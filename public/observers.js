@@ -140,6 +140,8 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
   let _fetchedAt = 0; // #1562: ms epoch when the current `observers` payload was received
   let _loadObserversReqId = 0; // #1563: monotonic id; resolutions older than the latest are discarded
   let obsSkewMap = {}; // observerID → {offsetSec, samples}
+  let obsAirtimeMap = {}; // #661 observerID → tx_airtime_pct_1h
+  let obsAirtimeWarnPct; // #661 duty_cycle_warn_pct from the summary
   let wsHandler = null;
   let refreshTimer = null;
   let regionChangeHandler = null;
@@ -255,6 +257,7 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
     _mqttPanelTeardown = null;
     observers = [];
     obsSkewMap = {};
+    obsAirtimeMap = {};
   }
 
   async function loadObservers(opts) {
@@ -265,13 +268,20 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
     // (or vice versa) with stale data + a misleading "0s ago" pill.
     var myId = ++_loadObserversReqId;
     try {
-      const [data, skewData] = await Promise.all([
+      const [data, skewData, airData] = await Promise.all([
         api('/observers', { ttl: CLIENT_TTL.observers, bust: bust }),
-        api('/observers/clock-skew', { ttl: 30000 }).catch(function() { return []; })
+        api('/observers/clock-skew', { ttl: 30000 }).catch(function() { return []; }),
+        // #661 — rolling 1 h TX airtime; one bulk call, not per observer.
+        api('/observers/metrics/summary?window=1h', { ttl: 30000 }).catch(function() { return {}; })
       ]);
       if (myId !== _loadObserversReqId) return; // stale resolve, newer in-flight
       observers = data.observers || [];
       _fetchedAt = Date.now(); // #1562: stamp freshness for the header label
+      obsAirtimeMap = {};
+      obsAirtimeWarnPct = airData && airData.duty_cycle_warn_pct;
+      ((airData && airData.observers) || []).forEach(function(a) {
+        if (a && a.observer_id) obsAirtimeMap[a.observer_id] = a.tx_airtime_pct_1h;
+      });
       obsSkewMap = {};
       (Array.isArray(skewData) ? skewData : []).forEach(function(s) {
         if (s && s.observerID) obsSkewMap[s.observerID] = s;
@@ -306,6 +316,11 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
   // share ONE classifier (single source of truth). If anything reintroduces
   // parallel thresholds, the new ObserversSummary regression test breaks.
   window.observerHealthStatus = healthStatus;
+
+  // #2270: latest /neighbors report, shared with the observer page.
+  function neighborsCell(o) {
+    return window.ObserverNeighbors ? window.ObserverNeighbors.cell(o) : '<span class="text-muted">—</span>';
+  }
 
   function packetBadge(o) {
     const warnIcon = '<svg class="ph-icon" aria-hidden="true" focusable="false"><use href="/icons/phosphor-sprite.svg#ph-warning"></use></svg>';
@@ -383,8 +398,8 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
       <div class="obs-table-scroll table-fluid-wrap"><table class="data-table obs-table" id="obsTable">
         <caption class="sr-only">Observer status and statistics</caption>
         <thead><tr>
-          <th scope="col" data-priority="1" data-sort-key="status" data-type="numeric">Status</th><th scope="col" data-priority="1" data-sort-key="name">Name</th><th scope="col" data-priority="3" data-sort-key="region">Region</th><th scope="col" data-priority="2" data-sort-key="last_seen" data-type="numeric">Last Status</th><th scope="col" data-priority="2" data-sort-key="last_packet_at" data-type="numeric">Last Packet</th>
-          <th scope="col" data-priority="3" data-sort-key="packet_health" data-type="numeric">Packet Health</th><th scope="col" data-priority="4" data-sort-key="packet_count" data-type="numeric">Total Packets</th><th scope="col" data-priority="3" data-sort-key="packets_hour" data-type="numeric">Packets/Hour</th><th scope="col" data-priority="4" data-sort-key="clock_offset" data-type="numeric">Clock Offset</th><th scope="col" data-priority="4" data-sort-key="uptime" data-type="numeric">Uptime</th><th scope="col" data-priority="4" data-sort-key="firmware">Firmware</th><th scope="col" data-priority="4" data-sort-key="client_version">Client</th>
+          <th scope="col" data-priority="1" data-sort-key="status" data-type="numeric">Status</th><th scope="col" data-priority="1" data-sort-key="name">Name</th><th scope="col" data-priority="3" data-sort-key="region">Region</th><th scope="col" data-priority="2" data-sort-key="last_seen" data-type="numeric">Last Status</th><th scope="col" data-priority="2" data-sort-key="last_packet_at" data-type="numeric">Last Packet</th><th scope="col" data-priority="3" data-sort-key="neighbors" data-type="numeric" title="Latest /neighbors report: when it arrived and how many neighbors it named">Neighbors</th>
+          <th scope="col" data-priority="3" data-sort-key="packet_health" data-type="numeric">Packet Health</th><th scope="col" data-priority="4" data-sort-key="packet_count" data-type="numeric">Total Packets</th><th scope="col" data-priority="3" data-sort-key="packets_hour" data-type="numeric">Packets/Hour</th><th scope="col" data-priority="3" data-sort-key="airtime_1h" data-type="numeric" title="TX airtime share over the last hour (duty cycle)">TX 1h</th><th scope="col" data-priority="4" data-sort-key="clock_offset" data-type="numeric">Clock Offset</th><th scope="col" data-priority="4" data-sort-key="uptime" data-type="numeric">Uptime</th><th scope="col" data-priority="4" data-sort-key="firmware">Firmware</th><th scope="col" data-priority="4" data-sort-key="client_version">Client</th>
           <th scope="col" data-priority="1" class="col-compare-select" style="width:32px"><span class="sr-only">Select for compare</span></th>
         </tr></thead>
         <tbody>${filtered.map(o => {
@@ -399,6 +414,7 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
           // NaN last). Empty string ⇒ NaN ⇒ missing-sorts-last.
           const _lastSeenMs  = o.last_seen      ? new Date(o.last_seen).getTime()      : '';
           const _lastPktMs   = o.last_packet_at ? new Date(o.last_packet_at).getTime() : '';
+          const _neighborsMs = o.neighbors_report_at ? new Date(o.neighbors_report_at).getTime() : '';
           const _firstSeenMs = o.first_seen     ? new Date(o.first_seen).getTime()     : 0;
           const _uptimeMs    = _firstSeenMs ? (Date.now() - _firstSeenMs) : '';
           const _skewSec = (obsSkewMap[o.id] && obsSkewMap[o.id].samples)
@@ -416,9 +432,11 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
             <td data-value="${escapeHtml(o.iata || '')}">${o.iata ? `<span class="badge-region">${escapeHtml(o.iata)}</span>` : '—'}</td>
             <td data-value="${_lastSeenMs}">${timeAgo(o.last_seen)}</td>
             <td data-testid="obs-cell-last-packet" data-value="${_lastPktMs}">${o.last_packet_at ? timeAgo(o.last_packet_at) : '<span class="text-muted">—</span>'}</td>
+            <td data-testid="obs-cell-neighbors" data-value="${_neighborsMs}">${neighborsCell(o)}</td>
             <td data-value="${_healthRank}">${packetBadge(o)}</td>
             <td data-testid="obs-cell-packet-count" data-value="${_packetCount}">${(o.packet_count || 0).toLocaleString()}</td>
             <td data-value="${_packetsHour}">${sparkBar(o.packetsLastHour || 0, maxPktsHr)}</td>
+            <td data-testid="obs-cell-airtime" data-value="${obsAirtimeMap[o.id] != null ? obsAirtimeMap[o.id] : ''}">${window.ObserverAirtime.badge(obsAirtimeMap[o.id], obsAirtimeWarnPct)}</td>
             <td data-value="${_skewSec}">${(function() {
               var sk = obsSkewMap[o.id];
               if (!sk || sk.samples == null || sk.samples === 0) return '<span class="text-muted">—</span>';
@@ -529,6 +547,7 @@ window.preserveCompareSelection = function preserveCompareSelection(prevIds, tbo
         '<dt>Region</dt><dd>' + (o.iata ? '<span class="badge-region">' + escapeHtml(o.iata) + '</span>' : '—') + '</dd>' +
         '<dt>Last status</dt><dd>' + timeAgo(o.last_seen) + '</dd>' +
         '<dt>Last packet</dt><dd>' + (o.last_packet_at ? timeAgo(o.last_packet_at) : '—') + '</dd>' +
+        '<dt>Neighbors</dt><dd>' + neighborsCell(o) + '</dd>' +
         '<dt>Total packets</dt><dd>' + (o.packet_count || 0).toLocaleString() + '</dd>' +
         '<dt>Packets/hr</dt><dd>' + pkts + '</dd>' +
         '<dt>Clock offset</dt><dd>' + skewLine + '</dd>' +

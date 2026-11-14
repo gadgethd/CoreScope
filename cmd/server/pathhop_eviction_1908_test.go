@@ -42,7 +42,7 @@ func TestPathHopEviction1908(t *testing.T) {
 					tx.ScopeName = &expiredScope
 				}
 				addTxToPathHopIndex(store.byPathHop, tx)
-				store.indexResolvedPathHops(tx, []string{shared, pk}, hopsSeen)
+				store.indexResolvedPathHops(tx, []string{shared, pk}, hopsSeen, nil, nil)
 			}
 			// Repeated observations no longer append the same resolved
 			// association again (#2108), but eviction must still drop every
@@ -152,7 +152,6 @@ func BenchmarkPathHopEviction1908(b *testing.B) {
 					store := &PacketStore{
 						packets:        make([]*StoreTx, count),
 						byPathHop:      make(map[string][]*StoreTx, len(pubkeys)+256),
-						spTxIndex:      make(map[string][]*StoreTx),
 						retentionHours: 1,
 					}
 					hopsSeen := make(map[string]bool, hops*2)

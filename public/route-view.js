@@ -80,6 +80,7 @@
   var escapeHtml = _MC_RT_U.escapeHtml;
   var buildPacketContextBlock = _MC_RT_U.buildPacketContextBlock;
   var buildSnrSparkline = _MC_RT_U.buildSnrSparkline;
+  var pathGroupKey = _MC_RT_U.pathGroupKey;
 
   // Polish review (carmack #1423): bound _detailCache (was unbounded plain
   // object; every distinct pubkey ever clicked was retained for the tab's
@@ -227,9 +228,26 @@
     return '<svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#' + name + '"/></svg>';
   }
 
+  // #2206 — the "from payload" chip marks rows whose name was decoded from
+  // the packet payload (1-byte sender/recipient hashes), not from the outer
+  // path bytes. Shared by the canonical row builder and the isolated-path
+  // row builder so the markup can't drift apart.
+  function payloadChip(p) {
+    return p._fromPayload ? ' <span class="mc-rt-status-chip mc-rt-status-payload" title="Sender/recipient decoded from packet payload (not from outer path bytes)">from payload</span>' : '';
+  }
+
+  // #2206 follow-up — the "N hops" figures count only true hops: the
+  // payload-decoded sender/recipient rows are endpoints, not hops, so a
+  // 6-relay DM reads "6 hops" instead of 8 rows. Shared by the desktop
+  // header and the mobile summary so they can't disagree.
+  function countHops(positions) {
+    return positions.filter(function (p) { return !p._fromPayload; }).length;
+  }
+
   function buildSidebar(positions, mapRef, layer, edges, markers, opts) {
     opts = opts || {};
     var total = positions.length;
+    var hopCount = countHops(positions);
     // Compute hop distances
     var dists = [], maxDist = 0;
     for (var i = 1; i < total; i++) {
@@ -279,18 +297,21 @@
         if (p.gpsless) {
           statusBadge = ' <span class="mc-rt-status-chip mc-rt-status-nogps" title="Node identified but has no GPS coordinates"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-map-pin"/></svg> no GPS</span>';
         } else {
-          statusBadge = ' <span class="mc-rt-status-chip mc-rt-status-unknown" title="Could not resolve this hop prefix to a known node"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-magnifying-glass"/></svg> unknown</span>';
+          // An unlisted hop was inferred as a node missing from the list (or
+          // without GPS): known nodes share its prefix, but none fits here.
+          var unknownTitle = p.unlisted
+            ? 'No listed node with this prefix fits this point in the path'
+            : 'Could not resolve this hop prefix to a known node';
+          statusBadge = ' <span class="mc-rt-status-chip mc-rt-status-unknown" title="' + unknownTitle + '"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-magnifying-glass"/></svg> ' + (p.unlisted ? 'unlisted' : 'unknown') + '</span>';
         }
       }
       // hops derived from the packet's PAYLOAD (sender/recipient
       // encoded in decoded.srcHash/destHash) are visually distinct from hops
       // derived from path_json (the floodband repeaters). Operator confusion:
       // PATH packets show both, but packet-detail page only shows the inner
-      // path. Marking with a chip makes the layering explicit.
-      var payloadBadge = '';
-      if (p._fromPayload) {
-        payloadBadge = ' <span class="mc-rt-status-chip mc-rt-status-payload" title="Sender/recipient decoded from packet payload (not from outer path bytes)">from payload</span>';
-      }
+      // path. Marking with a chip makes the layering explicit — the chip
+      // markup lives in payloadChip() so both row builders share it.
+      var payloadBadge = payloadChip(p);
       var unresolved = p.resolved === false ? ' mc-rt-unresolved' : '';
       // Stripe color: incoming edge color (idx-1) for non-origin, outgoing for origin.
       var stripeIdx = idx === 0 ? 0 : (idx - 1);
@@ -322,23 +343,13 @@
     // flow without packetContext).
     var pktCtx = (opts && opts.packetContext) || null;
     var contextBlock = buildPacketContextBlock(pktCtx);
+    // #1633 — collapse paths whose only difference is 1-byte hops when
+    // the customizer toggle is ON: grouping uses the FILTERED hop list so
+    // the picker count reflects the surviving distinct routes.
+    var filterHops = (typeof window !== 'undefined') ? window.MC_filterPathHops : null;
     var uniquePathsCount = (opts && opts.allPaths) ? (function () {
       var seen = {};
-      opts.allPaths.forEach(function (p) {
-        // #1633 — collapse paths whose only difference is 1-byte hops when
-        // the customizer toggle is ON. Aggregation uses the FILTERED hop
-        // list so the picker count reflects the surviving distinct routes.
-        // #1689 r1 (adv #1): if the filter strips EVERY hop the key becomes
-        // an empty string and distinct all-1-byte routes collide into one
-        // bucket. Fall back to the raw key with an `__all1byte__::` prefix
-        // so they stay distinct while still being marked as filtered.
-        var rawHops = (p.path || []);
-        var hops = (typeof window !== 'undefined' && window.MC_filterPathHops)
-          ? window.MC_filterPathHops(rawHops)
-          : rawHops;
-        var key = hops.length ? hops.join('-') : ('__all1byte__::' + rawHops.join('-'));
-        seen[key] = true;
-      });
+      opts.allPaths.forEach(function (p) { seen[pathGroupKey(p.path, filterHops)] = true; });
       return Object.keys(seen).length;
     })() : 1;
     var multiPathChip = '';
@@ -353,14 +364,9 @@
       var pathGroups = {};
       (opts.allPaths || []).forEach(function (p) {
         var rawHops = p.path || [];
-        // #1633 — same render-time filter as the count above.
-        // #1689 r1 (adv #1): empty filtered result must NOT collide with
-        // other all-1-byte paths. Use a sentinel that includes the rawHops
-        // signature so distinct routes stay separate buckets in the picker.
-        var hops = (typeof window !== 'undefined' && window.MC_filterPathHops)
-          ? window.MC_filterPathHops(rawHops)
-          : rawHops;
-        var k = hops.length ? hops.join('→') : ('⟨all-1byte⟩::' + rawHops.join('→'));
+        // #1633 — same render-time grouping as the count above.
+        var hops = typeof filterHops === 'function' ? filterHops(rawHops) : rawHops;
+        var k = pathGroupKey(rawHops, filterHops);
         var _bt = false;
         // #1784 — trust threshold: if any raw hop is below the configured
         // minimum hash bytes, mark for speculative display treatment.
@@ -433,7 +439,7 @@
           '<div class="mc-rt-title">Route</div>' +
           backLink +
         '</div>' +
-        '<div class="mc-rt-meta">' + total + ' hops · ' + totalKm + ' km' +
+        '<div class="mc-rt-meta">' + hopCount + ' hops · ' + totalKm + ' km' +
           (unresolvedCount ? ' · ' + unresolvedCount + ' unresolved' : '') +
         '</div>' +
         contextBlock +
@@ -489,7 +495,7 @@
       }
     } catch (e) { console.warn('[route-view]', e); }
     summaryLine = (typeTag ? '<b>' + escapeHtml(typeTag) + '</b> · ' : '') +
-                  total + ' hops · ' + totalKm + ' km' +
+                  hopCount + ' hops · ' + totalKm + ' km' +
                   (multiPath ? ' · ' + totalObservers + ' obs' : '') +
                   (hexRoute ? '<br><span class="mc-rt-mobile-hex">' + escapeHtml(hexRoute) + '</span>' : '');
     sidebar.innerHTML =
@@ -819,12 +825,13 @@
           var pinned = idx === 0 ? 'origin' : (idx === iso.length - 1 ? 'dest' : '');
           var glyph = roleGlyph(p.role);
           var name = escapeHtml(p.name || (p.pubkey ? String(p.pubkey).slice(0,8) : '?'));
+          var payloadBadge = payloadChip(p);
           var stripeColor = iso.length > 1 ? rampColor(idx === 0 ? 0 : idx - 1, iso.length - 1) : 'transparent';
           return '<li class="mc-rt-row mc-rt-row-iso ' + pinned + '" tabindex="0" style="--mc-rt-row-color:' + stripeColor + '">' +
             '<span class="mc-rt-stripe" aria-hidden="true"></span>' +
             '<span class="mc-rt-seq">' + (idx + 1) + '</span>' +
             '<span class="mc-rt-glyph" title="' + (p.role || '?') + '">' + glyph + '</span>' +
-            '<span class="mc-rt-name">' + name + '</span>' +
+            '<span class="mc-rt-name">' + name + payloadBadge + '</span>' +
             '<span class="mc-rt-distlabel">' + distLabel + '</span>' +
             '<div class="mc-rt-distbar-wrap">' + distBar + '</div>' +
             '</li>';
@@ -1012,6 +1019,19 @@
         restoreAllPaths();
       });
     }
+    // Deep-link initial view (?paths=all / ?observer=, see map.js
+    // loadRouteFromDeepLink): the same handlers as the operator's click.
+    sidebar._applyPathView = function (view) {
+      if (!view) return;
+      if (view.mode === 'all') {
+        if (clearBtn) clearBtn.click();
+      } else if (view.mode === 'path') {
+        var key = pathGroupKey(view.path, filterHops);
+        for (var ri = 0; ri < pathRows.length; ri++) {
+          if (pathRows[ri].dataset.pathKey === key) { pathRows[ri].click(); return; }
+        }
+      }
+    };
 
     // Sparkline interactivity
     var sparkDots = sidebar.querySelectorAll('.mc-rt-spark-dot');
@@ -1522,6 +1542,10 @@
           window.__mc_routeResizeObserver = ro;
         }
       } catch (e) { console.warn('[route-view] ResizeObserver attach:', e); }
+    }
+    // Queued after the initial refit so the deep-linked view's own fit wins.
+    if (opts.initialPathView && sidebar._applyPathView) {
+      requestAnimationFrame(function () { sidebar._applyPathView(opts.initialPathView); });
     }
   }
 

@@ -1549,27 +1549,14 @@
     }
     _rebindDPRListener();
 
-    const isDark = document.documentElement.getAttribute('data-theme') === 'dark' ||
-      (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-    // #1420 — multi-provider dark-tile picker. Light mode unchanged.
+    const isDark = window.MC_isDarkTheme();
+    // #1420 — multi-provider dark-tile picker. Light mode unchanged (live page).
     let _liveDarkRefLayer = null;
+    // Single shared registry resolver (map-tile-providers.js loads before this
+    // file; there is deliberately no second fallback body here — AGENTS.md DRY).
     function _liveResolveTile(dark) {
-      const reg = window.MC_TILE_PROVIDERS || {};
-      if (!dark) {
-        const lightId = (typeof window.MC_getLightTileProvider === 'function') ? window.MC_getLightTileProvider() : null;
-        const lp = lightId ? (reg[lightId] || null) : null;
-        if (lp && lp.url) {
-          return { url: (typeof lp.url === 'function' ? lp.url() : lp.url), attribution: lp.attribution || '© OpenStreetMap © CartoDB', refUrl: null };
-        }
-        return { url: TILE_LIGHT, attribution: '© OpenStreetMap © CartoDB', refUrl: null };
-      }
-      const id  = (typeof window.MC_getDarkTileProvider === 'function') ? window.MC_getDarkTileProvider() : 'carto-dark';
-      const p   = reg[id] || reg['carto-dark'] || {};
-      return {
-        url: (typeof p.url === 'function' ? p.url() : p.url) || (typeof p.baseUrl === 'function' ? p.baseUrl() : p.baseUrl) || TILE_DARK,
-        attribution: p.attribution || '© OpenStreetMap © CartoDB',
-        refUrl: p.refUrl || null
-      };
+      const r = window.MC_resolveTile(!!dark);
+      return { url: r.url, attribution: r.attribution, refUrl: r.refUrl, maxZoom: r.maxZoom };
     }
     const liveAutoLayerGroup = L.layerGroup().addTo(map);
 
@@ -1596,9 +1583,9 @@
       }
     }
     const _liveInitTile = _liveResolveTile(isDark);
-    let tileLayer = L.tileLayer(_liveInitTile.url, { maxZoom: 19, attribution: _liveInitTile.attribution }).addTo(liveAutoLayerGroup);
+    let tileLayer = L.tileLayer(_liveInitTile.url, { maxZoom: _liveInitTile.maxZoom || 19, attribution: _liveInitTile.attribution }).addTo(liveAutoLayerGroup);
     if (isDark && _liveInitTile.refUrl) {
-      _liveDarkRefLayer = L.tileLayer(_liveInitTile.refUrl, { maxZoom: 19, attribution: _liveInitTile.attribution }).addTo(liveAutoLayerGroup);
+      _liveDarkRefLayer = L.tileLayer(_liveInitTile.refUrl, { maxZoom: _liveInitTile.maxZoom || 19, attribution: _liveInitTile.attribution }).addTo(liveAutoLayerGroup);
     }
     if (typeof window.MC_applyTileFilter === 'function') window.MC_applyTileFilter();
   
@@ -1654,15 +1641,12 @@
 
     // Swap tiles when theme changes
     const _themeObs = new MutationObserver(function () {
-      const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
-        (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-      _liveSyncDarkTiles(dark);
+      _liveSyncDarkTiles(window.MC_isDarkTheme());
     });
     _themeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
     // #1420 — re-render on customizer change.
     window.addEventListener('mc-tile-provider-changed', function (e) {
-      const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
-        (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      const dark = window.MC_isDarkTheme();
       if (e && e.detail && e.detail.type && e.detail.type !== (dark ? 'dark' : 'light')) return;
       _liveSyncDarkTiles(dark);
     });
@@ -2609,11 +2593,15 @@
       const roleColor = ROLE_COLORS[n.role] || '#6b7280';
       const roleLabel = (ROLE_LABELS[n.role] || n.role || 'unknown').replace(/s$/, '');
       const hasLoc = n.lat != null && n.lon != null;
-      const lastSeen = formatLiveTimestampHtml(n.last_seen);
-      const thresholds = window.getHealthThresholds ? getHealthThresholds(n.role) : { degradedMs: 3600000, silentMs: 86400000 };
-      const ageMs = n.last_seen ? Date.now() - new Date(n.last_seen).getTime() : Infinity;
-      const statusDot = ageMs < thresholds.degradedMs ? 'health-green' : ageMs < thresholds.silentMs ? 'health-yellow' : 'health-red';
-      const statusLabel = ageMs < thresholds.degradedMs ? 'Online' : ageMs < thresholds.silentMs ? 'Degraded' : 'Offline';
+      // Both endpoints carry certain activity; use the newest without changing
+      // the cached node. Shared-prefix relay traffic alone remains uncertain.
+      const activityNode = Object.assign({}, n, { _lastHeard: stats.lastHeard });
+      const heardMs = window.getEffectiveHeardMs(activityNode);
+      const lastActivity = formatLiveTimestampHtml(heardMs);
+      const health = getHealthStatus(n.role, heardMs);
+      const uncertain = getNodeStatus(activityNode) === 'uncertain';
+      const statusDot = uncertain ? 'text-muted' : health === 'healthy' ? 'health-green' : health === 'degraded' ? 'health-yellow' : 'health-red';
+      const statusLabel = uncertain ? 'Uncertain' : health === 'healthy' ? 'Online' : health === 'degraded' ? 'Degraded' : 'Offline';
 
       let html = `
         <div style="padding:16px;">
@@ -2629,7 +2617,7 @@
             <code style="font-size:10px;word-break:break-all;">${escapeHtml(n.public_key)}</code>
           </div>
           <table style="font-size:12px;width:100%;border-collapse:collapse;">
-            <tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Last Seen</td><td>${lastSeen}</td></tr>
+            <tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Last Activity</td><td>${lastActivity}</td></tr>
             <tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Adverts</td><td>${n.advert_count || 0}</td></tr>
             ${'configured_scope' in n && n.configured_scope !== null ? `<tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;" title="Region scopes this node has configured, confirmed via an observer /neighbors report (status=responded) — concrete evidence (#1865).${n.configured_scope_at ? ' Last confirmed ' + escapeHtml(String(n.configured_scope_at)) + '.' : ''}">Configured scope <span style="color:var(--status-green-text)" role="img" aria-label="confirmed"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-check"/></svg></span></td><td>${n.configured_scope === '' ? '<span style="color:var(--text-muted)">none configured</span>' : `<code style="color:var(--link-color)">${escapeHtml(n.configured_scope)}</code>`}</td></tr>` : ''}
             ${'default_scope' in n ? `<tr><td style="color:var(--text-muted);padding:4px 8px 4px 0;">Scope</td><td>${n.default_scope === null ? '<span style="color:var(--text-muted)">—</span>'
@@ -3169,8 +3157,8 @@
   // #1598: infra nodes (repeater/room) are ALWAYS dimmed, never deleted —
   // a dimmed marker still tells operators "infrastructure exists here,
   // advert stale", whereas deletion silently rewrites the map. Staleness
-  // itself is relay-aware via getNodeStatus(node) (max of advert-based
-  // freshness and last_relayed for infra).
+  // itself comes from getNodeStatus(node), whose last_heard includes the
+  // relays that can only be this node (#2260).
   // Remaining WS-only non-infra nodes are removed to prevent memory leaks.
   function pruneStaleNodes() {
     var now = Date.now();
@@ -3180,7 +3168,10 @@
       if (!n) continue;
       var lastSeen = n._liveSeen || (n.last_heard ? new Date(n.last_heard).getTime() : null) || (n.last_seen ? new Date(n.last_seen).getTime() : null);
       if (lastSeen == null) continue;
+      // #2260: 'uncertain' (only a shared hop prefix seen) dims like stale;
+      // it only occurs for repeaters and rooms, which are never removed.
       var status = window.getNodeStatus ? getNodeStatus(n) : 'active';
+      if (status === 'uncertain') status = 'stale';
       var isInfra = n.role === 'repeater' || n.role === 'room';
       var marker = nodeMarkers[key];
       if (status === 'stale') {

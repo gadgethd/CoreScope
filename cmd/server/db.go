@@ -39,7 +39,10 @@ const routeTypeNonTransportSQL = "route_type IN (1, 2)"
 // DB wraps a read-only connection to the MeshCore SQLite database.
 type DB struct {
 	advertEvidenceTable     atomic.Bool
-	advertEvidenceReadHook  func() // test-only: immediately before a bulk mask query
+	txRewriteFeedTable      atomic.Bool // tx_rewrite_feed present (#2107); re-probed while absent
+	clientNodeNamesTable    atomic.Bool // client_node_names present; re-probed while absent (clientNodeNamesPresent)
+	inactiveNodesTable      atomic.Bool // inactive_nodes present; re-probed while absent (clientNameHeard)
+	advertEvidenceReadHook  func()      // test-only: immediately before a bulk mask query
 	conn                    *sql.DB
 	path                    string // filesystem path to the database file
 	isV3                    bool   // v3 schema: observer_idx in observations (vs observer_id in v2)
@@ -703,6 +706,7 @@ type PacketQuery struct {
 	Type               *int
 	Route              *int
 	Observer           string
+	ExcludeTx          bool // require a non-TX observation from the selected observer(s), or any observer if unscoped
 	Hash               string
 	Since              string
 	Until              string
@@ -710,6 +714,7 @@ type PacketQuery struct {
 	Area               string // area key; filters by transmitting node's GPS position
 	Node               string
 	Channel            string // channel_hash filter (#812). Plain names like "#test"/"public" or "enc_<HEX>" for encrypted
+	Radio              string // canonical "MHz,kHz,SF,CR": some observation heard on it (#1869; in-memory store only)
 	Order              string // ASC or DESC
 	ExpandObservations bool   // when true, include observation sub-maps in txToMap output
 }
@@ -1011,18 +1016,24 @@ func (db *DB) buildTransmissionWhere(q PacketQuery) ([]string, []interface{}) {
 		where = append(where, "t.channel_hash = ?")
 		args = append(args, q.Channel)
 	}
+	directionFilter := ""
+	if q.ExcludeTx {
+		directionFilter = " AND oi.direction IS NOT 'tx'"
+	}
 	if q.Observer != "" {
 		ids := strings.Split(q.Observer, ",")
 		placeholders := strings.Repeat("?,", len(ids))
 		placeholders = placeholders[:len(placeholders)-1]
 		if db.isV3 {
-			where = append(where, "EXISTS (SELECT 1 FROM observations oi JOIN observers obi ON obi.rowid = oi.observer_idx WHERE oi.transmission_id = t.id AND obi.id IN ("+placeholders+"))")
+			where = append(where, "EXISTS (SELECT 1 FROM observations oi JOIN observers obi ON obi.rowid = oi.observer_idx WHERE oi.transmission_id = t.id AND obi.id IN ("+placeholders+")"+directionFilter+")")
 		} else {
-			where = append(where, "EXISTS (SELECT 1 FROM observations oi WHERE oi.transmission_id = t.id AND oi.observer_id IN ("+placeholders+"))")
+			where = append(where, "EXISTS (SELECT 1 FROM observations oi WHERE oi.transmission_id = t.id AND oi.observer_id IN ("+placeholders+")"+directionFilter+")")
 		}
 		for _, id := range ids {
 			args = append(args, strings.TrimSpace(id))
 		}
+	} else if q.ExcludeTx {
+		where = append(where, "EXISTS (SELECT 1 FROM observations oi WHERE oi.transmission_id = t.id"+directionFilter+")")
 	}
 	if q.Region != "" {
 		if db.isV3 {
@@ -3037,12 +3048,16 @@ type MetricsSummaryRow struct {
 	CurrentBattMv *int       `json:"battery_mv"`
 	SampleCount   int        `json:"sample_count"`
 	Sparkline     []*float64 `json:"sparkline"`
+	// Airtime share over the hour before now, whatever the window (#661).
+	TxAirtimePct1h *float64 `json:"tx_airtime_pct_1h"`
+	RxAirtimePct1h *float64 `json:"rx_airtime_pct_1h"`
 }
 
 // GetMetricsSummary returns a fleet summary of observer metrics within a time window.
 // Uses a CTE with ROW_NUMBER to get latest values in a single pass (no correlated subqueries).
-// Also returns sparkline data (noise_floor time series) per observer.
-func (db *DB) GetMetricsSummary(since string) ([]MetricsSummaryRow, error) {
+// Also returns sparkline data (noise_floor time series) per observer, and the
+// TX/RX airtime share over the hour before now.
+func (db *DB) GetMetricsSummary(since string, now time.Time) ([]MetricsSummaryRow, error) {
 	query := `
 		WITH ranked AS (
 			SELECT observer_id, noise_floor, battery_mv,
@@ -3109,9 +3124,49 @@ func (db *DB) GetMetricsSummary(since string) ([]MetricsSummaryRow, error) {
 				result[i].Sparkline = s
 			}
 		}
+
+		if err := db.fillAirtime1h(result, now); err != nil {
+			return nil, err
+		}
 	}
 
 	return result, nil
+}
+
+// fillAirtime1h sets the rolling 1 h TX/RX airtime share on each row from
+// the cumulative counters sampled in the hour before now, in one query.
+func (db *DB) fillAirtime1h(rows []MetricsSummaryRow, now time.Time) error {
+	since := now.Add(-airtimeWindow).Format(time.RFC3339)
+	q, err := db.conn.Query(`SELECT observer_id, timestamp, tx_air_secs, rx_air_secs
+		FROM observer_metrics WHERE timestamp >= ? ORDER BY observer_id, timestamp ASC`, since)
+	if err != nil {
+		return err
+	}
+	defer q.Close()
+
+	tx := make(map[string][]airtimePoint)
+	rx := make(map[string][]airtimePoint)
+	for q.Next() {
+		var oid, ts string
+		var txSecs, rxSecs *int
+		if err := q.Scan(&oid, &ts, &txSecs, &rxSecs); err != nil {
+			return err
+		}
+		at, err := time.Parse(time.RFC3339, ts)
+		if err != nil {
+			continue
+		}
+		tx[oid] = append(tx[oid], airtimePoint{At: at, Secs: txSecs})
+		rx[oid] = append(rx[oid], airtimePoint{At: at, Secs: rxSecs})
+	}
+	if err := q.Err(); err != nil {
+		return err
+	}
+	for i := range rows {
+		rows[i].TxAirtimePct1h = rollingAirtimePct(tx[rows[i].ObserverID], now)
+		rows[i].RxAirtimePct1h = rollingAirtimePct(rx[rows[i].ObserverID], now)
+	}
+	return nil
 }
 
 // (PruneOldMetrics / RemoveStaleObservers removed in #1283 — see note

@@ -5,11 +5,15 @@
   let map = null;
   let routeLayer = null;
   let markerLayer = null;
+  // Estimated positions of repeaters known only from their reported name
+  // (map-estimated.js). A layer of its own: never clustered with real markers.
+  let estimatedLayer = null;
+  let reported = { nodes: [], method: null };
   let clusterGroup = null;
   let nodes = [];
   let targetNodeKey = null;
   let observers = [];
-  let filters = { repeater: true, companion: true, room: true, sensor: true, observer: true, lastHeard: '30d', neighbors: false, clustering: localStorage.getItem('meshcore-map-clustering') !== 'false', hashLabels: localStorage.getItem('meshcore-map-hash-labels') !== 'false', statusFilter: localStorage.getItem('meshcore-map-status-filter') || 'all', byteSize: localStorage.getItem('meshcore-map-byte-filter') || 'all', multiByteOverlay: localStorage.getItem('meshcore-map-multibyte-overlay') === 'true', scopeState: localStorage.getItem('meshcore-map-scope-filter') || 'all', scopeOverlay: localStorage.getItem('meshcore-map-scope-overlay') === 'true', regionScope: localStorage.getItem('meshcore-map-region-filter') || '' };
+  let filters = { repeater: true, companion: true, room: true, sensor: true, observer: true, lastHeard: '30d', neighbors: false, clustering: localStorage.getItem('meshcore-map-clustering') !== 'false', hashLabels: localStorage.getItem('meshcore-map-hash-labels') !== 'false', statusFilter: localStorage.getItem('meshcore-map-status-filter') || 'all', byteSize: localStorage.getItem('meshcore-map-byte-filter') || 'all', multiByteOverlay: localStorage.getItem('meshcore-map-multibyte-overlay') === 'true', scopeState: localStorage.getItem('meshcore-map-scope-filter') || 'all', scopeOverlay: localStorage.getItem('meshcore-map-scope-overlay') === 'true', estimated: localStorage.getItem('meshcore-map-estimated') !== 'false', regionScope: localStorage.getItem('meshcore-map-region-filter') || '' };
   let selectedReferenceNode = null;  // pubkey of the reference node for neighbor filtering
   let neighborPubkeys = null;        // Set of pubkeys that are direct neighbors of selected node
   let wsHandler = null;
@@ -33,6 +37,10 @@
   const safeEsc = (typeof escapeHtml === 'function') ? escapeHtml : function (s) {
     return s == null ? '' : String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   };
+
+  // The stored flag is sticky; it is not a current location or bridge finding.
+  const FOREIGN_ADVERT_DESCRIPTION = 'An advert from this node was flagged outside the configured area at ingestion. This historical flag does not indicate its current location.';
+  const FOREIGN_ADVERT_INDICATOR = '<span class="map-foreign-indicator" aria-hidden="true"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-warning"/></svg></span>';
 
   // Roles loaded from shared roles.js (ROLE_STYLE, ROLE_LABELS, ROLE_COLORS globals)
 
@@ -341,7 +349,7 @@
     return out;
   }
 
-  function makeMarkerIcon(role, isStale, isAlsoObserver, colorOverride) {
+  function makeMarkerIcon(role, isStale, isAlsoObserver, colorOverride, isForeign) {
     const s = ROLE_STYLE[role] || ROLE_STYLE.companion;
     // #1438: default fill resolves through the live CSS var so existing
     // mounted SVG markers recolor when cb-preset switches or the
@@ -409,15 +417,16 @@
     }
     const svg = `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" xmlns="http://www.w3.org/2000/svg">${path}${obsOverlay}</svg>`;
     return L.divIcon({
-      html: svg,
+      html: svg + (isForeign ? FOREIGN_ADVERT_INDICATOR : ''),
       className: 'meshcore-marker' + (isStale ? ' marker-stale' : ''),
       iconSize: [size, size],
       iconAnchor: [c, c],
       popupAnchor: [0, -c],
+      collisionBounds: { x: -c, y: -c, w: size + (isForeign ? 7 : 0), h: size + (isForeign ? 7 : 0) },
     });
   }
 
-  function makeRepeaterLabelIcon(node, isStale, isAlsoObserver, mbStatus, scopeState) {
+  function makeRepeaterLabelIcon(node, isStale, isAlsoObserver, mbStatus, scopeState, metrics) {
     // Show the short mesh hash ID (first N bytes of pubkey, uppercased). When
     // the width is unobserved the label falls back to one byte — it has to draw
     // something — but says so instead of asserting a 1-byte config.
@@ -450,9 +459,15 @@
     }
     var scopeClass = scopeMeta ? (' scope-' + scopeMeta.key) : '';
     var scopeAria = scopeMeta ? (', scope config ' + scopeMeta.label) : '';
-    var scopeTitle = scopeMeta ? (' title="' + scopeMeta.label + ' — ' + scopeMeta.title.replace(/"/g, '&quot;') + '"') : '';
+    var labelTitle = scopeMeta ? (scopeMeta.label + ' — ' + scopeMeta.title) : '';
     var ariaStatus = status ? ('multi-byte ' + status + ', hash ' + shortHash + ariaWidth + scopeAria)
                             : ('repeater hash ' + shortHash + ariaWidth + scopeAria);
+    var isForeign = node.foreign === true;
+    if (isForeign) {
+      var foreignTitle = 'Foreign advert flag: ' + FOREIGN_ADVERT_DESCRIPTION;
+      ariaStatus += ', ' + foreignTitle;
+      labelTitle += (labelTitle ? ' — ' : '') + foreignTitle;
+    }
     // Observer indicator stays a star — it is an orthogonal signal, not a status color.
     var obsIndicator = isAlsoObserver
       ? ' <span aria-hidden="true" style="color:' + (ROLE_COLORS.observer || '#f1c40f') + ';font-size:13px;line-height:1;" title="Also an observer"><svg class="ph-icon" aria-hidden="true"><use href="/icons/phosphor-sprite.svg#ph-star-fill"/></svg></span>'
@@ -460,15 +475,45 @@
     // Glyph + thin-space (U+2009) + hash. Visible content is aria-hidden so AT
     // reads the aria-label only (avoids "check mark 3 E" literal announcements).
     var visible = (glyph ? glyph + '\u2009' : '') + shortHash;
-    var html = '<div class="mc-mb-label' + statusClass + scopeClass + unknownWidth + '" role="img" aria-label="' + ariaStatus + '"' + scopeTitle + '>' +
-      '<span aria-hidden="true">' + visible + '</span>' + obsIndicator + '</div>';
+    var html = '<div class="mc-mb-label' + statusClass + scopeClass + unknownWidth + '" role="img" aria-label="' + ariaStatus + '"' + (labelTitle ? ' title="' + safeEsc(labelTitle) + '"' : '') + '>' +
+      '<span aria-hidden="true">' + visible + '</span>' + obsIndicator + (isForeign ? FOREIGN_ADVERT_INDICATOR : '') + '</div>';
     return L.divIcon({
       html: html,
       className: 'meshcore-marker meshcore-label-marker' + (isStale ? ' marker-stale' : ''),
       iconSize: null,
       iconAnchor: [14, 12],
       popupAnchor: [0, -12],
+      collisionBounds: metrics ? {
+        x: -14, y: -12,
+        w: Math.ceil(metrics.textWidth(visible) + metrics.padding + (isAlsoObserver ? metrics.observer : 0) + (isForeign ? 17 : 0)),
+        h: metrics.height,
+      } : null,
     });
+  }
+
+  // Read the label font once per render, outside the marker/placement loops.
+  // Canvas measures short text without forcing a DOM layout for each node.
+  function markerLabelMetrics() {
+    const probe = document.createElement('div');
+    probe.className = 'mc-mb-label';
+    probe.style.cssText = 'position:absolute;visibility:hidden;pointer-events:none';
+    probe.setAttribute('aria-hidden', 'true');
+    document.body.appendChild(probe);
+    try {
+      const style = getComputedStyle(probe);
+      const context = document.createElement('canvas').getContext('2d');
+      context.font = style.fontWeight + ' ' + style.fontSize + ' ' + style.fontFamily;
+      const spacing = parseFloat(style.letterSpacing) || 0;
+      const textWidth = text => context.measureText(text).width + text.length * spacing;
+      return {
+        textWidth,
+        padding: parseFloat(style.paddingLeft) + parseFloat(style.paddingRight) + parseFloat(style.borderLeftWidth) + parseFloat(style.borderRightWidth),
+        observer: textWidth(' ') + 16, // .ph-icon is 16px, including in the observer span.
+        height: Math.ceil(Math.max(24, parseFloat(style.lineHeight) + parseFloat(style.paddingTop) + parseFloat(style.paddingBottom) + 4)),
+      };
+    } finally {
+      probe.remove();
+    }
   }
 
   async function init(container) {
@@ -517,6 +562,7 @@
             <label for="mcHashLabels"><input type="checkbox" id="mcHashLabels"> Hash prefix labels</label>
             <label for="mcMultiByte"><input type="checkbox" id="mcMultiByte"> Multi-byte support</label>
             <label for="mcScopeOverlay" title="Colour repeater markers by their region-scope configuration"><input type="checkbox" id="mcScopeOverlay"> Scope config colours</label>
+            <label for="mcEstimated" title="Repeaters that never sent an advert, placed from where mobile companions heard them. Dashed circle = uncertainty. Follows the repeater role filter only, not the area, region or last-heard filters."><input type="checkbox" id="mcEstimated"> Estimated positions <span class="mc-est-legend" aria-hidden="true">≈</span></label>
             <label id="mcGeoFilterLabel" for="mcGeoFilter" style="display:none"><input type="checkbox" id="mcGeoFilter"> Mesh live area</label>
           </fieldset>
           <div id="mapAreaFilter"></div>
@@ -525,6 +571,7 @@
             <div class="filter-group" id="mcStatusFilter">
               <button class="btn ${filters.statusFilter==='all'?'active':''}" data-status="all">All</button>
               <button class="btn ${filters.statusFilter==='active'?'active':''}" data-status="active">Active</button>
+              <button class="btn ${filters.statusFilter==='uncertain'?'active':''}" data-status="uncertain" title="Only a hop prefix shared with other repeaters still appears in paths (#2260)">Uncertain</button>
               <button class="btn ${filters.statusFilter==='stale'?'active':''}" data-status="stale">Stale</button>
             </div>
           </fieldset>
@@ -598,7 +645,19 @@
     } else {
       const savedView = localStorage.getItem('map-view');
       if (savedView) {
-        try { const v = JSON.parse(savedView); initCenter = [v.lat, v.lng]; initZoom = v.zoom; } catch {}
+        try {
+          const v = JSON.parse(savedView);
+          if (v && [v.lat, v.lng, v.zoom].every(Number.isFinite)) {
+            // Panning can save another world copy; markers use canonical longitudes.
+            const saved = parseViewportHash(new URLSearchParams({
+              lat: v.lat, lon: L.latLng(v.lat, v.lng).wrap().lng, zoom: v.zoom
+            }).toString());
+            if (saved) {
+              initCenter = [saved.lat, saved.lon];
+              initZoom = saved.zoom;
+            }
+          }
+        } catch {}
       }
     }
     map = L.map('leaflet-map', { zoomControl: true }).setView(initCenter, initZoom);
@@ -607,27 +666,14 @@
     // If navigated with ?node=PUBKEY, highlight that node after markers load
     targetNodeKey = urlParams.get('node') || null;
 
-    const isDark = document.documentElement.getAttribute('data-theme') === 'dark' ||
-      (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-    // #1420 — multi-provider dark-tile picker. Light mode unchanged.
+    const isDark = window.MC_isDarkTheme();
+    // #1420 — multi-provider dark-tile picker. Light mode unchanged (map page).
     let _darkRefLayer = null;  // Esri-only: labels overlay
+    // Single shared registry resolver (map-tile-providers.js loads before this
+    // file; there is deliberately no second fallback body here — AGENTS.md DRY).
     function _resolveTileUrl(dark) {
-      const reg = window.MC_TILE_PROVIDERS || {};
-      if (!dark) {
-        const lightId = (typeof window.MC_getLightTileProvider === 'function') ? window.MC_getLightTileProvider() : null;
-        const lp = lightId ? (reg[lightId] || null) : null;
-        if (lp && lp.url) {
-          return { url: (typeof lp.url === 'function' ? lp.url() : lp.url), attribution: lp.attribution || '© OpenStreetMap © CartoDB', refUrl: null };
-        }
-        return { url: TILE_LIGHT, attribution: '© OpenStreetMap © CartoDB', refUrl: null };
-      }
-      const id  = (typeof window.MC_getDarkTileProvider === 'function') ? window.MC_getDarkTileProvider() : 'carto-dark';
-      const p   = reg[id] || reg['carto-dark'] || {};
-      return {
-        url: (typeof p.url === 'function' ? p.url() : p.url) || (typeof p.baseUrl === 'function' ? p.baseUrl() : p.baseUrl) || TILE_DARK,
-        attribution: p.attribution || '© OpenStreetMap © CartoDB',
-        refUrl: p.refUrl || null
-      };
+      const r = window.MC_resolveTile(!!dark);
+      return { url: r.url, attribution: r.attribution, refUrl: r.refUrl, maxZoom: r.maxZoom };
     }
     const autoLayerGroup = L.layerGroup().addTo(map);
     
@@ -656,10 +702,10 @@
     const _initTile = _resolveTileUrl(isDark);
     const tileLayer = L.tileLayer(_initTile.url, {
       attribution: _initTile.attribution,
-      maxZoom: 19,
+      maxZoom: _initTile.maxZoom || 19,
     }).addTo(autoLayerGroup);
     if (isDark && _initTile.refUrl) {
-      _darkRefLayer = L.tileLayer(_initTile.refUrl, { maxZoom: 19, attribution: _initTile.attribution }).addTo(autoLayerGroup);
+      _darkRefLayer = L.tileLayer(_initTile.refUrl, { maxZoom: _initTile.maxZoom || 19, attribution: _initTile.attribution }).addTo(autoLayerGroup);
     }
     if (typeof window.MC_applyTileFilter === 'function') window.MC_applyTileFilter();
     
@@ -669,15 +715,13 @@
     }
 
     const _mapThemeObs = new MutationObserver(function () {
-      const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
-        (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      const dark = window.MC_isDarkTheme();
       _syncDarkTiles(dark);
     });
     _mapThemeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
     // #1420 — re-render when the user picks a different dark provider in the customizer.
     window.addEventListener('mc-tile-provider-changed', function (e) {
-      const dark = document.documentElement.getAttribute('data-theme') === 'dark' ||
-        (document.documentElement.getAttribute('data-theme') !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      const dark = window.MC_isDarkTheme();
       if (e && e.detail && e.detail.type && e.detail.type !== (dark ? 'dark' : 'light')) return;
       _syncDarkTiles(dark);
     });
@@ -704,7 +748,7 @@
 
     // Save position on move
     map.on('moveend', () => {
-      const c = map.getCenter();
+      const c = map.getCenter().wrap();
       localStorage.setItem('map-view', JSON.stringify({ lat: c.lat, lng: c.lng, zoom: map.getZoom() }));
       userHasMoved = true;
     });
@@ -724,6 +768,7 @@
     });
 
     markerLayer = L.layerGroup().addTo(map);
+    estimatedLayer = L.layerGroup().addTo(map);
     clusterGroup = createClusterGroup();
     if (filters.clustering && clusterGroup) clusterGroup.addTo(map);
     routeLayer = L.layerGroup().addTo(map);
@@ -897,6 +942,11 @@
       scopeOverlayEl.checked = filters.scopeOverlay;
       scopeOverlayEl.addEventListener('change', e => { filters.scopeOverlay = e.target.checked; localStorage.setItem('meshcore-map-scope-overlay', e.target.checked); renderMarkers(); });
     }
+    const estimatedEl = document.getElementById('mcEstimated');
+    if (estimatedEl) {
+      estimatedEl.checked = filters.estimated;
+      estimatedEl.addEventListener('change', e => { filters.estimated = e.target.checked; localStorage.setItem('meshcore-map-estimated', e.target.checked); renderEstimated(); });
+    }
     document.getElementById('mcLastHeard').addEventListener('change', e => { filters.lastHeard = e.target.value; loadNodes(); });
 
     AreaFilter.init(document.getElementById('mapAreaFilter'));
@@ -1029,6 +1079,14 @@
     });
   }
 
+  // Route hops for a path whose hops were inferred (inferObservationPath),
+  // aligned with hopKeys. opts.inferredHops on either renderer takes this
+  // path instead of /api/resolve-hops, which resolves each prefix alone.
+  function inferredRouteHops(hopKeys, inferred) {
+    const roles = new Map((nodes || []).map(n => [n.public_key, n.role]));
+    return hopKeys.map((hop, i) => routeHopFromInferred(inferred[i].hop, inferred[i], roles.get(inferred[i].pubkey)));
+  }
+
   async function drawPacketRoute(hopKeys, origin, opts) {
     // Defensive: origin must be an object with pubkey/lat/lon/name. A bare
     // string slips through both branches at lines below and silently no-ops
@@ -1070,23 +1128,27 @@
       window.__mc_routeTrustControl = _trustMsg;
       return;
     }
+    const inferred = opts.inferredHops && opts.inferredHops.length === hopKeys.length ? opts.inferredHops : null;
     // #1422: use the backend's /api/resolve-hops for proper disambiguation
     // (unique_prefix vs multi-byte vs gps_preference vs affinity scoring).
     // Falls back to naive nodes.filter() scan if the API is unreachable.
     let serverResolved = null;
-    try {
-      const hopList = (hopKeys || []).join(',');
-      const apiUrl = '/api/resolve-hops?hops=' + encodeURIComponent(hopList);
-      const resp = await fetch(apiUrl, { cache: 'no-cache' });
-      if (resp.ok) {
-        const json = await resp.json();
-        serverResolved = json && json.resolved ? json.resolved : null;
+    if (!inferred) {
+      try {
+        const hopList = (hopKeys || []).join(',');
+        const apiUrl = '/api/resolve-hops?hops=' + encodeURIComponent(hopList);
+        const resp = await fetch(apiUrl, { cache: 'no-cache' });
+        if (resp.ok) {
+          const json = await resp.json();
+          serverResolved = json && json.resolved ? json.resolved : null;
+        }
+      } catch (e) {
+        console.warn('resolve-hops API call failed, falling back to local nodes scan', e);
       }
-    } catch (e) {
-      console.warn('resolve-hops API call failed, falling back to local nodes scan', e);
     }
     // Hide default markers so only the route is visible
     if (markerLayer) map.removeLayer(markerLayer);
+    if (estimatedLayer) map.removeLayer(estimatedLayer);
     if (clusterGroup) map.removeLayer(clusterGroup);
     if (heatLayer) map.removeLayer(heatLayer);
 
@@ -1101,6 +1163,7 @@
         L.DomEvent.preventDefault(e);
         routeLayer.clearLayers();
         if (markerLayer) map.addLayer(markerLayer);
+        if (estimatedLayer) map.addLayer(estimatedLayer);
         if (clusterGroup) map.addLayer(clusterGroup);
         map.removeControl(closeBtn);
         var container = map.getContainer();
@@ -1127,7 +1190,9 @@
     // prefix/pubkey but has no GPS coords, we still want its name/role/pubkey
     // for the sidebar — flag it as {resolved:false, gpsless:true} so the
     // renderer can label it "no GPS" instead of "unresolved prefix".
-    const raw = hopKeys.map(hop => {
+    const raw = inferred
+      ? inferredRouteHops(hopKeys, inferred).map((h, i) => Object.assign(h, { _hopHex: String(hopKeys[i]) }))
+      : hopKeys.map(hop => {
       const hopLower = String(hop).toLowerCase();
       // #1633 — tag the original hex token so MC_isVisibleHop can filter
       // 1-byte hops out of the polyline/sidebar when the customizer toggle
@@ -1333,18 +1398,23 @@
       }
     });
 
-    // Resolve canonical hops via /api/resolve-hops + naive fallback.
+    // Resolve canonical hops: the inferred hops when given, else
+    // /api/resolve-hops + naive fallback.
+    const inferred = opts.inferredHops && opts.inferredHops.length === canonicalPath.length ? opts.inferredHops : null;
+    const inferredRaw = inferred ? inferredRouteHops(canonicalPath, inferred) : null;
     let serverResolved = null;
-    try {
-      const apiUrl = '/api/resolve-hops?hops=' + encodeURIComponent(canonicalPath.join(','));
-      const resp = await fetch(apiUrl, { cache: 'no-cache' });
-      if (resp.ok) {
-        const json = await resp.json();
-        serverResolved = json && json.resolved ? json.resolved : null;
-      }
-    } catch (e) {}
+    if (!inferred) {
+      try {
+        const apiUrl = '/api/resolve-hops?hops=' + encodeURIComponent(canonicalPath.join(','));
+        const resp = await fetch(apiUrl, { cache: 'no-cache' });
+        if (resp.ok) {
+          const json = await resp.json();
+          serverResolved = json && json.resolved ? json.resolved : null;
+        }
+      } catch (e) {}
+    }
 
-    const raw = canonicalPath.map(hop => {
+    const raw = canonicalPath.map((hop, i) => {
       const hopLower = String(hop).toLowerCase();
       const srv = serverResolved && (serverResolved[hop] || serverResolved[hopLower] || serverResolved[hop.toUpperCase()]);
       // hopCounts is keyed on the SHORT prefix from observation paths (e.g. "37"),
@@ -1354,13 +1424,15 @@
       // contains an entry that is either an exact match OR a prefix of the hop's
       // full pubkey.
       let coverage = 0;
-      const hopFullKey = (srv && srv.pubkey) ? srv.pubkey.toLowerCase() : hopLower;
+      const hopFullKey = inferred ? String(inferred[i].pubkey || hop).toLowerCase()
+        : (srv && srv.pubkey) ? srv.pubkey.toLowerCase() : hopLower;
       paths.forEach(pth => {
         const phops = (pth.path || []).map(h => String(h).toLowerCase());
         const matches = phops.some(ph => ph === hopFullKey || hopFullKey.startsWith(ph) || ph.startsWith(hopFullKey));
         if (matches) coverage++;
       });
       const obsInfo = { observerCount: coverage || (hopCounts[hop] || 1), observerTotal: totalObservers };
+      if (inferredRaw) return Object.assign(inferredRaw[i], obsInfo);
       if (srv && srv.pubkey) {
         const c = srv.candidates && srv.candidates[0];
         if (c && c.lat != null && c.lon != null && !(c.lat === 0 && c.lon === 0)) {
@@ -1391,12 +1463,12 @@
       if (op) {
         const hasGps = op.lat != null && op.lon != null && !(op.lat === 0 && op.lon === 0);
         if (hasGps) {
-          raw.unshift({ lat: op.lat, lon: op.lon, name: origin.name || op.name || 'Sender', pubkey: op.public_key, role: op.role || 'companion', resolved: true, isOrigin: true, observerCount: totalObservers, observerTotal: totalObservers });
+          raw.unshift({ lat: op.lat, lon: op.lon, name: origin.name || op.name || 'Sender', pubkey: op.public_key, role: op.role || 'companion', resolved: true, isOrigin: true, _fromPayload: true, observerCount: totalObservers, observerTotal: totalObservers });
         } else {
-          raw.unshift({ name: origin.name || op.name || 'Sender', pubkey: op.public_key, role: op.role || 'companion', resolved: false, gpsless: true, isOrigin: true, observerCount: totalObservers, observerTotal: totalObservers });
+          raw.unshift({ name: origin.name || op.name || 'Sender', pubkey: op.public_key, role: op.role || 'companion', resolved: false, gpsless: true, isOrigin: true, _fromPayload: true, observerCount: totalObservers, observerTotal: totalObservers });
         }
       } else if (origin.name) {
-        raw.unshift({ name: origin.name, pubkey: origin.pubkey, role: 'companion', resolved: false, isOrigin: true, observerCount: totalObservers, observerTotal: totalObservers });
+        raw.unshift({ name: origin.name, pubkey: origin.pubkey, role: 'companion', resolved: false, isOrigin: true, _fromPayload: true, observerCount: totalObservers, observerTotal: totalObservers });
       }
     }
     // #1418 Phase D: append destination (recipient from decoded.destHash) so
@@ -1410,9 +1482,9 @@
       if (dp) {
         const hasGps = dp.lat != null && dp.lon != null && !(dp.lat === 0 && dp.lon === 0);
         if (hasGps) {
-          raw.push({ lat: dp.lat, lon: dp.lon, name: opts.destination.name || dp.name || 'Recipient', pubkey: dp.public_key, role: dp.role || 'companion', resolved: true, observerCount: totalObservers, observerTotal: totalObservers });
+          raw.push({ lat: dp.lat, lon: dp.lon, name: opts.destination.name || dp.name || 'Recipient', pubkey: dp.public_key, role: dp.role || 'companion', resolved: true, _fromPayload: true, observerCount: totalObservers, observerTotal: totalObservers });
         } else {
-          raw.push({ name: opts.destination.name || dp.name || 'Recipient', pubkey: dp.public_key, role: dp.role || 'companion', resolved: false, gpsless: true, observerCount: totalObservers, observerTotal: totalObservers });
+          raw.push({ name: opts.destination.name || dp.name || 'Recipient', pubkey: dp.public_key, role: dp.role || 'companion', resolved: false, gpsless: true, _fromPayload: true, observerCount: totalObservers, observerTotal: totalObservers });
         }
       }
     }
@@ -1429,6 +1501,7 @@
         edgeCounts: edgeCounts,
         packetHash: opts.packetHash || null,
         observationId: opts.observationId || null,
+        initialPathView: opts.initialPathView || null,
         allPaths: paths,
         packetContext: opts.packetContext || null
       });
@@ -1441,7 +1514,10 @@
   // fetches the packet+observations from /api/packets/<hash>, picks the
   // selected observation as canonical, and dispatches the same payload that
   // the packets-page 'View on map' button would have set in sessionStorage.
-  // Without an obs param, the first observation is used.
+  // Without an obs param, the first observation is used. Optional:
+  //   &observer=<pubkey or 8+ char prefix> — that observer's earliest
+  //     observation, its path isolated in the path picker
+  //   &paths=all — open the path picker's "All" (union) view
   async function loadRouteFromDeepLink() {
     try {
       const hash = location.hash || '';
@@ -1465,10 +1541,13 @@
       const pkt = data.packet || data;
       const observations = data.observations || pkt.observations || [];
       if (!observations.length) return;
-      // Pick the user-chosen observation by id, fall back to first
-      let chosen = null;
-      if (obsId) chosen = observations.find(o => String(o.id) === String(obsId));
-      if (!chosen) chosen = observations[0];
+      // Pick the observation: ?obs=<id>, else ?observer=<pubkey|prefix>'s
+      // earliest, else the first. ?observer / ?paths=all also set which
+      // path-picker view the route opens in.
+      const pick = window.MC_ROUTE_UTILS.resolveDeepLinkObservation(observations, {
+        obsId: obsId, observer: params.get('observer'), paths: params.get('paths')
+      });
+      const chosen = pick.chosen;
       // Parse decoded for src/dst.
       // Try observation first, fall back to packet-level decoded_json (GRP_TXT
       // / TRACE packets often have channel + content at the packet level, not
@@ -1488,53 +1567,35 @@
       else if (decoded.srcHash) origin.pubkey = decoded.srcHash;
       if (decoded.adName || decoded.name) origin.name = decoded.adName || decoded.name;
       const destination = decoded.destHash ? { pubkey: decoded.destHash } : null;
-      // Resolve the chosen observation's hops (canonical path).
-      // Priority: 1) server-side `resolved_path` (authoritative, eyeball-
-      // validated against packet detail), 2) client-side HopResolver (used
-      // by packets.js — does observer-IATA-aware geographic disambiguation),
-      // 3) raw prefixes (worst case, leaves naive lookup to drawPacketRoute).
-      let chosenPath = [];
+      // Infer the chosen observation's hops as one path, anchored on the
+      // observer that heard it — the same inference as the packet detail pane
+      // (inferObservationPath), with the observation's resolved_path as a
+      // hint. The renderers draw these hops; an unlisted hop stays a
+      // placeholder instead of the nearest node sharing its prefix. Without
+      // the resolver, the raw prefixes go to the renderers' own lookup.
       let rawHops = [];
       try { rawHops = JSON.parse(chosen.path_json || '[]'); } catch (_) {}
-      let resolvedHops = null;
-      try {
-        if (chosen.resolved_path) {
-          resolvedHops = typeof chosen.resolved_path === 'string' ? JSON.parse(chosen.resolved_path) : chosen.resolved_path;
-        }
-      } catch (_) {}
-      if (Array.isArray(resolvedHops) && resolvedHops.length === rawHops.length) {
-        chosenPath = rawHops.map((h, i) => resolvedHops[i] || h);
-      } else if (window.HopResolver && typeof window.HopResolver.resolve === 'function' && rawHops.length) {
-        // Use the SAME resolver the packets page uses, so route view and
-        // packet detail agree on hop identities.
+      let inferredHops = null;
+      if (rawHops.length && window.HopResolver && window.inferObservationPath) {
         try {
-          // Sender + observer hints help disambiguation
-          const senderLat = decoded.lat || decoded.latitude || null;
-          const senderLon = decoded.lon || decoded.longitude || null;
-          let obsLat = null, obsLon = null;
-          // Try to find observer's coords for geographic affinity scoring
-          if (chosen.observer_id && Array.isArray(nodes)) {
-            const obs = nodes.find(n => (n.public_key || '').toLowerCase() === String(chosen.observer_id).toLowerCase());
-            if (obs && obs.lat != null && obs.lon != null) { obsLat = obs.lat; obsLon = obs.lon; }
+          if (!window.HopResolver.ready()) {
+            const coords = await api('/iata-coords', { ttl: 300000 }).catch(() => ({ coords: {} }));
+            window.HopResolver.init(nodes || [], { observers: observers, iataCoords: coords.coords || {} });
           }
-          // HopResolver.init may already have been done by packets.js; if not,
-          // do a minimal init from window data we have.
-          if (!window.HopResolver.ready || !window.HopResolver.ready()) {
-            try {
-              window.HopResolver.init(nodes || [], { observers: [], iataCoords: {} });
-            } catch (_) {}
-          }
-          const resolveResult = window.HopResolver.resolve(rawHops, senderLat, senderLon, obsLat, obsLon, chosen.observer_id);
-          chosenPath = rawHops.map(h => {
-            const r = resolveResult ? resolveResult[h] : null;
-            return r && r.pubkey ? r.pubkey : h;
-          });
-        } catch (_) {
-          chosenPath = rawHops;
+          await window.ensureHopAffinity();
+          const obsKey = String(chosen.observer_id || '').toLowerCase();
+          const ob = observers.find(o => String(o.id).toLowerCase() === obsKey) ||
+            (nodes || []).find(n => (n.public_key || '').toLowerCase() === obsKey);
+          const obsPos = ob && ob.lat != null && ob.lon != null ? { lat: ob.lat, lon: ob.lon } : null;
+          const senderLat = decoded.lat != null ? decoded.lat : decoded.latitude;
+          const senderLon = decoded.lon != null ? decoded.lon : decoded.longitude;
+          const originPos = senderLat != null && senderLon != null ? { lat: senderLat, lon: senderLon } : null;
+          inferredHops = inferObservationPath(chosen, obsPos, originPos);
+        } catch (e) {
+          console.warn('[deep-link] path inference failed', e);
         }
-      } else {
-        chosenPath = rawHops;
       }
+      const chosenPath = inferredHops ? rawHops.map((h, i) => inferredHops[i].pubkey || h) : rawHops;
       // All observation paths for multi-path stroke weighting
       const allPaths = observations.map(o => {
         let p = [];
@@ -1550,16 +1611,8 @@
         const m = nodes.find(n => n.public_key.toLowerCase().startsWith(hL));
         return m ? m.name : null;
       }
-      // Map payload_type byte → string. Source: cmd/ingestor/decoder.go.
-      // 0=REQ, 1=RESPONSE, 2=TXT_MSG, 3=ACK, 4=ADVERT, 5=GRP_TXT,
-      // 6=GRP_DATA, 7=ANON_REQ, 8=PATH, 9=TRACE, 10=MULTIPART,
-      // 11=CONTROL, 12=RAW_CUSTOM.
-      const PAYLOAD_TYPE_MAP = {
-        0: 'REQ', 1: 'RESPONSE', 2: 'TXT_MSG', 3: 'ACK', 4: 'ADVERT',
-        5: 'GRP_TXT', 6: 'GRP_DATA', 7: 'ANON_REQ', 8: 'PATH',
-        9: 'TRACE', 10: 'MULTIPART', 11: 'CONTROL', 12: 'RAW_CUSTOM'
-      };
-      const inferredType = decoded.type || PAYLOAD_TYPE_MAP[pkt.payload_type] || 'OTHER';
+      // payload_type byte → firmware enum name from the canonical map.
+      const inferredType = decoded.type || window.PayloadLabels.api.enumNameById(pkt.payload_type) || 'OTHER';
       // Try to peek at raw_hex bytes to extract src/destHash when decoded is empty.
       // TXT_MSG/REQ/RESPONSE/ANON_REQ all have the same wire layout:
       //   byte0=route+type, byte1=path_len, then path bytes, then destHash + srcHash + encrypted body.
@@ -1697,12 +1750,14 @@
         return;
       }
       if (allPaths.length === 1) {
-        drawPacketRoute(chosenPath, origin, { destination: destination, packetHash: packetHash, observationId: obsId, packetContext: pktCtx });
+        drawPacketRoute(chosenPath, origin, { destination: destination, packetHash: packetHash, observationId: pick.observationId, packetContext: pktCtx, inferredHops: inferredHops });
       } else {
         drawPacketRouteMulti(allPaths, origin, {
           packetHash: packetHash,
-          observationId: obsId,
+          observationId: pick.observationId,
+          initialPathView: pick.pathView,
           canonicalPath: chosenPath,
+          inferredHops: inferredHops,
           destination: destination,
           packetContext: pktCtx
         });
@@ -1734,12 +1789,21 @@
       if (map !== loadingMap) return;
       nodes = data.nodes || [];
       observers = obsData.observers || [];
-
       buildRoleChecks(data.counts || {});
       buildRegionFilter();
       buildJumpButtons();
 
       renderMarkers();
+      // Optional and not awaited: the real markers never wait for it. The same
+      // cached list as the nodes page (reported-nodes.js); it answers an empty
+      // list when the route is missing or gated off.
+      if (window.ReportedNodes) {
+        window.ReportedNodes.load().then(function (rep) {
+          if (map !== loadingMap) return;
+          reported = rep;
+          renderEstimated();
+        });
+      }
 
       // Keep the Important Links overlay in sync on a full node reload: re-fetch
       // the neighbor-graph edges (not just re-render the stale cache) so the
@@ -1818,11 +1882,11 @@
     // Count active/stale per role from loaded nodes
     const roleCounts = {};
     for (const role of roles) {
-      roleCounts[role] = { active: 0, stale: 0 };
+      roleCounts[role] = { active: 0, uncertain: 0, stale: 0 };
     }
     for (const n of nodes) {
       const role = (n.role || 'companion').toLowerCase();
-      if (!roleCounts[role]) roleCounts[role] = { active: 0, stale: 0 };
+      if (!roleCounts[role]) roleCounts[role] = { active: 0, uncertain: 0, stale: 0 };
       const status = getNodeStatus(n); // #1598: relay-aware for infra
       roleCounts[role][status]++;
     }
@@ -1836,17 +1900,21 @@
       if (role === 'observer') {
         countStr = `(${obsCount})`;
       } else {
-        const rc = roleCounts[role] || { active: 0, stale: 0 };
+        const rc = roleCounts[role] || { active: 0, uncertain: 0, stale: 0 };
         const isInfra = role === 'repeater' || role === 'room';
         const thresh = isInfra ? '72h' : '24h';
         const activeTip = 'Active \u2014 heard within the last ' + thresh;
         const staleTip = 'Stale \u2014 not heard for over ' + thresh;
-        countStr = `(<span title="${activeTip}">${rc.active} active</span>, <span title="${staleTip}">${rc.stale} stale</span>)`;
+        const uncertainTip = 'Uncertain \u2014 only a hop prefix shared with other repeaters still appears in paths';
+        countStr = `(<span title="${activeTip}">${rc.active} active</span>, ` +
+          (rc.uncertain ? `<span title="${uncertainTip}">${rc.uncertain} uncertain</span>, ` : '') +
+          `<span title="${staleTip}">${rc.stale} stale</span>)`;
       }
       lbl.innerHTML = `<input type="checkbox" id="${cbId}" data-role="${role}" ${filters[role] ? 'checked' : ''}> <span style="color:${ROLE_COLORS[role]};font-weight:600;" aria-hidden="true">${shape}</span> ${ROLE_LABELS[role]} <span style="color:var(--text-muted)">${countStr}</span>`;
       lbl.querySelector('input').addEventListener('change', e => {
         filters[e.target.dataset.role] = e.target.checked;
         renderMarkers();
+        renderEstimated();
       });
       el.appendChild(lbl);
     }
@@ -1965,16 +2033,20 @@
 
     for (var i = 0; i < markers.length; i++) {
       var m = markers[i];
-      var w = m.isLabel ? 38 : 20;
-      var h = m.isLabel ? 24 : 20;
+      // Callers without bounds retain the old placement (including route labels).
+      var bounds = m.collisionBounds;
+      var w = bounds ? bounds.w : (m.isLabel ? 38 : 20);
+      var h = bounds ? bounds.h : (m.isLabel ? 24 : 20);
+      var left = bounds ? bounds.x : -w / 2;
+      var top = bounds ? bounds.y : -h / 2;
       var pt = mapRef.latLngToLayerPoint(m.latLng);
       var bestPt = pt;
-      var box = { x: pt.x - w / 2, y: pt.y - h / 2, w: w, h: h };
+      var box = { x: pt.x + left, y: pt.y + top, w: w, h: h };
 
       if (overlaps(box)) {
         for (var j = 0; j < offsets.length; j++) {
           var tryPt = L.point(pt.x + offsets[j][0], pt.y + offsets[j][1]);
-          var tryBox = { x: tryPt.x - w / 2, y: tryPt.y - h / 2, w: w, h: h };
+          var tryBox = { x: tryPt.x + left, y: tryPt.y + top, w: w, h: h };
           if (!overlaps(tryBox)) {
             bestPt = tryPt;
             box = tryBox;
@@ -2048,6 +2120,14 @@
     }
   }
 
+  // renderEstimated draws the estimated positions, hidden with the toggle or
+  // when repeaters are filtered out (they are all repeaters).
+  function renderEstimated() {
+    if (!estimatedLayer || !window.MapEstimated) return;
+    estimatedLayer.clearLayers();
+    if (filters.estimated && filters.repeater) window.MapEstimated.addTo(estimatedLayer, L, reported.nodes, reported.method);
+  }
+
   function renderMarkers() {
     if (_renderingMarkers) return;
     _renderingMarkers = true;
@@ -2064,6 +2144,10 @@
 
     const filterCtx = { selectedReferenceNode, neighborPubkeys };
     const filtered = nodes.filter(n => nodePassesMapFilters(n, filters, filterCtx));
+    // A warning and its neighbors need their full footprints. Keep the ordinary
+    // map's placement unchanged when no warning is present; clusters place themselves.
+    const sizeWarnings = !filters.clustering && filtered.some(n => n.foreign === true);
+    const labelMetrics = sizeWarnings && filters.hashLabels ? markerLabelMetrics() : null;
 
     const allMarkers = [];
 
@@ -2075,7 +2159,8 @@
 
     for (const node of filtered) {
       const lastSeenTime = node.last_heard || node.last_seen;
-      const isStale = getNodeStatus(node) === 'stale'; // #1598: relay-aware for infra
+      // #2260: uncertain is not proof of life either, so it dims like stale.
+      const isStale = getNodeStatus(node) !== 'active';
       const pk = (node.public_key || '').toLowerCase();
       const isAlsoObserver = _observerByPubkey.has(pk);
       const useLabel = node.role === 'repeater' && filters.hashLabels;
@@ -2095,7 +2180,8 @@
       // scope overlay stands down rather than the two fighting over the fill.
       var scopeState = (scopeTintEnabled(filters.scopeOverlay, filters.scopeState) && !mbColor) ? (node.scope_config_state || null) : null;
       var scopeColor = scopeState ? scopeTint(node) : null;
-      const icon = useLabel ? makeRepeaterLabelIcon(node, isStale, isAlsoObserver, mbStatus, scopeState) : makeMarkerIcon(node.role || 'companion', isStale, isAlsoObserver, mbColor || scopeColor);
+      const isForeign = node.foreign === true;
+      const icon = useLabel ? makeRepeaterLabelIcon(node, isStale, isAlsoObserver, mbStatus, scopeState, labelMetrics) : makeMarkerIcon(node.role || 'companion', isStale, isAlsoObserver, mbColor || scopeColor, isForeign);
       const latLng = L.latLng(node.lat, node.lon);
       // The scope state has to leave the fill and reach the DOM, or a dot marker
       // is colour and nothing else — which on the achromat preset is six greys
@@ -2106,8 +2192,9 @@
       // produced. The popup carries it too, for the pointerless case.
       var scopeLabel = scopeState ? scopeStateLabel(scopeState) : '';
       var markerAlt = (node.name || 'Unknown') + ' (' + (node.role || 'node') + (isAlsoObserver ? ' + observer' : '') + ')' +
-        (scopeLabel ? ', scope config ' + scopeLabel : '');
-      allMarkers.push({ latLng, node, icon, isLabel: useLabel, popupFn: function() { return buildPopup(node); }, alt: markerAlt, title: scopeLabel ? markerAlt : '' });
+        (scopeLabel ? ', scope config ' + scopeLabel : '') +
+        (isForeign ? ', Foreign advert flag: ' + FOREIGN_ADVERT_DESCRIPTION : '');
+      allMarkers.push({ latLng, node, icon, isLabel: useLabel, collisionBounds: sizeWarnings ? icon.options.collisionBounds : null, popupFn: function() { return buildPopup(node); }, alt: markerAlt, title: scopeLabel || isForeign ? markerAlt : '' });
     }
 
     // Add observer markers (skip observers already represented as a node marker)
@@ -2122,7 +2209,7 @@
         if (obs.id && displayedNodePubkeys.has(obs.id.toLowerCase())) continue;
         const icon = makeMarkerIcon('observer');
         const latLng = L.latLng(obs.lat, obs.lon);
-        allMarkers.push({ latLng, node: obs, icon, isLabel: false, popupFn: function() { return buildObserverPopup(obs); }, alt: (obs.name || obs.id || 'Unknown') + ' (observer)' });
+        allMarkers.push({ latLng, node: obs, icon, isLabel: false, collisionBounds: sizeWarnings ? icon.options.collisionBounds : null, popupFn: function() { return buildObserverPopup(obs); }, alt: (obs.name || obs.id || 'Unknown') + ' (observer)' });
       }
     }
 
@@ -2286,6 +2373,7 @@
       <div class="map-popup" style="font-family:var(--font);min-width:180px;">
         <h3 style="font-weight:700;font-size:14px;margin:0 0 4px;">${safeEsc(node.name || 'Unknown')}</h3>
         ${roleBadge}${obsBadge}
+        ${node.foreign === true ? '<p class="map-foreign-notice"><strong>Foreign advert flag</strong><br>' + FOREIGN_ADVERT_DESCRIPTION + '</p>' : ''}
         <dl style="margin-top:8px;font-size:12px;">
           ${hashPrefixRow}
           ${mbRow}
@@ -2444,6 +2532,8 @@
       map = null;
     }
     markerLayer = null;
+    estimatedLayer = null;
+    reported = { nodes: [], method: null };
     clusterGroup = null;
     _currentMarkerData = [];
     routeLayer = null;

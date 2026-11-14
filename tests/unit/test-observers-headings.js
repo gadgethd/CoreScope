@@ -58,8 +58,8 @@ test('expected headings present and ordered', () => {
   const re = /<th[^>]*>([^<]+)<\/th>/g;
   let m;
   while ((m = re.exec(thead)) !== null) labels.push(m[1].trim());
-  const expected = ['Status', 'Name', 'Region', 'Last Status', 'Last Packet',
-                    'Packet Health', 'Total Packets', 'Packets/Hour', 'Clock Offset', 'Uptime',
+  const expected = ['Status', 'Name', 'Region', 'Last Status', 'Last Packet', 'Neighbors',
+                    'Packet Health', 'Total Packets', 'Packets/Hour', 'TX 1h', 'Clock Offset', 'Uptime',
                     'Firmware', 'Client'];
   assert.deepStrictEqual(labels, expected,
     `Headings out of sync.\nGot:      ${JSON.stringify(labels)}\nExpected: ${JSON.stringify(expected)}`);

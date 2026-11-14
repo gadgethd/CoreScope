@@ -105,6 +105,7 @@ func main() {
 	if err != nil {
 		log.Printf("[config] warning: %v (using defaults)", err)
 	}
+	warnClientRxAppURL(cfg)
 
 	// CLI flags override config
 	if port > 0 {
@@ -445,6 +446,24 @@ func main() {
 		log.Printf("[known-channels] disabled (knownChannelsUrl unset in config)")
 	}
 
+	// Radio settings observers listened on, over time (#1869). Small tables,
+	// reloaded once a minute; see radio_history.go.
+	rhCtx, stopRadioHistory := context.WithCancel(context.Background())
+	runRadioHistory(rhCtx, database.conn)
+	defer stopRadioHistory()
+
+	// LoRa RF parameters from the MeshCore map (issue #1268). OPT-IN, like
+	// the known-channels catalogue: without rfParams.nodesUrl nothing is
+	// fetched and /api/rf-params reports enabled=false.
+	if cfg.RfParams.enabled() {
+		srv.rfParams = newRfParamsCache(cfg.RfParams)
+		rfCtx, stopRfParams := context.WithCancel(context.Background())
+		srv.rfParams.run(rfCtx, log.Printf)
+		defer stopRfParams()
+		log.Printf("[rf-params] background fetch enabled (nodes=%s, presets=%s, refresh=%s, maxAge=%s)",
+			cfg.RfParams.NodesURL, cfg.RfParams.PresetsURL, cfg.RfParams.refresh(), cfg.RfParams.maxAge())
+	}
+
 	// Steady-state repeater-enrichment recomputer (issue #1262).
 	// Prewarms the bulk caches feeding handleNodes so the very first
 	// /api/nodes?limit=2000 from live.js's SPA bootstrap hits a
@@ -469,6 +488,15 @@ func main() {
 	)
 	defer stopBridgeRecomp()
 	log.Printf("[bridge-recompute] background recompute enabled (interval=%s)",
+		cfg.AnalyticsDefaultRecomputeInterval())
+
+	// Zero-hop home regions for the /api/nodes region filter (#1879). Read
+	// by RegionNodePubkeys and handleNodes via a single atomic load.
+	stopNodeHomeRegionsRecomp := store.StartNodeHomeRegionsRecomputer(
+		cfg.AnalyticsDefaultRecomputeInterval(),
+	)
+	defer stopNodeHomeRegionsRecomp()
+	log.Printf("[node-home-regions-recompute] background recompute enabled (interval=%s)",
 		cfg.AnalyticsDefaultRecomputeInterval())
 
 	// Steady-state coverage + redundancy recomputer (issue #672 axes 3 & 4).

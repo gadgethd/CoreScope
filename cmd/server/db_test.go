@@ -1918,7 +1918,7 @@ func TestGetMetricsSummary(t *testing.T) {
 		"obs2", t1, -115.0)
 
 	since := now.Add(-24 * time.Hour).Format(time.RFC3339)
-	summary, err := db.GetMetricsSummary(since)
+	summary, err := db.GetMetricsSummary(since, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2250,16 +2250,11 @@ func TestPerObservationRawHexEnrich(t *testing.T) {
 	for _, obs := range tx.Observations {
 		m := store.enrichObsWithTx(obs, store.byTxID[obs.TransmissionID])
 		rh, _ := m["raw_hex"].(string)
-		if obs.RawHex != "" {
-			// Observer A: should get per-observation raw_hex
-			if rh != obsAHex {
-				t.Errorf("obs with own raw_hex: got %q, want %q", rh, obsAHex)
-			}
-		} else {
-			// Observer B: should fall back to transmission raw_hex
-			if rh != txHex {
-				t.Errorf("obs without raw_hex: got %q, want %q (tx fallback)", rh, txHex)
-			}
+		ceAssertNoRaw(t, obs)
+		// Hot-store enrichment uses the representative frame for both.
+		// The packet-detail endpoint retrieves original frames separately.
+		if rh != txHex {
+			t.Errorf("obs without raw_hex: got %q, want %q (tx fallback)", rh, txHex)
 		}
 	}
 }

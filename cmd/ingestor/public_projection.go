@@ -175,6 +175,7 @@ func (p *corePublicProjection) Refresh(ctx context.Context) (int64, error) {
 }
 
 var publicMeasurementTables = []string{
+	"observation_radios", "observer_radios", "observer_neighbor_reports", "client_node_names", "tx_rewrite_feed",
 	"advert_route_evidence", "neighbor_edges", "client_rf_samples", "client_rx_observations",
 	"client_receptions", "client_observers", "node_declared_regions", "observer_metrics", "dropped_packets",
 	"observations", "transmissions", "scope_match_totals", "inactive_nodes", "nodes", "observers",

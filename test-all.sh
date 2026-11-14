@@ -6,6 +6,7 @@ set -e
 cd "$(dirname "$0")"
 
 node tests/unit/test-test-inventory.js
+node tests/unit/test-manage-workflow.js
 node tests/unit/test-1108-region-hide-nodes.js
 node tests/unit/test-1659-analytics-warmup.js
 node tests/unit/test-a11y-1705-subpath-hop-prefix-e2e.js
@@ -47,14 +48,20 @@ node tests/unit/test-compare-overlap.js
 node tests/unit/test-confidence-indicator.js
 node tests/unit/test-coverage-gate.js
 node tests/unit/test-customizer-v2.js
+node tests/unit/test-dockerfile-buildplatform.js
 node tests/unit/test-drag-manager.js
+node tests/unit/test-e2e-coverage.js
 node tests/unit/test-direct-rf-heard-by.js
 node tests/unit/test-embed-mode-1369.js
+node tests/unit/test-theme-url-param-2236.js
 node tests/unit/test-fetch-all-nodes-pagination.js
 node tests/unit/test-fluid-scaffolding.js
 node tests/unit/test-frontend-helpers.js
 node tests/unit/test-geofilter-draft.js
 node tests/unit/test-hash-color.js
+node tests/unit/test-health-status.js
+node tests/unit/test-hop-path-detail.js
+node tests/unit/test-hop-path-inference.js
 node tests/unit/test-hop-resolver-affinity.js
 node tests/unit/test-issue-1065-gesture-hints-gates.js
 node tests/unit/test-issue-1107-live-layout.js
@@ -77,6 +84,7 @@ node tests/unit/test-issue-1412-customizer-no-override.js
 node tests/unit/test-issue-1415-packets-layout.js
 node tests/unit/test-issue-1418-cb-preset-ramp.js
 node tests/unit/test-issue-1418-deeplink-hops-channels.js
+node tests/unit/test-map-deeplink-path-params.js
 node tests/unit/test-issue-1418-edge-weights.js
 node tests/unit/test-issue-1418-polish-review.js
 node tests/unit/test-issue-1418-raw-hex-extraction.js
@@ -91,6 +99,7 @@ node tests/unit/test-issue-1456-score-labels.js
 node tests/unit/test-issue-1461-mobile-page-actions.js
 node tests/unit/test-issue-1470-card-bg-contrast.js
 node tests/unit/test-issue-1470-node-tile-helper.js
+node tests/unit/test-tile-resolver.js
 node tests/unit/test-issue-1473-prefix-generator.js
 node tests/unit/test-issue-1473-reserved-prefixes.js
 node tests/unit/test-issue-1485-live-anim-z.js
@@ -101,6 +110,10 @@ node tests/unit/test-issue-1509-nav-active-bg.js
 node tests/unit/test-issue-1518-home-url.js
 node tests/unit/test-issue-1532-live-fullscreen.js
 node tests/unit/test-issue-1562-observers-summary.js
+node tests/unit/test-issue-748-node-analytics-coverage.js
+node tests/unit/test-node-analytics-certain-timeline.js
+node tests/unit/test-issue-661-observer-airtime.js
+node tests/unit/test-issue-1268-rf-params.js
 node tests/unit/test-issue-1563-aggregate-and-inflight.js
 node tests/unit/test-issue-1574-live-map-max-nodes.js
 node tests/unit/test-issue-1606-pagination.js
@@ -122,6 +135,8 @@ node tests/unit/test-issue-1668-m3-typography.js
 node tests/unit/test-issue-1668-m4-per-route.js
 node tests/unit/test-issue-1697-mqtt-mobile-e2e.js
 node tests/unit/test-issue-1699-retransmission-chart.js
+node tests/unit/test-issue-2193-packets-per-hour.js
+node tests/unit/test-analytics-theme-refresh-before-data.js
 node tests/unit/test-issue-1705-subpath-contrast.js
 node tests/unit/test-issue-1753-copy-url-slash.js
 node tests/unit/test-issue-1770-mobile-row-clamp.js
@@ -132,6 +147,7 @@ node tests/unit/test-issue-1836-crossnav-case-normalization.js
 node tests/unit/test-issue-1843-node-qr-quiet-zone.js
 node tests/unit/test-issue-1846-observers-width.js
 node tests/unit/test-issue-1849-trace-hashbytes.js
+node tests/unit/test-hb-column-header-route.js
 node tests/unit/test-issue-1851-channel-message-scope.js
 node tests/unit/test-issue-1862-map-region-filter.js
 node tests/unit/test-issue-1868-control-decode.js
@@ -146,6 +162,12 @@ node tests/unit/test-issue-2001-map-scope-state.js
 node tests/unit/test-issue-2012-clear-filters-selection.js
 node tests/unit/test-issue-2095-channels-client-state.js
 node tests/unit/test-issue-2097-hop-ambiguity-badge.js
+node tests/unit/test-issue-2098-last-hop-region.js
+node tests/unit/test-issue-2206-hop-count.js
+node tests/unit/test-issue-2206-payload-badge.js
+node tests/unit/test-issue-2200-analytics-stale-load.js
+node tests/unit/test-issue-2218-node-analytics-stale-render.js
+node tests/unit/test-issue-2230-account-stale-render.js
 node tests/unit/test-live-anims.js
 node tests/unit/test-live-dt-cap-1524.js
 node tests/unit/test-live-legend-helper.js
@@ -153,6 +175,7 @@ node tests/unit/test-live-multibyte-filter.js
 node tests/unit/test-live-region-filter.js
 node tests/unit/test-live.js
 node tests/unit/test-map-clustering.js
+node tests/unit/test-map-estimated.js
 node tests/unit/test-mqtt-status-panel.js
 node tests/unit/test-my-repeaters-dashboard.js
 node tests/unit/test-naive-banner-tone.js
@@ -163,21 +186,25 @@ node tests/unit/test-node-reach-coverage.js
 node tests/unit/test-nodes-export-wiring.js
 node tests/unit/test-nav-drawer-version-footer.js
 node tests/unit/test-nodes-export.js
+node tests/unit/test-node-quick-actions.js
 node tests/unit/test-notifications-ui.js
 node tests/unit/test-observer-iata-1188.js
 node tests/unit/test-observer-menu-interactions.js
 node tests/unit/test-observer-naive-clock-1478.js
+node tests/unit/test-observer-detail-ownership.js
 node tests/unit/test-observer-search-filter.js
 node tests/unit/test-observers-headings.js
 node tests/unit/test-packet-filter-time.js
 node tests/unit/test-packet-filter-ux.js
 node tests/unit/test-packet-filter.js
 node tests/unit/test-packets-local-channels.js
+node tests/unit/test-packets-live-channel-filter.js
 node tests/unit/test-packets.js
 node tests/unit/test-panel-corner.js
 node tests/unit/test-path-inspector.js
 node tests/unit/test-payload-labels-content.js
 node tests/unit/test-payload-labels-namespace.js
+node tests/unit/test-payload-labels-surfaces.js
 node tests/unit/test-perf-anomaly.js
 node tests/unit/test-perf-disk-io-1120.js
 node tests/unit/test-perf-go-runtime.js
@@ -186,12 +213,15 @@ node tests/unit/test-preflight-xss-gate.js
 node tests/unit/test-pull-to-reconnect-1091.js
 node tests/unit/test-pull-to-reconnect.js
 node tests/unit/test-region-filter-setselected.js
+node tests/unit/test-region-filter-url-param.js
 node tests/unit/test-repeater-metric-scatter.js
+node tests/unit/test-reported-nodes.js
 node tests/unit/test-rx-coverage-config-race.js
 node tests/unit/test-rx-coverage-mine.js
 node tests/unit/test-rx-coverage-escape.js
 node tests/unit/test-rx-coverage-noise.js
 node tests/unit/test-rx-coverage-viewport.js
+node tests/unit/test-rx-coverage-app-qr.js
 node tests/unit/test-scope-audit-styles-linked.js
 node tests/unit/test-settings-sync.js
 node tests/unit/test-slideover-1056-rowsel-strict.js
@@ -199,6 +229,8 @@ node tests/unit/test-top-routes-overlay.js
 node tests/unit/test-traces.js
 node tests/unit/test-url-state.js
 node tests/unit/test-user-management-ui.js
+node tests/unit/test-vendored-libs.js
+node tests/unit/test-observer-neighbors.js
 node tests/unit/test-warmup-banner.js
 node tests/unit/test-ws-stale-watchdog-1074.js
 node tests/unit/test-xss-escape-sinks.js

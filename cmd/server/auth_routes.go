@@ -59,12 +59,29 @@ func (s *Server) registerAuthRoutes(r *mux.Router) {
 	if s.auth.set.proposals.enabled {
 		s.registerProposalRoutes(r)
 	}
+	// Broker hooks: no session, only the shared secret header.
+	if s.auth.set.observerLogins.enabled {
+		r.HandleFunc("/api/mqtt-hook/emqx/authn", s.handleEMQXAuthn).Methods("POST")
+		r.HandleFunc("/api/mqtt-hook/emqx/authz", s.handleEMQXAuthz).Methods("POST")
+		r.HandleFunc("/api/account/observer-login", s.withUser(s.handleObserverLoginGet)).Methods("GET")
+		r.HandleFunc("/api/account/observer-login", s.withUser(s.handleObserverLoginCreate)).Methods("POST")
+		r.HandleFunc("/api/account/observer-login/resend", s.withUser(s.handleObserverLoginResend)).Methods("POST")
+		r.HandleFunc("/api/admin/observer-logins", s.withAdmin(s.handleAdminObserverLogins)).Methods("GET")
+		r.HandleFunc("/api/admin/observer-logins/{id}/revoke", s.withAdmin(s.handleAdminObserverLoginRevoke)).Methods("POST")
+		r.HandleFunc("/api/admin/observer-logins/{id}/reissue", s.withAdmin(s.handleAdminObserverLoginReissue)).Methods("POST")
+		r.HandleFunc("/api/admin/observer-bindings/{pubkey}", s.withAdmin(s.handleAdminObserverBinding)).Methods("PUT")
+	}
 	if s.auth.notify != nil {
 		s.registerNotifyRoutes(r)
 	}
-	// The webhook exists only when a secret is configured.
+	// The webhook exists only when a secret is configured, and only for the
+	// configured provider.
 	if s.auth.set.webhookSecret != "" {
-		r.HandleFunc("/api/mail/brevo/webhook", s.handleBrevoWebhook).Methods("POST")
+		if s.auth.set.provider == "postal" {
+			r.HandleFunc("/api/mail/postal/webhook", s.handlePostalWebhook).Methods("POST")
+		} else {
+			r.HandleFunc("/api/mail/brevo/webhook", s.handleBrevoWebhook).Methods("POST")
+		}
 	}
 	if e2eRoutes != nil {
 		e2eRoutes(s, r)

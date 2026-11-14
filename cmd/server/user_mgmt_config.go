@@ -1,11 +1,13 @@
 package main
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -24,12 +26,15 @@ type UserManagementConfig struct {
 	ChannelProposals *ChannelProposalsConfig `json:"channelProposals,omitempty"`
 	Notifications    *NotificationsConfig    `json:"notifications,omitempty"`
 	Backup           *UsersBackupConfig      `json:"backup,omitempty"`
+	ObserverLogins   *ObserverLoginsConfig   `json:"observerLogins,omitempty"`
 }
 
 // UserMailConfig is userManagement.mail.
 type UserMailConfig struct {
 	Provider      string `json:"provider,omitempty"`
 	BrevoAPIKey   string `json:"brevoApiKey,omitempty"`
+	PostalBaseURL string `json:"postalBaseUrl,omitempty"`
+	PostalAPIKey  string `json:"postalApiKey,omitempty"`
 	FromEmail     string `json:"fromEmail,omitempty"`
 	FromName      string `json:"fromName,omitempty"`
 	WebhookSecret string `json:"webhookSecret,omitempty"`
@@ -89,6 +94,17 @@ type NotificationsConfig struct {
 	// ExternalAlerts feeds the node.external event (#2177). Absent: the
 	// event is not offered.
 	ExternalAlerts *ExternalAlertsConfig `json:"externalAlerts,omitempty"`
+	// AdaptiveOffline learns node.offline's threshold per node from its own
+	// certain traffic (#2260, adaptive_offline.go). Absent or not enabled:
+	// the fixed healthThresholds silent windows only.
+	AdaptiveOffline *AdaptiveOfflineConfig `json:"adaptiveOffline,omitempty"`
+}
+
+// AdaptiveOfflineConfig is userManagement.notifications.adaptiveOffline.
+type AdaptiveOfflineConfig struct {
+	Enabled      bool `json:"enabled"`
+	FloorMinutes int  `json:"floorMinutes,omitempty"` // shortest learned threshold, default 30
+	MinObservers int  `json:"minObservers,omitempty"` // fewer distinct observers keep the fixed window, default 3
 }
 
 // ExternalAlertsConfig is userManagement.notifications.externalAlerts: a
@@ -107,6 +123,30 @@ type notifySettings struct {
 	maxMailsPerDay    int           // notification mails per instance per 24 hours
 	maxWatchesPerUser int
 	external          externalAlertSettings
+	adaptive          adaptiveSettings
+}
+
+// adaptiveSettings is the resolved adaptiveOffline block; the zero value is
+// off.
+type adaptiveSettings struct {
+	enabled      bool
+	floor        time.Duration
+	minObservers int
+}
+
+const (
+	defaultAdaptiveFloorMinutes = 30
+	defaultAdaptiveMinObservers = 3
+)
+
+// resolveAdaptiveOffline fills the defaults; nil or not enabled is off.
+func resolveAdaptiveOffline(c *AdaptiveOfflineConfig) adaptiveSettings {
+	if c == nil || !c.Enabled {
+		return adaptiveSettings{}
+	}
+	return adaptiveSettings{enabled: true,
+		floor:        time.Duration(positiveOr(c.FloorMinutes, defaultAdaptiveFloorMinutes)) * time.Minute,
+		minObservers: positiveOr(c.MinObservers, defaultAdaptiveMinObservers)}
 }
 
 // externalAlertSettings is the resolved externalAlerts block; url "" means
@@ -162,6 +202,7 @@ func resolveNotifications(c *NotificationsConfig) notifySettings {
 		perUserPerDay:     positiveOr(c.PerUserPerDay, defaultNotifyPerUserPerDay),
 		maxMailsPerDay:    positiveOr(c.MaxMailsPerDay, defaultNotifyMaxMailsPerDay),
 		maxWatchesPerUser: positiveOr(c.MaxWatchesPerUser, defaultNotifyMaxWatches),
+		adaptive:          resolveAdaptiveOffline(c.AdaptiveOffline),
 	}
 }
 
@@ -200,6 +241,96 @@ func resolveBackup(c *UsersBackupConfig, dbPath string) backupSettings {
 	return b
 }
 
+// ObserverLoginsConfig is userManagement.observerLogins: personal MQTT logins
+// for observers. Off by default.
+type ObserverLoginsConfig struct {
+	Enabled       bool                 `json:"enabled"`
+	HookSecret    string               `json:"hookSecret,omitempty"`
+	EncryptionKey string               `json:"encryptionKey,omitempty"`
+	Broker        ObserverBrokerConfig `json:"broker"`
+	// SharedUsernames are the broker's own shared login names; the authz
+	// hook denies them a publish under a confirmed observer pubkey.
+	SharedUsernames []string `json:"sharedUsernames,omitempty"`
+}
+
+// ObserverBrokerConfig is the broker an observer connects to, as shown to
+// the user.
+type ObserverBrokerConfig struct {
+	Host      string `json:"host"`
+	Port      int    `json:"port,omitempty"`
+	Transport string `json:"transport,omitempty"`
+	TLS       bool   `json:"tls,omitempty"`
+}
+
+// observerLoginSettings is the resolved form; the zero value means off.
+type observerLoginSettings struct {
+	enabled    bool
+	hookSecret string
+	key        []byte // 32 bytes, for users.NewSecretBox
+	host       string
+	port       int
+	transport  string
+	tls        bool
+	// sharedUsernames is nil when none are configured.
+	sharedUsernames map[string]bool
+}
+
+const (
+	defaultObserverBrokerPort      = 1883
+	defaultObserverBrokerTransport = "tcp"
+)
+
+// resolveObserverLogins validates the block only when it is enabled. The
+// hook secret and key may come from the environment, which wins.
+func resolveObserverLogins(c *ObserverLoginsConfig, getenv func(string) string) (observerLoginSettings, error) {
+	if c == nil || !c.Enabled {
+		return observerLoginSettings{}, nil
+	}
+	o := observerLoginSettings{enabled: true, tls: c.Broker.TLS}
+	o.hookSecret = envOrValue(getenv, "CORESCOPE_OBSERVER_HOOK_SECRET", c.HookSecret)
+	if o.hookSecret == "" {
+		return observerLoginSettings{}, errors.New("userManagement.observerLogins.hookSecret is required (or CORESCOPE_OBSERVER_HOOK_SECRET)")
+	}
+	if len(o.hookSecret) < 16 {
+		return observerLoginSettings{}, errors.New("userManagement.observerLogins.hookSecret must be at least 16 characters")
+	}
+	rawKey := envOrValue(getenv, "CORESCOPE_OBSERVER_KEY", c.EncryptionKey)
+	if rawKey == "" {
+		return observerLoginSettings{}, errors.New("userManagement.observerLogins.encryptionKey is required (or CORESCOPE_OBSERVER_KEY)")
+	}
+	key, err := base64.StdEncoding.DecodeString(rawKey)
+	if err != nil || len(key) != 32 {
+		return observerLoginSettings{}, errors.New("userManagement.observerLogins.encryptionKey must be standard base64 of exactly 32 bytes")
+	}
+	o.key = key
+	o.host = strings.TrimSpace(c.Broker.Host)
+	if o.host == "" {
+		return observerLoginSettings{}, errors.New("userManagement.observerLogins.broker.host is required")
+	}
+	o.port = positiveOr(c.Broker.Port, defaultObserverBrokerPort)
+	o.transport = strings.TrimSpace(c.Broker.Transport)
+	if o.transport == "" {
+		o.transport = defaultObserverBrokerTransport
+	}
+	if o.transport != "tcp" && o.transport != "websockets" {
+		return observerLoginSettings{}, fmt.Errorf("userManagement.observerLogins.broker.transport %q is not supported (use \"tcp\" or \"websockets\")", o.transport)
+	}
+	for _, name := range c.SharedUsernames {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if strings.HasPrefix(name, mqttUsernamePrefix) {
+			return observerLoginSettings{}, fmt.Errorf("userManagement.observerLogins.sharedUsernames: %q is a personal login name", name)
+		}
+		if o.sharedUsernames == nil {
+			o.sharedUsernames = map[string]bool{}
+		}
+		o.sharedUsernames[name] = true
+	}
+	return o, nil
+}
+
 // UserManagementEnabled reports whether optional accounts are on. Nil config
 // or absent section means off (the default).
 func (c *Config) UserManagementEnabled() bool {
@@ -214,14 +345,17 @@ type userMgmtSettings struct {
 	secureCookie   bool
 	sessionTTL     time.Duration
 	trustedProxies []*net.IPNet
-	provider       string // "brevo" or (e2etest builds only) "fake"
+	provider       string // "brevo", "postal" or (e2etest builds only) "fake"
 	brevoAPIKey    string
+	postalBaseURL  string // no trailing slash
+	postalAPIKey   string
 	fromEmail      string
 	fromName       string
 	webhookSecret  string
 	proposals      proposalSettings
 	notify         notifySettings
 	backup         backupSettings
+	observerLogins observerLoginSettings
 }
 
 const defaultSessionDays = 30
@@ -271,7 +405,12 @@ func resolveUserManagement(u *UserManagementConfig, measurementDBPath string, ge
 		set.provider = "brevo"
 	}
 	set.brevoAPIKey = envOrValue(getenv, "CORESCOPE_BREVO_API_KEY", u.Mail.BrevoAPIKey)
-	set.webhookSecret = envOrValue(getenv, "CORESCOPE_BREVO_WEBHOOK_SECRET", u.Mail.WebhookSecret)
+	set.postalAPIKey = envOrValue(getenv, "CORESCOPE_POSTAL_API_KEY", u.Mail.PostalAPIKey)
+	webhookEnv := "CORESCOPE_BREVO_WEBHOOK_SECRET"
+	if set.provider == "postal" {
+		webhookEnv = "CORESCOPE_POSTAL_WEBHOOK_SECRET"
+	}
+	set.webhookSecret = envOrValue(getenv, webhookEnv, u.Mail.WebhookSecret)
 	from, err := users.NormalizeEmail(u.Mail.FromEmail)
 	if err != nil {
 		return nil, errors.New("userManagement.mail.fromEmail must be a valid address")
@@ -287,12 +426,24 @@ func resolveUserManagement(u *UserManagementConfig, measurementDBPath string, ge
 		if set.brevoAPIKey == "" {
 			return nil, errors.New("userManagement.mail: a Brevo API key is required (mail.brevoApiKey or CORESCOPE_BREVO_API_KEY)")
 		}
+	case "postal":
+		if set.postalAPIKey == "" {
+			return nil, errors.New("userManagement.mail: a Postal API key is required (mail.postalApiKey or CORESCOPE_POSTAL_API_KEY)")
+		}
+		if set.postalBaseURL, err = resolvePostalBaseURL(u.Mail.PostalBaseURL); err != nil {
+			return nil, err
+		}
+		// Postal sends the secret as HTTP Basic auth taken from the webhook
+		// URL, and its URL check allows only these characters there.
+		if set.webhookSecret != "" && !postalSecretRe.MatchString(set.webhookSecret) {
+			return nil, errors.New("userManagement.mail.webhookSecret may contain only letters, digits, '.', '_' and '-' with the postal provider")
+		}
 	case "fake":
 		if !fakeMailerAllowed {
 			return nil, errors.New(`userManagement.mail.provider "fake" is only available in e2etest builds`)
 		}
 	default:
-		return nil, fmt.Errorf("userManagement.mail.provider %q is not supported (use \"brevo\")", u.Mail.Provider)
+		return nil, fmt.Errorf("userManagement.mail.provider %q is not supported (use \"brevo\" or \"postal\")", u.Mail.Provider)
 	}
 	if set.webhookSecret != "" && len(set.webhookSecret) < 16 {
 		return nil, errors.New("userManagement.mail.webhookSecret must be at least 16 characters")
@@ -305,7 +456,33 @@ func resolveUserManagement(u *UserManagementConfig, measurementDBPath string, ge
 		}
 	}
 	set.backup = resolveBackup(u.Backup, set.dbPath)
+	if set.observerLogins, err = resolveObserverLogins(u.ObserverLogins, getenv); err != nil {
+		return nil, err
+	}
 	return set, nil
+}
+
+var postalSecretRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+// resolvePostalBaseURL validates mail.postalBaseUrl. The API key travels in a
+// header, so plain http is allowed only to a loopback host.
+func resolvePostalBaseURL(raw string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return "", errors.New("userManagement.mail.postalBaseUrl must be an absolute http(s) URL, e.g. https://postal.example.org")
+	}
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", errors.New("userManagement.mail.postalBaseUrl must not contain credentials, a query or a fragment")
+	}
+	if u.Scheme == "http" {
+		host := u.Hostname()
+		ip := net.ParseIP(host)
+		if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+			return "", errors.New("userManagement.mail.postalBaseUrl must use https (http is allowed only for localhost)")
+		}
+	}
+	u.Path = strings.TrimRight(u.Path, "/")
+	return u.String(), nil
 }
 
 func envOrValue(getenv func(string) string, key, fallback string) string {

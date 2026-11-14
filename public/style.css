@@ -882,7 +882,7 @@ img.brand-logo {
   color: var(--nav-text-muted); text-decoration: none;
   padding: 14px clamp(8px, 0.6vw + 4px, 14px); font-size: var(--fs-sm);
   font-weight: var(--fw-medium); /* #1668 M3 — 12-14px fluid + 500 floor */
-  border-bottom: 2px solid transparent; transition: all .15s;
+  border-bottom: 2px solid transparent; transition: color .15s, background-color .15s, border-color .15s;
   background: none; border-top: none; border-left: none; border-right: none;
   cursor: pointer; font-family: var(--font);
   white-space: nowrap; /* #1046: never wrap labels — wrapping makes the nav bar grow taller */
@@ -986,6 +986,15 @@ img.brand-logo {
 }
 .nav-stats .stat-val { color: var(--nav-text); font-weight: 600; transition: color 0.3s ease; }
 .nav-stats .stat-val.updated { color: var(--link-color); }
+
+/* Only compact when the measured desktop strip cannot fit its primary links. */
+.nav-hide-stats .nav-stats { display: none; }
+.nav-compact .brand-text { display: none; }
+.nav-compact .brand-logo { max-width: 80px; height: auto; max-height: 36px; }
+.nav-compact .nav-left { gap: var(--space-xs); }
+.nav-compact .nav-links .nav-link { padding-inline: 4px; }
+.nav-compact .nav-more-btn { padding-inline: 6px; }
+.nav-compact .nav-account-label { max-width: 5ch; }
 
 /* === Layout === */
 /* Default: body-scroll mode — content pushes beyond viewport, iOS status-bar
@@ -1387,7 +1396,7 @@ img.brand-logo {
  * corrupted overflow under last-writer-wins races. */
 body.scroll-locked { overflow: hidden; }
 .slide-over-backdrop {
-  position: fixed; inset: 0; z-index: 1000;
+  position: fixed; inset: 0; z-index: var(--z-modal-backdrop);
   background: rgba(0, 0, 0, 0.5);
   cursor: pointer;
 }
@@ -1395,7 +1404,7 @@ body.scroll-locked { overflow: hidden; }
 .slide-over-panel {
   position: fixed; top: 0; right: 0; bottom: 0;
   width: min(480px, 90vw);
-  z-index: 1001;
+  z-index: var(--z-modal);
   background: var(--detail-bg, var(--card-bg, #1f2937));
   color: var(--text, inherit);
   border-left: 1px solid var(--border);
@@ -1449,6 +1458,10 @@ body.scroll-locked { overflow: hidden; }
   font-size: 10px; font-weight: 700; font-family: var(--mono);
   background: var(--nav-bg); color: var(--nav-text); letter-spacing: .5px;
 }
+/* #1268 M3 — LoRa settings differ from nearby same-band nodes */
+.badge-lora-diff { display: inline-block; margin-left: 4px; padding: 0 5px; border: 1px solid currentColor; border-radius: 4px; font-size: 10px; font-weight: 600; color: var(--status-yellow-text); cursor: help; }
+.lora-deviation { margin-top: 2px; font-size: 11px; color: var(--status-yellow-text); }
+
 /* Issue #1290: listener vs repeater badge on observers list + detail.
  * Driven by ObserverResp.can_relay (false = firmware reported repeat:off).
  * Server-side disambiguator excludes listener observers from path-hop
@@ -2055,6 +2068,14 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 .node-detail { padding: 4px 0; }
 .node-detail-name { font-size: 20px; font-weight: 700; margin: 12px 0 4px; }
 .node-detail-role { margin-bottom: 12px; }
+.node-quick-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.node-quick-actions .btn-primary {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 12px; padding: 4px 10px; text-decoration: none;
+}
+@media (pointer: coarse) {
+  .node-quick-actions .btn-primary { min-height: 44px; min-width: 44px; }
+}
 .node-detail-section {
   background: var(--card-bg); border: 1px solid var(--border);
   border-radius: 8px; padding: 12px; margin-bottom: 8px;
@@ -2306,8 +2327,8 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 /* === Hamburger (hidden on desktop) === */
 .hamburger { display: none; }
 /* "More" button (hidden on desktop) */
-.nav-more-wrap { display: none; position: relative; }
-.nav-more-btn { display: inline-flex; }
+.nav-more-wrap { display: none; position: relative; flex-shrink: 0; }
+.nav-more-btn { display: inline-flex; transition-property: color, background-color, border-color; }
 /* #1406: position:fixed (not absolute) so the dropdown escapes .nav-more-wrap's
    layout box. When absolute, the dropdown's content extents inflated
    .nav-more-wrap.scrollHeight → bubbled into .nav-left flex line-height calc
@@ -2474,18 +2495,30 @@ button.ch-item:hover .ch-icon-btn { opacity: 1; }
 
   /* #1224 Channels mobile UX: compact header, dominant channel name,
      icon-only row actions, smaller empty state. */
+  /* No max-height here: on touch devices the region pills (44px) and
+     + Add (48px) touch-target minimums can't fit a 56px cap, and the
+     wrapped rows overflowed onto the channel list. Instead: title + Add
+     on row 1, region pills on a full-width, sideways-scrolling row 2. */
   .ch-sidebar-header {
     padding: 6px 10px; gap: 6px;
-    max-height: 56px;
+    flex-wrap: wrap;
   }
-  .ch-sidebar-title { font-size: 14px; }
+  .ch-sidebar-title { font-size: 14px; flex: 1 1 auto; order: 1; }
   .ch-sidebar-title .ch-icon { font-size: 16px; }
-  .ch-add-channel-btn { padding: 4px 8px; font-size: 12px; }
+  .ch-add-channel-btn { padding: 4px 8px; font-size: 12px; flex: 0 0 auto; order: 2; }
   .ch-analytics-link { padding: 3px 7px; font-size: 13px; }
   /* Region filter shows just its compact pills/dropdown trigger in the header. */
-  .ch-header-region .region-filter-bar { padding: 0; gap: 4px; }
-  .ch-header-region .region-pill { padding: 2px 6px; font-size: 11px; }
-  .ch-header-region .region-dropdown-trigger { padding: 3px 6px; font-size: 11px; }
+  .ch-header-region {
+    order: 3; flex: 1 0 100%; min-width: 0;
+    overflow-x: auto; scrollbar-width: none;
+  }
+  .ch-header-region::-webkit-scrollbar { display: none; }
+  /* Dropdown mode (>4 regions): the menu is position:absolute below its
+     trigger, so the row must not clip it. A single trigger never needs
+     to scroll sideways anyway. */
+  .ch-header-region:has(.region-dropdown-wrap) { overflow: visible; }
+  .ch-header-region:empty { display: none; }
+  .ch-header-region .region-filter-bar { padding: 0; gap: 4px; flex-wrap: nowrap; }
 
   /* Keep legacy channel rows compact without reducing the shared hit area.
      The mobile chat-app renderer uses rows without inline action icons. */
@@ -3132,6 +3165,9 @@ button.ch-item.ch-item-encrypted .ch-badge { filter: grayscale(0.6); }
 
 /* Ambiguous hop indicator */
 .hop-ambiguous { border-bottom: 1px dashed var(--status-yellow, #f59e0b); }
+/* Unlisted hop: no known node with its prefix fits that point in the path */
+.hop-unlisted { font-family: var(--mono); color: var(--text-muted); }
+.hop-nogps { font-size: 0.85em; color: var(--text-muted); }
 .hop-warn { font-size: 0.7em; margin-left: 2px; vertical-align: super; color: var(--status-yellow, #f59e0b); }
 .hop-conflict-btn { background: var(--status-yellow, #f59e0b); color: #000; border: none; border-radius: 4px; font-size: 11px;
   font-weight: 700; padding: 1px 5px; cursor: pointer; vertical-align: middle; margin-left: 3px; line-height: 1.2; }
@@ -3480,6 +3516,28 @@ tr[data-hops]:hover { background: rgba(59,130,246,0.1); }
 }
 
 .meshcore-marker { background: none !important; border: none !important; }
+.map-foreign-indicator {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  margin-left: 3px;
+  border-radius: 2px;
+  background: var(--card-bg);
+  color: var(--warning);
+  font-size: 14px;
+  vertical-align: middle;
+}
+/* Keep the observer star at the top right unobscured in dot mode. */
+.meshcore-marker:not(.meshcore-label-marker) .map-foreign-indicator {
+  position: absolute;
+  right: -7px;
+  bottom: -7px;
+  margin-left: 0;
+}
+/* Preserve the compact popup width so the note stays clear of mobile controls. */
+.map-foreign-notice { max-width: 200px; margin: 6px 0; color: var(--warning); font-size: 12px; }
 .marker-stale { opacity: 0.7; filter: grayscale(90%) brightness(0.8); }
 .last-seen-active { color: var(--status-green); }
 .last-seen-stale { color: var(--text-muted); }
@@ -3511,11 +3569,9 @@ tr[data-hops]:hover { background: rgba(59,130,246,0.1); }
 @container (max-width: 480px) {
   .dumbbell-row, .dumbbell-axis { --relay-airtime-columns: 70px minmax(20px, 1fr) 90px; }
 }
-/* Constrain chart media inside the card (svg/canvas at any depth). The
-   `.analytics-chart-card svg, .analytics-chart-card canvas` descendant
-   selector is robust to wrapper elements (legends, tooltips, axis
-   groups) being added between the card and the chart media. */
-.analytics-chart-card svg,
+/* Constrain chart media at any depth, preserving inline Phosphor icons.
+   Descendant selectors allow wrappers between the card and chart media. */
+.analytics-chart-card svg:not(.ph-icon),
 .analytics-chart-card canvas { max-width: 100%; height: auto; display: block; }
 .analytics-chart-card h4 { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--text-muted); margin-bottom: 4px; }
 .analytics-chart-desc { font-size: 10px; color: var(--text-muted); margin-bottom: 8px; font-style: italic; }
@@ -3523,6 +3579,8 @@ tr[data-hops]:hover { background: rgba(59,130,246,0.1); }
 .analytics-heatmap-cell { aspect-ratio: 1; border-radius: 2px; cursor: default; }
 .analytics-heatmap-label { font-size: 10px; color: var(--text-muted); display: flex; align-items: center; }
 .analytics-time-range { display: flex; gap: 8px; margin-bottom: 16px; }
+/* #748 — the requested range reaches past the in-memory window */
+.analytics-coverage-notice { margin: 0 0 12px; padding: 6px 10px; border-left: 3px solid var(--status-yellow); font-size: 12px; color: var(--text-muted); }
 .analytics-time-range button { padding: 4px 12px; border-radius: 4px; border: 1px solid var(--border); background: var(--card-bg); color: var(--text); cursor: pointer; font-size: 12px; }
 /* .analytics-time-range button.active — #1719 round-1 polish: bg/color
    consolidated into the .btn-active-accent rule. */
@@ -4266,10 +4324,13 @@ button.region-pill-active:hover { opacity: 0.85; color: var(--text-on-accent); }
 .observers-page .page-header h2 { font-size: var(--fs-lg); margin: 0 var(--space-sm) 0 0; }
 .observers-page .page-header .obs-refresh-spacer { margin-left: auto; }
 
+/* Empty datasets leave canvases at their native size without Chart.js. */
+.observer-detail-page .obs-charts canvas { max-width: 100%; }
+
 /* Observer-detail header: the Compare-with picker + Compare button
  * should sit together visually. Reuses the same .btn-secondary. */
 .observer-detail-page .compare-with-group {
-  display: inline-flex; align-items: stretch; gap: 0;
+  display: inline-flex; align-items: stretch; gap: 0; max-width: 100%;
   border: 1px solid var(--border); border-radius: var(--radius-sm);
   background: var(--surface-1); overflow: hidden;
 }
@@ -4277,7 +4338,7 @@ button.region-pill-active:hover { opacity: 0.85; color: var(--text-on-accent); }
   border: none; background: transparent; color: var(--text);
   font-size: var(--fs-sm); padding: 6px 10px;
   border-right: 1px solid var(--border);
-  min-height: 0;
+  min-height: 0; min-width: 0;
 }
 .observer-detail-page .compare-with-group select.time-range-select:focus { outline: none; }
 .observer-detail-page .compare-with-group button[data-action="compare-with-go"] {
@@ -4361,6 +4422,11 @@ button.region-pill-active:hover { opacity: 0.85; color: var(--text-on-accent); }
 
 .rf-cell-sparkline { height: 24px; margin: 2px 0; overflow: hidden; }
 .rf-cell-stats { display: flex; gap: 8px; font-size: 10px; color: var(--text-muted); }
+/* #661 — a fourth stat ("TX 1h") wraps between items, never inside one */
+.rf-cell-stats { flex-wrap: wrap; row-gap: 0; }
+.rf-cell-stats > span { white-space: nowrap; }
+/* #661 — rolling 1 h TX airtime at or over the duty-cycle threshold */
+.airtime-over { color: var(--status-red-text); font-weight: 600; }
 
 /* Side panel for observer detail */
 .rf-health-detail {
@@ -5846,3 +5912,41 @@ body.embed #app.app-fixed {
 .role-swatch--room      { color: var(--role-room); }
 .role-swatch--sensor    { color: var(--role-sensor); }
 .role-swatch--observer  { color: var(--role-observer); }
+
+/* Estimated positions (map-estimated.js): hollow, dashed, marked with "≈" so
+   they never read as a node's own advert position. */
+.mc-est-marker { background: none; border: none; }
+.mc-est-ring { fill: var(--surface-1); fill-opacity: .85; stroke: var(--mc-role-repeater); stroke-width: 2; stroke-dasharray: 3 3; }
+.mc-est-glyph { fill: var(--mc-role-repeater); font: 700 15px/1 var(--mono, ui-monospace, monospace); }
+.leaflet-interactive.mc-est-area, path.mc-est-area { stroke: var(--mc-role-repeater); stroke-width: 1.5; stroke-dasharray: 6 6; fill: var(--mc-role-repeater); fill-opacity: .07; }
+.mc-est-legend { color: var(--mc-role-repeater); font-weight: 700; }
+.mc-est-popup { display: grid; gap: 4px; max-width: 280px; }
+.mc-est-badge { justify-self: start; font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; padding: 1px 6px; border-radius: 3px; border: 1px dashed var(--mc-role-repeater); color: var(--text); }
+.mc-est-name { font-weight: 700; font-size: 14px; }
+.mc-est-pk { color: var(--text-muted); font-size: 11px; }
+.mc-est-what, .mc-est-caveat { margin: 2px 0; font-size: 12px; }
+.mc-est-caveat { color: var(--text-muted); }
+.mc-est-facts { display: grid; grid-template-columns: auto 1fr; gap: 1px 8px; margin: 2px 0; font-size: 12px; }
+.mc-est-facts dt { color: var(--text-muted); }
+.mc-est-facts dd { margin: 0; }
+
+/* Self-reported repeaters (reported-nodes.js): no advert, name only. */
+.reported-section { margin-top: 16px; padding: 12px; border: 1px dashed var(--mc-role-repeater); border-radius: 6px; }
+.reported-section h3 { margin: 0 0 4px; font-size: 14px; }
+.reported-count { color: var(--text-muted); font-weight: 400; }
+.reported-intro { margin: 0 0 8px; font-size: 12px; color: var(--text-muted); max-width: 70ch; }
+.reported-pos-est { color: var(--text); }
+.reported-pos-none { color: var(--text-muted); }
+.reported-tag { font-size: 11px; color: var(--text-muted); border: 1px dashed var(--mc-role-repeater); border-radius: 3px; padding: 0 4px; }
+.reported-detail { padding: 16px; margin: 16px auto; max-width: 640px; display: grid; gap: 8px; }
+.reported-badge { justify-self: start; font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; padding: 1px 6px; border-radius: 3px; border: 1px dashed var(--mc-role-repeater); color: var(--text); }
+.reported-detail .node-detail-name { font-size: 20px; font-weight: 700; }
+.reported-detail .node-detail-key { font-size: 11px; word-break: break-all; color: var(--text-muted); }
+.reported-detail p { margin: 0; }
+.reported-caveat { font-size: 12px; color: var(--text-muted); }
+.reported-facts { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; margin: 0; }
+.reported-facts dt { color: var(--text-muted); }
+.reported-facts dd { margin: 0; }
+.reported-links { display: flex; flex-wrap: wrap; gap: 6px; }
+.reported-links .btn-primary { text-decoration: none; padding: 4px 10px; font-size: 12px; }
+.reported-table td { white-space: normal; }

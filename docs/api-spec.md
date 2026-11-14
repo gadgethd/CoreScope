@@ -104,7 +104,7 @@ They return `total` (the unfiltered/filtered count before pagination).
 
 ## User management (optional)
 
-These routes are registered only when `userManagement.enabled` is true. When it is off they do not exist, and requests to them fall through to the SPA page (HTTP 200, HTML). The webhook route exists only when `mail.webhookSecret` is also set. Sessions use the `cs_session` cookie (HttpOnly, SameSite=Lax). Every state-changing request that authenticates with the cookie needs an `Origin` (or `Referer`) equal to `publicBaseUrl` and the header `X-CS-CSRF: <csrfToken from GET /api/auth/me>`. Errors are `{"error": "<message>"}`. Rate-limited calls answer `429` with `Retry-After`. Request bodies are JSON. On every route except the webhook and `PUT /api/account/settings` they are limited to 16 KiB and unknown fields are rejected with `400`; the webhook takes up to 256 KiB of Brevo's payload as is.
+These routes are registered only when `userManagement.enabled` is true. When it is off they do not exist, and requests to them fall through to the SPA page (HTTP 200, HTML). The webhook route exists only when `mail.webhookSecret` is also set, and only for the configured `mail.provider`. Sessions use the `cs_session` cookie (HttpOnly, SameSite=Lax). Every state-changing request that authenticates with the cookie needs an `Origin` (or `Referer`) equal to `publicBaseUrl` and the header `X-CS-CSRF: <csrfToken from GET /api/auth/me>`. Errors are `{"error": "<message>"}`. Rate-limited calls answer `429` with `Retry-After`. Request bodies are JSON. On every route except the webhook and `PUT /api/account/settings` they are limited to 16 KiB and unknown fields are rejected with `400`; the webhooks take up to 256 KiB of the provider's payload as is.
 
 | Method and path | Auth | Body and response |
 |---|---|---|
@@ -139,6 +139,7 @@ These routes are registered only when `userManagement.enabled` is true. When it 
 | `GET /api/admin/stats` | admin | -> `{total, active, pending, disabled, admins, stuckPending, bouncing, new7d, new30d, newPerDay, active7d, active30d, logins24h, failedLogins24h, mail7d, guessing}`. `newPerDay` is `[{day, count}]` for 30 UTC days, oldest first; registrations count `user.register` audit rows. `stuckPending` counts pending accounts older than 24 hours. `mail7d` is `{delivered, bounced, blocked, spam, pending, other}` by latest delivery event. `guessing` is `[{userId, displayName, failed}]`: accounts with 5 or more failed logins in 24 hours |
 | `GET /api/admin/users-backup` | admin | -> `application/octet-stream`, attachment `corescope-users-<YYYYMMDD-HHMMSS>.db` (UTC): a fresh consistent copy of `users.db`. It holds every password hash and address, so store it encrypted. Writes a `user.backup` audit row. Restore: docs/user-guide/accounts.md, Backups |
 | `POST /api/mail/brevo/webhook` | `Authorization: Bearer <webhookSecret>` | Brevo transactional event payload -> `{ok}`. `401` on a wrong secret |
+| `POST /api/mail/postal/webhook` | HTTP Basic auth, password `<webhookSecret>` (any user name) | Postal webhook payload `{event, timestamp, payload, uuid}` -> `{ok}`, also for events that are not about a message. `401` on a wrong secret |
 
 `adminUser` = `{id, email, displayName, role, status, createdAt, activatedAt, activatedManually, activatedBy, lastLoginAt, emailBouncing, configAdmin, lastMail}`. `status` is `pending`, `active` or `disabled`.
 
@@ -894,6 +895,28 @@ Returned when the node is unknown or blacklisted.
 { "error": "Not found" }
 ```
 
+### Response `429`
+
+At most 2 uncached reports compute at once, with up to 8 distinct cold build
+leaders waiting for a slot for up to 3 s. A further distinct cold leader gets
+429 immediately when the queue is full; an admitted leader gets 429 if no
+slot frees before its wait expires. Waiting holds no database connection.
+These are fixed internal defaults, with no operator or customizer setting.
+
+Cached answers never wait. Concurrent requests for the same node and `days`
+share one computation and one queue admission, so the eight-leader cap does
+not bound all existing singleflight followers. When the request that started
+a shared computation disconnects first, the others sharing it also get 429.
+Nothing is cached for a 429; retry after `Retry-After` seconds.
+
+```
+Retry-After: 2
+```
+
+```json
+{ "error": "reach is busy computing other reports", "retryAfter": 2 }
+```
+
 ---
 
 ## GET /api/packets
@@ -910,6 +933,7 @@ Paginated packet (transmission) list with filtering.
 | `route`      | string | —       | Filter by route type                               |
 | `region`     | string | —       | Filter by region (IATA code substring)             |
 | `observer`   | string | —       | Filter by observer ID                              |
+| `excludeTx`  | boolean | `false` | Set exactly `true` to exclude TX-only evidence for the selected observer(s) |
 | `hash`       | string | —       | Filter by packet hash                              |
 | `since`      | string | —       | ISO timestamp lower bound                          |
 | `until`      | string | —       | ISO timestamp upper bound                          |
@@ -918,6 +942,14 @@ Paginated packet (transmission) list with filtering.
 | `order`      | string | `DESC`  | Sort direction: `asc` or `desc`                    |
 | `groupByHash`| string | —       | Set to `"true"` for grouped response               |
 | `expand`     | string | —       | Set to `"observations"` to include observation arrays |
+
+With `excludeTx=true`, a transmission must have at least one observation whose
+direction is not `tx`. When `observer` is set, that same observation must belong
+to one of its comma-separated IDs; without it, any observer can qualify.
+Missing/empty directions remain eligible for legacy data. This filters membership,
+including totals and grouped results; displayed direction and signal values still
+come from the transmission's representative observation. Multi-node mode (`nodes`)
+ignores this option, as it does the other ordinary packet filters.
 
 ### Response `200` (default)
 
@@ -1896,6 +1928,7 @@ not being the same as "declared nothing"), which apply here identically.
 | `window` | string | `24h`      | Time window: `1h`, `24h`, `7d` |
 | `mode`   | string | `declared` | `declared` (this section) or `transport` (see [Transport view](#transport-view-modetransport)) |
 | `scope`  | string | —          | `mode=transport` only: region scope to split the fleet by (`be`, `be-van`), with or without `#`, any case |
+| `region` | string | —          | Observer IATA filter, comma-separated (`SFO,SJC`), both views: count only forwarding heard by observers in those regions. As on every other endpoint this means *heard by*, not *located in*; `All` means no filter, and codes with no observer match nothing. Each region set is cached separately |
 
 ### Response `200`
 
@@ -1903,6 +1936,7 @@ not being the same as "declared nothing"), which apply here identically.
 {
   "window": string,                    // echoed window ("1h", "24h", or "7d")
   "since":  string (ISO),              // start of the observed-forwarding window
+  "region": string | undefined,        // normalised ?region= codes ("sfo,sjc" -> "SFO,SJC"); present only when given
   "repeaters": [
     {
       "publicKey":        string,
@@ -2064,6 +2098,7 @@ separately where it exists. Cached per window with the same TTLs as the declared
   "mode": "transport",
   "window": string,
   "since": string (ISO),
+  "region": string | undefined,        // normalised ?region= codes; present only when given
   "scope": string | undefined,         // normalised ?scope= filter ("#FR" -> "fr"); present only when given
   "carrying": number | undefined,      // rows with carriesScope: true; only with scope
   "notCarrying": number | undefined,   // rows with carriesScope: false; only with scope
@@ -2395,7 +2430,8 @@ Client-side configuration values.
   "cacheInvalidateMs":  number | null,
   "externalUrls":       object | null,
   "propagationBufferMs": number,         // default: 5000
-  "clientRfSamples":    boolean          // opt-in flag; gates /api/rf-noise
+  "clientRfSamples":    boolean,         // opt-in flag; gates /api/rf-noise
+  "clientRxAppUrl":     string           // omitted unless clientRxCoverage is on and clientRxCoverage.appUrl is an https URL
 }
 ```
 
@@ -2603,7 +2639,7 @@ A transmission/packet as stored in memory and returned by most endpoints:
   "hash":              string,              // content hash (dedup key)
   "first_seen":        string (ISO),        // when first observed
   "timestamp":         string (ISO),        // display timestamp (= first_seen)
-  "route_type":        number,              // 0=DIRECT, 1=FLOOD, 2=reserved, 3=TRANSPORT
+  "route_type":        number,              // 0=TRANSPORT_FLOOD, 1=FLOOD, 2=DIRECT, 3=TRANSPORT_DIRECT
   "payload_type":      number,              // 0=REQ, 1=RESPONSE, 2=TXT_MSG, 3=ACK, 4=ADVERT, 5=GRP_TXT, 7=ANON_REQ, 8=PATH, 9=TRACE, 11=CONTROL
   "payload_version":   number | null,
   "decoded_json":      string | null,       // JSON-stringified decoded payload
