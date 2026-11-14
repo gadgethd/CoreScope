@@ -100,7 +100,12 @@ type corePublicProjection struct {
 	loadPolicy    func(context.Context) (*corePublicPolicy, error)
 	apply         func(*Store, publicProjectionRecord) error
 	retentionDays int
-	fingerprint   string // privacy-rule digest behind the last completed refresh
+}
+
+type projectionCheckpoint struct {
+	Generation  int64
+	Fingerprint string
+	Revision    int64
 }
 
 func newCorePublicProjection(store *Store, load func(context.Context) (*corePublicPolicy, error),
@@ -137,7 +142,7 @@ func newCorePublicProjection(store *Store, load func(context.Context) (*corePubl
 	}
 	_, err := store.db.Exec(`CREATE TABLE IF NOT EXISTS public_projection_state (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), generation INTEGER NOT NULL, ready INTEGER NOT NULL,
-  policy_fingerprint TEXT NOT NULL DEFAULT '');
+  policy_fingerprint TEXT NOT NULL DEFAULT '', policy_revision INTEGER NOT NULL DEFAULT 0);
   INSERT OR IGNORE INTO public_projection_state(singleton,generation,ready) VALUES(1,0,0);
   CREATE TABLE IF NOT EXISTS public_projection_journal (
    id INTEGER PRIMARY KEY AUTOINCREMENT, observation_id TEXT NOT NULL UNIQUE,
@@ -153,6 +158,15 @@ func newCorePublicProjection(store *Store, load func(context.Context) (*corePubl
 		!strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
 		return nil, err
 	}
+	if _, err := store.db.Exec(`ALTER TABLE public_projection_state ADD COLUMN policy_revision INTEGER NOT NULL DEFAULT 0`); err != nil &&
+		!strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+		return nil, err
+	}
+	// A legacy cursor cannot prove it observed earlier pruning. Establish a
+	// durable baseline so it performs one bounded retention replay on upgrade.
+	if _, err := store.db.Exec(`UPDATE public_projection_state SET policy_revision=1 WHERE policy_revision=0 AND ready=1`); err != nil {
+		return nil, err
+	}
 	// Do NOT force ready=0 here. Both ensure() and Batch() clear ready before
 	// any derived write and restore it afterwards, so ready=1 in the database
 	// means the last writer completed and the tables match the journal. The
@@ -162,16 +176,25 @@ func newCorePublicProjection(store *Store, load func(context.Context) (*corePubl
 }
 
 func (p *corePublicProjection) Refresh(ctx context.Context) (int64, error) {
+	checkpoint, err := p.RefreshCheckpoint(ctx)
+	return checkpoint.Generation, err
+}
+
+// Generation, current rules and pruning history describe one completed epoch.
+// Reading them under one lock prevents a refresher changing the policy between
+// the follower's generation check and its retention-cursor decision.
+func (p *corePublicProjection) RefreshCheckpoint(ctx context.Context) (projectionCheckpoint, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	policy, err := p.loadPolicy(ctx)
 	if err != nil {
-		return 0, err
+		return projectionCheckpoint{}, err
 	}
-	if err := p.ensure(policy); err != nil {
-		return 0, err
+	revision, err := p.ensure(policy)
+	if err != nil {
+		return projectionCheckpoint{}, err
 	}
-	return policy.generation, nil
+	return projectionCheckpoint{Generation: policy.generation, Fingerprint: policy.fingerprint, Revision: revision}, nil
 }
 
 var publicMeasurementTables = []string{
@@ -181,16 +204,15 @@ var publicMeasurementTables = []string{
 	"observations", "transmissions", "scope_match_totals", "inactive_nodes", "nodes", "observers",
 }
 
-func (p *corePublicProjection) ensure(policy *corePublicPolicy) error {
+func (p *corePublicProjection) ensure(policy *corePublicPolicy) (int64, error) {
 	if policy == nil || policy.generation < 1 {
-		return errors.New("public policy unavailable")
+		return 0, errors.New("public policy unavailable")
 	}
-	p.fingerprint = policy.fingerprint
-	var generation int64
+	var generation, revision int64
 	var ready int
 	var fingerprint string
-	if err := p.store.db.QueryRow(`SELECT generation,ready,COALESCE(policy_fingerprint,'') FROM public_projection_state WHERE singleton=1`).Scan(&generation, &ready, &fingerprint); err != nil {
-		return err
+	if err := p.store.db.QueryRow(`SELECT generation,ready,COALESCE(policy_fingerprint,''),policy_revision FROM public_projection_state WHERE singleton=1`).Scan(&generation, &ready, &fingerprint, &revision); err != nil {
+		return 0, err
 	}
 	switch decideProjectionAction(generation, ready, fingerprint, policy) {
 	case projectionReady:
@@ -198,21 +220,24 @@ func (p *corePublicProjection) ensure(policy *corePublicPolicy) error {
 			// Baseline the digest on the first start of this build so the next
 			// counter-only bump can be recognised as a no-op.
 			_, err := p.store.db.Exec(`UPDATE public_projection_state SET policy_fingerprint=? WHERE singleton=1`, policy.fingerprint)
-			return err
+			return revision, err
 		}
-		return nil
+		return revision, nil
 	case projectionAdoptGeneration:
 		// Only the counter moved: the visibility rules are identical, so the
 		// derived tables are still correct. Adopt the epoch without replaying.
 		_, err := p.store.db.Exec(`UPDATE public_projection_state SET generation=?,policy_fingerprint=? WHERE singleton=1`,
 			policy.generation, policy.fingerprint)
-		return err
+		return revision, err
 	}
 	if _, err := p.store.db.Exec(`UPDATE public_projection_state SET ready=0 WHERE singleton=1`); err != nil {
-		return err
+		return 0, err
 	}
 	cutoff := time.Now().UTC().AddDate(0, 0, -p.retentionDays).Format(time.RFC3339Nano)
 	if err := p.store.WriterTx("public_projection", func(tx *sql.Tx) error {
+		if err := tx.QueryRow(`UPDATE public_projection_state SET policy_revision=policy_revision+1 WHERE singleton=1 RETURNING policy_revision`).Scan(&revision); err != nil {
+			return err
+		}
 		for _, table := range publicMeasurementTables {
 			var exists int
 			if err := tx.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&exists); err != nil {
@@ -227,7 +252,7 @@ func (p *corePublicProjection) ensure(policy *corePublicPolicy) error {
 		_, err := tx.Exec(`DELETE FROM public_projection_journal WHERE observed_at < ?`, cutoff)
 		return err
 	}); err != nil {
-		return err
+		return 0, err
 	}
 	p.store.prefixIdx.store(prefixIndex{})
 	p.store.neighborGraph.store(&NeighborGraph{})
@@ -242,7 +267,7 @@ func (p *corePublicProjection) ensure(policy *corePublicPolicy) error {
 	for {
 		rows, err := p.store.db.Query(`SELECT id,record FROM public_projection_journal WHERE id>? ORDER BY id LIMIT ?`, cursor, publicProjectionReplayBatchSize)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		type saved struct {
 			id     int64
@@ -254,18 +279,18 @@ func (p *corePublicProjection) ensure(policy *corePublicPolicy) error {
 			var raw []byte
 			if err := rows.Scan(&item.id, &raw); err != nil {
 				rows.Close()
-				return err
+				return 0, err
 			}
 			if err := json.Unmarshal(raw, &item.record); err != nil {
 				rows.Close()
-				return err
+				return 0, err
 			}
 			batch = append(batch, item)
 		}
 		err = rows.Err()
 		rows.Close()
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if len(batch) == 0 {
 			break
@@ -282,16 +307,16 @@ func (p *corePublicProjection) ensure(policy *corePublicPolicy) error {
 			}
 			return nil
 		}); err != nil {
-			return err
+			return 0, err
 		}
 		cursor = batch[len(batch)-1].id
 	}
 	if err := p.store.backfillAdvertEvidence(context.Background(), p.store.db); err != nil {
-		return err
+		return 0, err
 	}
 	_, err := p.store.db.Exec(`UPDATE public_projection_state SET generation=?,ready=1,policy_fingerprint=? WHERE singleton=1`,
 		policy.generation, policy.fingerprint)
-	return err
+	return revision, err
 }
 
 // projectionDecision is the outcome of comparing the stored projection state
@@ -318,15 +343,6 @@ func decideProjectionAction(generation int64, ready int, fingerprint string, pol
 	}
 }
 
-// Fingerprint returns the privacy-rule digest behind the last completed
-// refresh. The pg source uses it to avoid resetting its ledger cursor when a
-// generation bump did not change the rules.
-func (p *corePublicProjection) Fingerprint() string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.fingerprint
-}
-
 func (p *corePublicProjection) Batch(ctx context.Context, records []publicProjectionRecord) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -334,7 +350,7 @@ func (p *corePublicProjection) Batch(ctx context.Context, records []publicProjec
 	if err != nil {
 		return err
 	}
-	if err := p.ensure(policy); err != nil {
+	if _, err := p.ensure(policy); err != nil {
 		return err
 	}
 	if len(records) == 0 {

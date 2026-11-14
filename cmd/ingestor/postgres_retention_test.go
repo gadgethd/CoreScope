@@ -28,7 +28,7 @@ func TestPgPolicyCursorSeeksRetentionOnlyForChangedRules(t *testing.T) {
 			state := pgSourceState{PolicyGeneration: tc.generation, PolicyFingerprint: tc.fingerprint,
 				LastSeq: 900, LastTime: "retained-time", LastObsID: "retained-id"}
 			calls := 0
-			next, err := pgPolicyCursor(state, 2, "current", cutoff, func(got time.Time) (int64, error) {
+			next, err := pgPolicyCursor(state, projectionCheckpoint{Generation: 2, Fingerprint: "current"}, cutoff, func(got time.Time) (int64, error) {
 				calls++
 				if !got.Equal(cutoff) {
 					t.Fatalf("seek cutoff=%s want=%s", got, cutoff)
@@ -42,7 +42,7 @@ func TestPgPolicyCursorSeeksRetentionOnlyForChangedRules(t *testing.T) {
 	}
 	state := pgSourceState{PolicyGeneration: 1, PolicyFingerprint: "old", LastSeq: 900}
 	failed := errors.New("seek unavailable")
-	next, err := pgPolicyCursor(state, 2, "current", cutoff, func(time.Time) (int64, error) { return 0, failed })
+	next, err := pgPolicyCursor(state, projectionCheckpoint{Generation: 2, Fingerprint: "current"}, cutoff, func(time.Time) (int64, error) { return 0, failed })
 	if !errors.Is(err, failed) || next != state {
 		t.Fatalf("failed seek changed cursor: next=%+v err=%v", next, err)
 	}

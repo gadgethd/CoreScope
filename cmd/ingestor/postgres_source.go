@@ -48,11 +48,12 @@ const pgZeroObsID = "00000000-0000-0000-0000-000000000000"
 // the last row whose batch fully drained into the database. Resuming from
 // this pair re-reads nothing and skips nothing.
 type pgSourceState struct {
-	PolicyGeneration  int64  `json:"policyGeneration,omitempty"`
-	PolicyFingerprint string `json:"policyFingerprint,omitempty"` // privacy-rule digest; generation alone is not enough
-	LastTime          string `json:"lastTime"`                    // RFC3339Nano, UTC
-	LastObsID         string `json:"lastObsId"`                   // UUID as text
-	LastSeq           int64  `json:"lastSeq,omitempty"`           // committed-order UKMesh ledger cursor
+	PolicyGeneration   int64  `json:"policyGeneration,omitempty"`
+	PolicyFingerprint  string `json:"policyFingerprint,omitempty"`  // privacy-rule digest; generation alone is not enough
+	ProjectionRevision int64  `json:"projectionRevision,omitempty"` // observes intervening journal pruning even when rules return
+	LastTime           string `json:"lastTime"`                     // RFC3339Nano, UTC
+	LastObsID          string `json:"lastObsId"`                    // UUID as text
+	LastSeq            int64  `json:"lastSeq,omitempty"`            // committed-order UKMesh ledger cursor
 }
 
 // loadPgSourceState reads the cursor file. A missing or corrupt file reads
@@ -148,19 +149,20 @@ FROM ingest_observation_ledger WHERE observed_at >= $1`
 	return query, args
 }
 
-func pgPolicyCursor(state pgSourceState, generation int64, fingerprint string, cutoff time.Time,
+func pgPolicyCursor(state pgSourceState, checkpoint projectionCheckpoint, cutoff time.Time,
 	seek func(time.Time) (int64, error)) (pgSourceState, error) {
-	if state.PolicyGeneration != generation {
-		if state.PolicyGeneration != 0 && state.PolicyFingerprint != "" && state.PolicyFingerprint != fingerprint {
-			seq, err := seek(cutoff)
-			if err != nil {
-				return state, err
-			}
-			state.LastSeq = seq
+	changed := checkpoint.Revision > 0 && state.ProjectionRevision != checkpoint.Revision ||
+		state.PolicyFingerprint != "" && state.PolicyFingerprint != checkpoint.Fingerprint
+	if state.PolicyGeneration != 0 && changed {
+		seq, err := seek(cutoff)
+		if err != nil {
+			return state, err
 		}
-		state.PolicyGeneration = generation
+		state.LastSeq = seq
 	}
-	state.PolicyFingerprint = fingerprint
+	state.PolicyGeneration = checkpoint.Generation
+	state.PolicyFingerprint = checkpoint.Fingerprint
+	state.ProjectionRevision = checkpoint.Revision
 	return state, nil
 }
 
@@ -481,15 +483,14 @@ func runPostgresSource(store *Store, src PostgresSource, keySet *channelKeySet, 
 				return
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			generation, err := store.publicProjection.Refresh(ctx)
+			checkpoint, err := store.publicProjection.RefreshCheckpoint(ctx)
 			cancel()
 			if err != nil {
 				status.MarkDisconnect(time.Now(), err)
 				time.Sleep(time.Second)
 				continue
 			}
-			fingerprint := store.publicProjection.Fingerprint()
-			next, err := pgPolicyCursor(state, generation, fingerprint,
+			next, err := pgPolicyCursor(state, checkpoint,
 				time.Now().UTC().AddDate(0, 0, -cfg.Retention.PacketDays), func(cutoff time.Time) (int64, error) {
 					seekCtx, cancelSeek := context.WithTimeout(context.Background(), 90*time.Second)
 					defer cancelSeek()
@@ -606,11 +607,12 @@ func runPostgresSource(store *Store, src PostgresSource, keySet *channelKeySet, 
 
 		last := batch[len(batch)-1]
 		nextState := pgSourceState{
-			PolicyGeneration:  state.PolicyGeneration,
-			PolicyFingerprint: state.PolicyFingerprint,
-			LastTime:          last.Time.UTC().Format(time.RFC3339Nano),
-			LastObsID:         last.ObsID,
-			LastSeq:           last.Seq,
+			PolicyGeneration:   state.PolicyGeneration,
+			PolicyFingerprint:  state.PolicyFingerprint,
+			ProjectionRevision: state.ProjectionRevision,
+			LastTime:           last.Time.UTC().Format(time.RFC3339Nano),
+			LastObsID:          last.ObsID,
+			LastSeq:            last.Seq,
 		}
 		if err := finishSourceBatch(completed, admissionFailed || ingestBuffer.Dropped() > droppedBefore,
 			func() error { return savePgSourceState(statePath, nextState) }); err != nil {
