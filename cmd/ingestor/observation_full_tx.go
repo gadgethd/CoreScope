@@ -7,12 +7,12 @@ import (
 	"time"
 )
 
-// PRIVATE prototype: one packet observation, including observer metadata.
+// One packet observation, including observer metadata.
 // This capability must never wrap status/neighbors/client routes: some of
 // those deliberately use the base pool rather than the packet executor.
 // Existing replay owns a separate NORMAL policy; live observations stay FULL.
 func (s *Store) withOwnedObservationFullTx(ctx context.Context, apply func(*Store) error) error {
-	if s.replayTx != nil || s.publicProjection != nil {
+	if s.replayTx != nil {
 		return fmt.Errorf("packet observation requires an unscoped live Store")
 	}
 	if apply == nil {
@@ -50,8 +50,8 @@ func (s *Store) withOwnedObservationFullTx(ctx context.Context, apply func(*Stor
 	defer tx.Rollback()
 
 	// Explicit construction avoids copying mutexes, atomics or backfill owners.
-	// replayTx is the existing transaction/writer-lock capability, not its
-	// durability policy. Production should extract its shared scoped mechanics.
+	// replayTx is the transaction/writer-lock capability. Its owner selects
+	// FULL live-observation durability or reconstructible replay policy.
 	observation := &Store{
 		db: s.db, ingestDB: tx, replayTx: tx, path: s.path,
 		sampleIntervalSec: s.sampleIntervalSec,

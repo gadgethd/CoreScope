@@ -72,8 +72,8 @@ func (s *DBStats) SnapshotBackfills() map[string]int64 {
 type Store struct {
 	publicProjection *corePublicProjection
 	db               *sql.DB
-	ingestDB         ingestSQL // base pool, or a transaction-scoped replay executor
-	replayTx         *sql.Tx   // non-nil only on a private replay Store; writerMu is already held
+	ingestDB         ingestSQL // base pool, or a transaction-scoped ingest executor
+	replayTx         *sql.Tx   // scoped writer-lock capability; owner selects FULL observation or replay durability
 	path             string    // filesystem path to the SQLite DB (used to resolve queue dirs)
 	Stats            DBStats
 	// plannerStatsAt is when RefreshPlannerStats last succeeded in this
