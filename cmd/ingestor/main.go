@@ -1246,6 +1246,28 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 		}
 	}
 
+	// One packet observation and its observer metadata share a FULL commit.
+	// Status, neighbor reports and client metadata returned above: their
+	// independent base-pool writers must not enter this packet executor.
+	raw, _ := msg["raw"].(string)
+	if raw == "" && !strings.HasPrefix(topic, "meshcore/message/channel/") && !strings.HasPrefix(topic, "meshcore/message/direct/") {
+		return nil
+	}
+	apply := func(target *Store) error {
+		return handlePacketObservation(target, tag, source, m, channelKeys, regionSet, cfg, topic, parts, msg)
+	}
+	if store.replayTx != nil {
+		// The scoped executor already belongs to the public-projection page.
+		// Keep its FULL-journal/ready fence, cursor and replay policy intact;
+		// never nest a live observation transaction inside that owner.
+		return apply(store)
+	}
+	return store.withOwnedObservationFullTx(context.Background(), apply)
+}
+
+// handlePacketObservation uses the supplied packet executor for every packet
+// helper and observer metadata write. It never handles control/metadata topics.
+func handlePacketObservation(store *Store, tag string, source MQTTSource, m mqtt.Message, channelKeys map[string]string, regionSet *regionKeySet, cfg *Config, topic string, parts []string, msg map[string]interface{}) (writeErr error) {
 	// Format 1: Raw packet (meshcoretomqtt / Cisien format)
 	rawHex, _ := msg["raw"].(string)
 	if rawHex != "" {
@@ -1606,6 +1628,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 
 		if _, err := store.InsertTransmission(pktData); err != nil {
 			log.Printf("MQTT [%s] channel insert error: %v", tag, err)
+			return err
 		}
 
 		// Note: we intentionally do NOT create a node entry for channel message senders.
@@ -1698,6 +1721,7 @@ func handleMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, 
 
 		if _, err := store.InsertTransmission(pktData); err != nil {
 			log.Printf("MQTT [%s] DM insert error: %v", tag, err)
+			return err
 		}
 
 		log.Print(formatDirectMessageLog(tag, firstNonEmpty(sender, "unknown")))
