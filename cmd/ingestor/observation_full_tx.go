@@ -29,25 +29,28 @@ func (s *Store) withOwnedObservationFullTx(ctx context.Context, apply func(*Stor
 
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
-		return err
+		return s.observationAdmissionError("connection", err)
 	}
 	defer conn.Close()
 	var synchronous int
 	var journal string
 	if err := conn.QueryRowContext(ctx, "PRAGMA synchronous").Scan(&synchronous); err != nil {
-		return err
+		return s.observationAdmissionError("synchronous", err)
 	}
 	if err := conn.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&journal); err != nil {
-		return err
+		return s.observationAdmissionError("journal mode", err)
 	}
 	if synchronous != 2 || journal != "wal" {
 		return fmt.Errorf("packet observation requires existing FULL/WAL, got synchronous=%d journal=%s", synchronous, journal)
 	}
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return s.observationAdmissionError("begin", err)
 	}
 	defer tx.Rollback()
+	if err := ctx.Err(); err != nil {
+		return s.observationAdmissionError("context", err)
+	}
 
 	// Explicit construction avoids copying mutexes, atomics or backfill owners.
 	// replayTx is the transaction/writer-lock capability. Its owner selects
@@ -76,6 +79,9 @@ func (s *Store) withOwnedObservationFullTx(ctx context.Context, apply func(*Stor
 	if err := observation.prepareStatements(); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return s.observationAdmissionError("context", err)
+	}
 	if err := apply(observation); err != nil {
 		return err
 	}
@@ -98,4 +104,13 @@ func (s *Store) withOwnedObservationFullTx(ctx context.Context, apply func(*Stor
 	}
 	s.Stats.WALCommits.Add(1)
 	return nil
+}
+
+// Admission fails before a transaction-scoped Store exists, so its error cannot
+// be transferred with scoped write statistics. Count it here once, preserving
+// the underlying SQLite/context error for callers; downstream SQL owns its own
+// error counters.
+func (s *Store) observationAdmissionError(operation string, err error) error {
+	s.Stats.WriteErrors.Add(1)
+	return fmt.Errorf("packet observation %s: %w", operation, err)
 }

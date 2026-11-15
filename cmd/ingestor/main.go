@@ -348,7 +348,7 @@ func main() {
 			markReceiptForTag(tag, time.Now())
 			status.MarkPacket(time.Now())
 			ingestBuffer.Submit(func() {
-				handleMessage(store, tag, src, m, keySet.Snapshot(), regionSet, cfg)
+				handleMQTTMessage(store, tag, src, m, keySet.Snapshot(), regionSet, cfg)
 			})
 		})
 
@@ -1071,6 +1071,14 @@ func buildForceReconnectFn(client mqtt.Client, tag string) func() {
 		if token := client.Connect(); token.Error() != nil {
 			log.Printf("MQTT [%s] WATCHDOG force-reconnect Connect() failed: %v", tag, token.Error())
 		}
+	}
+}
+
+// Live MQTT jobs have no error return to their buffer. Report failures here
+// while the Store/transaction owners retain the exact write-error counts.
+func handleMQTTMessage(store *Store, tag string, source MQTTSource, m mqtt.Message, channelKeys map[string]string, regionSet *regionKeySet, cfg *Config) {
+	if err := handleMessage(store, tag, source, m, channelKeys, regionSet, cfg); err != nil {
+		log.Printf("MQTT [%s] handler error: %v", tag, err)
 	}
 }
 

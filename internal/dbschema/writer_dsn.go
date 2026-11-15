@@ -20,7 +20,11 @@ package dbschema
 //   - _auto_vacuum=incremental — cmd/ingestor/maintenance.go drives
 //     incremental_vacuum. Only takes effect on a database created with it.
 //   - _foreign_keys=on — the schema relies on FK enforcement.
-//   - _busy_timeout=5000 — writers serialise behind the reader.
+//   - _txlock=immediate — reserve the writer before any transaction reads.
+//     A deferred read snapshot can fail its write upgrade immediately with
+//     SQLITE_BUSY instead of waiting under busy_timeout. Both live packets
+//     and replay retain their owning transaction and durability policy.
+//   - _busy_timeout=5000 — writers wait for transient external writers.
 //   - _cache_size=-2000 — 2000 KiB of page cache per connection. This is
 //     SQLite's own default, pinned so it cannot drift: the page cache is a C
 //     allocation and therefore sits outside GOMEMLIMIT.
@@ -31,5 +35,6 @@ func WriterDSN(path string) string {
 		"&_auto_vacuum=incremental" +
 		"&_foreign_keys=on" +
 		"&_busy_timeout=5000" +
+		"&_txlock=immediate" +
 		"&_cache_size=-2000"
 }
