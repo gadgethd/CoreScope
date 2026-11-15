@@ -29,14 +29,17 @@ type PerfIOSample = perfio.Sample
 // independent monotonically-increasing counter and look at deltas across
 // multiple samples instead.
 type IngestorStatsSnapshot struct {
-	SampledAt       string `json:"sampledAt"`
-	TxInserted      int64  `json:"tx_inserted"`
-	ObsInserted     int64  `json:"obs_inserted"`
-	DuplicateTx     int64  `json:"tx_dupes"`
-	NodeUpserts     int64  `json:"node_upserts"`
-	ObserverUpserts int64  `json:"observer_upserts"`
-	WriteErrors     int64  `json:"write_errors"`
-	SignatureDrops  int64  `json:"sig_drops"`
+	// Unlike the independent counters below, all fields of this subtree
+	// are captured under one buffer lifecycle mutex.
+	IngestState     *IngestStateSnapshot `json:"ingest_state,omitempty"`
+	SampledAt       string               `json:"sampledAt"`
+	TxInserted      int64                `json:"tx_inserted"`
+	ObsInserted     int64                `json:"obs_inserted"`
+	DuplicateTx     int64                `json:"tx_dupes"`
+	NodeUpserts     int64                `json:"node_upserts"`
+	ObserverUpserts int64                `json:"observer_upserts"`
+	WriteErrors     int64                `json:"write_errors"`
+	SignatureDrops  int64                `json:"sig_drops"`
 	// ClientUnlinkedDropped counts client-topic messages dropped by the
 	// linked-only filter (clientRxCoverage.requireLinkedCompanion).
 	ClientUnlinkedDropped int64            `json:"client_unlinked_dropped"`
@@ -245,11 +248,11 @@ func procIORate(prev, cur procIOSnapshot, stamp string) *PerfIOSample {
 // start; the env var (CORESCOPE_INGESTOR_STATS) is only re-read on process
 // restart, not per tick.
 // The returned stop function ends the writer goroutine and returns once it has
-// exited. Production ignores it and runs for the process lifetime; tests must
+// exited. Production stops it before the final shutdown snapshot; tests must
 // call it, because this goroutine reads package-level hooks (readProcSelfIOFn)
 // that a later test may replace, and a writer left running past its own test
 // races with whoever runs next. It is safe to call more than once.
-func StartStatsFileWriter(s *Store, interval time.Duration) (stop func()) {
+func StartStatsFileWriter(s *Store, interval time.Duration, buffers ...*IngestBuffer) (stop func()) {
 	if interval <= 0 {
 		interval = time.Second
 	}
@@ -285,27 +288,7 @@ func StartStatsFileWriter(s *Store, interval time.Duration) (stop func()) {
 			curIO := readProcSelfIOFn()
 			ioRate := procIORate(prevIO, curIO, stamp)
 			prevIO = curIO
-			snap := IngestorStatsSnapshot{
-				SampledAt:             stamp,
-				TxInserted:            s.Stats.TransmissionsInserted.Load(),
-				ObsInserted:           s.Stats.ObservationsInserted.Load(),
-				DuplicateTx:           s.Stats.DuplicateTransmissions.Load(),
-				NodeUpserts:           s.Stats.NodeUpserts.Load(),
-				ObserverUpserts:       s.Stats.ObserverUpserts.Load(),
-				WriteErrors:           s.Stats.WriteErrors.Load(),
-				SignatureDrops:        s.Stats.SignatureDrops.Load(),
-				ClientUnlinkedDropped: s.Stats.ClientUnlinkedDropped.Load(),
-				WALCommits:            s.Stats.WALCommits.Load(),
-				GroupCommitFlushes:    0, // group commit reverted (refs #1129)
-				BackfillUpdates:       s.Stats.SnapshotBackfills(),
-				ProcIO:                ioRate,
-				WriterPerf:            s.WriterStatsSnapshot(),
-				SourceLiveness:        SnapshotLivenessClocks(),
-				SourceStatuses:        SnapshotSourceStatuses(tickAt),
-				WatchdogLastTickUnix:  WatchdogLastTickUnix(),
-				WatchdogPanicCount:    WatchdogPanicCount(),
-				WatchdogLogDropCount:  WatchdogLogDropCount(),
-			}
+			snap := ingestStatsSnapshot(s, tickAt, ioRate, buffers...)
 			buf.Reset()
 			if err := enc.Encode(&snap); err != nil {
 				log.Printf("[stats-file] encode: %v", err)
@@ -328,4 +311,54 @@ func StartStatsFileWriter(s *Store, interval time.Duration) (stop func()) {
 		once.Do(func() { close(done) })
 		<-stopped
 	}
+}
+
+// ingestStatsSnapshot is shared by periodic publication and the final shutdown
+// flush, so final state cannot drift into a second independently owned schema.
+func ingestStatsSnapshot(s *Store, tickAt time.Time, ioRate *PerfIOSample, buffers ...*IngestBuffer) IngestorStatsSnapshot {
+	stamp := tickAt.UTC().Format(time.RFC3339)
+	return IngestorStatsSnapshot{
+		IngestState:           ingestBufferSnapshot(buffers...),
+		SampledAt:             stamp,
+		TxInserted:            s.Stats.TransmissionsInserted.Load(),
+		ObsInserted:           s.Stats.ObservationsInserted.Load(),
+		DuplicateTx:           s.Stats.DuplicateTransmissions.Load(),
+		NodeUpserts:           s.Stats.NodeUpserts.Load(),
+		ObserverUpserts:       s.Stats.ObserverUpserts.Load(),
+		WriteErrors:           s.Stats.WriteErrors.Load(),
+		SignatureDrops:        s.Stats.SignatureDrops.Load(),
+		ClientUnlinkedDropped: s.Stats.ClientUnlinkedDropped.Load(),
+		WALCommits:            s.Stats.WALCommits.Load(),
+		GroupCommitFlushes:    0, // group commit reverted (refs #1129)
+		BackfillUpdates:       s.Stats.SnapshotBackfills(),
+		ProcIO:                ioRate,
+		WriterPerf:            s.WriterStatsSnapshot(),
+		SourceLiveness:        SnapshotLivenessClocks(),
+		SourceStatuses:        SnapshotSourceStatuses(tickAt),
+		WatchdogLastTickUnix:  WatchdogLastTickUnix(),
+		WatchdogPanicCount:    WatchdogPanicCount(),
+		WatchdogLogDropCount:  WatchdogLogDropCount(),
+	}
+}
+
+func ingestBufferSnapshot(buffers ...*IngestBuffer) *IngestStateSnapshot {
+	if len(buffers) == 0 || buffers[0] == nil {
+		return nil // legacy callers omit unknown buffer state, never fabricate zero
+	}
+	state := buffers[0].Snapshot()
+	return &state
+}
+
+// writeIngestStatsNow requires the periodic writer to have stopped first.
+// A same-sample interval has no measurable process-I/O rate, so the existing
+// owner omits ProcIO rather than fabricating a rate for this final flush.
+func writeIngestStatsNow(s *Store, buffer *IngestBuffer) error {
+	tickAt := time.Now().UTC()
+	io := readProcSelfIOFn()
+	snap := ingestStatsSnapshot(s, tickAt, procIORate(io, io, tickAt.Format(time.RFC3339)), buffer)
+	data, err := json.Marshal(snap)
+	if err != nil {
+		return err
+	}
+	return writeStatsAtomic(statsFilePath(), data)
 }

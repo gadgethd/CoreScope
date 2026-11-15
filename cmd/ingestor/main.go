@@ -832,7 +832,8 @@ func main() {
 
 	// Per-second stats file writer for the server's /api/perf/write-sources
 	// endpoint (#1120). Best-effort; never fatal.
-	StartStatsFileWriter(store, time.Second)
+	stopStatsFile := StartStatsFileWriter(store, time.Second, ingestBuffer)
+	defer stopStatsFile()
 
 	// Multi-byte capability persister (#1324 follow-up): the server's
 	// analytics cycle publishes a snapshot file via internal/mbcapqueue
@@ -885,6 +886,14 @@ func main() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
+	// The existing container stop grace is 30s. This same total budget
+	// includes source disconnect and prior background shutdown work.
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelShutdown()
+	ingestBuffer.CloseAdmission()
+	for _, c := range clients {
+		c.Disconnect(5000) // existing source quiesce bound, not a new drain budget
+	}
 
 	log.Println("Shutting down...")
 	stopEvidenceBackfill()
@@ -903,6 +912,12 @@ func main() {
 	pruneQueueTicker.Stop()
 	walCheckpointTicker.Stop()
 	stopWatchdog()
+	if err := finishIngestShutdown(shutdownCtx, store, ingestBuffer, stopStatsFile); err != nil {
+		// Do not checkpoint/close SQLite beneath an accepted active write.
+		// The final stats retain incomplete state; exit0 cannot certify loss.
+		log.Printf("[ingest-buffer] shutdown incomplete: %v", err)
+		os.Exit(1)
+	}
 	// A deploy is a SIGTERM, which is exactly the case that used to lose
 	// the tally: save before the process goes away rather than leaving up
 	// to 5 minutes of counting to the next tick that will not come.
@@ -910,9 +925,6 @@ func main() {
 		log.Printf("[regions] saving scope-match tally: %v", err)
 	}
 	store.LogStats() // final stats on shutdown
-	for _, c := range clients {
-		c.Disconnect(5000) // 5s to allow in-flight messages to drain
-	}
 	log.Println("Done.")
 }
 

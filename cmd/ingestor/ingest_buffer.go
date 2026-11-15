@@ -23,6 +23,8 @@ import (
 // memory). Buffering replays the original messages, so it introduces NO
 // duplicates (contrast: a QoS-1 broker-queue would).
 type IngestBuffer struct {
+	stateMu   sync.Mutex
+	state     ingestBufferState
 	jobs      chan func()
 	ready     chan struct{}
 	stop      chan struct{}
@@ -58,6 +60,7 @@ func NewIngestBuffer(capacity int) *IngestBuffer {
 		capacity = 1
 	}
 	return &IngestBuffer{
+		state: newIngestBufferState(),
 		jobs:  make(chan func(), capacity),
 		ready: make(chan struct{}),
 		stop:  make(chan struct{}),
@@ -105,12 +108,22 @@ func (b *IngestBuffer) SubmitTracked(job func() error) (<-chan error, bool) {
 }
 
 func (b *IngestBuffer) enqueue(job func()) bool {
+	b.stateMu.Lock()
+	if !b.state.accepting {
+		b.stateMu.Unlock()
+		return false // closed admission is not an accepted job or capacity drop
+	}
 	select {
 	case b.jobs <- job:
+		b.state.outstanding++
+		b.state.generation++
+		b.stateMu.Unlock()
 		b.maybeLogRecovery()
 		return true
 	default:
 		n := b.dropped.Add(1)
+		b.state.generation++
+		b.stateMu.Unlock()
 		b.logDrop(n)
 		return false
 	}
@@ -166,18 +179,20 @@ func (b *IngestBuffer) maybeLogRecovery() {
 func (b *IngestBuffer) Start() {
 	b.startOnce.Do(func() {
 		go func() {
-			defer close(b.done)
+			defer b.workerExited()
 			select {
 			case <-b.ready:
 			case <-b.stop:
-				// Stopped before Ready — exit immediately. Pending jobs
-				// are discarded; the buffer was never authorized to drain.
-				return
+				// Never authorize an unready startup queue to write. Its
+				// accepted work remains outstanding and shutdown incomplete.
+				if !b.Snapshot().Ready {
+					return
+				}
 			}
 			for {
 				select {
 				case job := <-b.jobs:
-					job()
+					b.runAccepted(job)
 				case <-b.stop:
 					// Stop after Ready — drain whatever is queued so
 					// shutdown is graceful, then exit. b.jobs is never
@@ -186,7 +201,7 @@ func (b *IngestBuffer) Start() {
 					for {
 						select {
 						case job := <-b.jobs:
-							job()
+							b.runAccepted(job)
 						default:
 							return
 						}
@@ -204,7 +219,16 @@ func (b *IngestBuffer) Start() {
 // effect. Calling Ready() without a prior Start() simply closes the ready
 // channel — nothing drains until a later Start() runs its consumer goroutine.
 func (b *IngestBuffer) Ready() {
-	b.readyOnce.Do(func() { close(b.ready) })
+	b.readyOnce.Do(func() {
+		b.stateMu.Lock()
+		defer b.stateMu.Unlock()
+		if !b.state.accepting {
+			return // closing admission must not authorize startup writes
+		}
+		b.state.ready = true
+		b.state.generation++
+		close(b.ready)
+	})
 }
 
 // Dropped returns the number of jobs dropped due to a full buffer.
@@ -213,11 +237,11 @@ func (b *IngestBuffer) Dropped() int64 { return b.dropped.Load() }
 // Pending returns the current queue depth (best-effort; for observability).
 func (b *IngestBuffer) Pending() int { return len(b.jobs) }
 
-// Stop signals the consumer goroutine to exit. Test-hygiene helper so unit
-// tests don't leak the goroutine that Start() spawns. Idempotent / safe to
-// call without a prior Start(). After Stop() the consumer exits and Done()
-// is closed.
+// Stop closes admission and signals the consumer to drain after Ready.
+// It remains safe without Start for test hygiene. Production must use Drain
+// and inspect its outcome: Done alone does not certify an unready backlog.
 func (b *IngestBuffer) Stop() {
+	b.CloseAdmission()
 	b.stopOnce.Do(func() { close(b.stop) })
 }
 
