@@ -128,10 +128,20 @@ func TestF08RealPairedSourcesCrashFailureAndRestartBothOrders(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := redis.NewClient(options)
-	defer client.Close()
 	ctx := context.Background()
 	key := fmt.Sprintf("core:f08:%d:%d", os.Getpid(), time.Now().UnixNano())
-	t.Cleanup(func() { client.Del(ctx, key) })
+	t.Cleanup(func() {
+		defer func() {
+			if err := client.Close(); err != nil {
+				t.Errorf("close F08 Redis fixture: %v", err)
+			}
+		}()
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := client.Del(cleanupCtx, key).Err(); err != nil {
+			t.Errorf("delete F08 Redis fixture stream: %v", err)
+		}
+	})
 	const frame = "0A00D69FD7A5A7475DB07337749AE61FA53A4788E976"
 	const topic = "meshcore/ZZZ/paired-observer/packets"
 	ids := []string{"11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"}
