@@ -1232,19 +1232,9 @@ input.live-node-filter-input:focus {
 
 /* Mobile VCR */
 @media (max-width: 640px) {
-  /* #1244: SINGLE-ROW layout. PR #1234 was meant to put all VCR controls
-   * on one row but `flex-wrap: wrap` here + `width: 100%` on the timeline
-   * forced a 2-row layout (controls/LCD on row 1, scope+scrubber on row 2).
-   * Fix: `flex-wrap: nowrap`, the timeline gets `flex: 1 1 0` so it
-   * absorbs leftover width, and scope buttons shrink (1/6/More) to fit. */
+  /* #1221/#1244: keep controls, scopes, timeline and clock on one row
+   * at 375px without reducing the existing touch targets. */
   .vcr-bar {
-    /* #1250: shaved horizontal padding from 8px → 4px. At 375px viewport the
-     * row of flex-shrink:0 children (controls + scope-btns + lcd) overflowed
-     * the padding box by 0.83px even though .vcr-timeline-container is
-     * flex:1 1 0 — its min-width:40px floor leaves the rest to absorb the
-     * overflow. 4px headroom on each side is well above the 0.83px clip and
-     * keeps the LCD's right edge ≤ viewport width. Desktop is unaffected
-     * (this rule is inside @media (max-width: 640px)). */
     padding: 4px 4px;
     padding-bottom: calc(4px + env(safe-area-inset-bottom, 20px));
     flex-wrap: nowrap;
@@ -1254,7 +1244,7 @@ input.live-node-filter-input:focus {
   /* #1221: LCD clock shares row with playback controls (not floating
    * bottom-right). LCD is scaled ~70% of desktop so it fits next to the
    * touch-target buttons without clipping at 375px viewport. */
-  .vcr-controls { order: 1; flex-shrink: 0; gap: 2px; }
+  .vcr-bar > .vcr-controls { order: 1; gap: 2px; }
   .vcr-lcd {
     order: 4;
     /* #1244: no auto margin in a no-wrap row — let the timeline absorb
@@ -1281,6 +1271,21 @@ input.live-node-filter-input:focus {
   .vcr-btn { padding: 4px 6px; font-size: 0.7rem; min-height: 32px; min-width: 32px; }
   .vcr-scope-btn { font-size: 0.6rem; padding: 2px 5px; min-height: 32px; min-width: 0; }
   .vcr-prompt { order: 5; width: 100%; font-size: 0.7rem; }
+}
+
+/* Below the single-row minimum, preserve the clock and touch targets while
+ * giving scopes and timeline their own row. The VCR height observer keeps
+ * the feed and other bottom-pinned overlays clear of the taller bar. */
+@media (max-width: 370px) {
+  .vcr-bar {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr) max-content;
+  }
+  .vcr-bar > .vcr-controls { grid-column: 1 / 3; grid-row: 1; }
+  .vcr-lcd { grid-column: 3; grid-row: 1; }
+  .vcr-scope-btns { grid-column: 1; grid-row: 2; }
+  .vcr-timeline-container { grid-column: 2 / 4; grid-row: 2; }
+  .vcr-prompt { grid-column: 1 / -1; }
 }
 
 /* Timeline time tooltip */
