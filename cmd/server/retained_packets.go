@@ -410,6 +410,20 @@ func (db *DB) claimRetainedScan(ctx context.Context) (func(), error) {
 	}
 }
 
+func (db *DB) withRetainedSnapshot(ctx context.Context, run func(*sql.Tx) error) error {
+	release, err := db.claimRetainedScan(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	read, err := db.conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	defer read.Rollback()
+	return run(read)
+}
+
 func (s *PacketStore) visitRetainedNodeHistory(ctx context.Context, pubkey, since string, visit func(*StoreTx)) error {
 	_, pm := s.getCachedNodesAndPM()
 	keys := map[string]bool{pubkey: true}
@@ -466,20 +480,10 @@ type retainedHistoryScope struct {
 
 // Read matching retained transmissions in chronological order and bounded batches.
 func (s *PacketStore) visitRetainedHistory(ctx context.Context, scope retainedHistoryScope, visit func(*retainedPacket)) error {
-	release, err := s.db.claimRetainedScan(ctx)
-	if err != nil {
-		return err
-	}
-	defer release()
 	radioCols, radioJoin, err := s.db.observationRadioSQL(ctx)
 	if err != nil {
 		return err
 	}
-	read, err := s.db.conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return err
-	}
-	defer read.Rollback()
 	q := scope.query
 	where, args := s.db.retainedPacketFilter(q, newPacketMatcher(q, packetFilterSets{}), true)
 	if scope.floodPrefix != "" {
@@ -516,19 +520,28 @@ func (s *PacketStore) visitRetainedHistory(ctx context.Context, scope retainedHi
 	if scope.groupByOrigin {
 		order = " ORDER BY " + origin + ", t.first_seen, t.id"
 	}
-	rows, err := read.QueryContext(ctx, "SELECT t.id"+where+order, args...)
+	return s.db.withRetainedSnapshot(ctx, func(read *sql.Tx) error {
+		return s.db.visitRetainedPacketRows(ctx, read, "SELECT t.id"+where+order, args, radioCols, radioJoin,
+			packetHydration{page: true, relayEvidence: true}, visit)
+	})
+}
+
+// visitRetainedPacketRows streams ordered packet IDs and materializes one batch
+// at a time using the caller's SQLite snapshot.
+func (db *DB) visitRetainedPacketRows(ctx context.Context, read *sql.Tx, idQuery string, args []any,
+	radioCols, radioJoin string, mode packetHydration, visit func(*retainedPacket)) error {
+	rows, err := read.QueryContext(ctx, idQuery, args...)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
-	mode := packetHydration{page: true, relayEvidence: true}
 	ids := make([]int, 0, retainedPacketBatch)
 	for {
 		ids, err = scanPacketIDs(rows, ids[:0])
 		if err != nil || len(ids) == 0 {
 			return err
 		}
-		packets, err := s.db.retainedPacketRows(ctx, read, ids, radioCols, radioJoin, mode)
+		packets, err := db.retainedPacketRows(ctx, read, ids, radioCols, radioJoin, mode)
 		if err != nil {
 			return err
 		}

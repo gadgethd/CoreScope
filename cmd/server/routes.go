@@ -2206,7 +2206,12 @@ func (s *Server) handleAnalyticsRF(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		writeJSON(w, s.store.GetAnalyticsRFWithWindow(region, area, window))
+		result, err := s.store.readAnalyticsRF(r.Context(), region, area, window)
+		if err != nil {
+			writeError(w, 500, "Unable to read retained radio history")
+			return
+		}
+		writeJSON(w, result)
 		return
 	}
 	writeJSON(w, RFAnalyticsResponse{
@@ -2253,7 +2258,11 @@ func (s *Server) handleAnalyticsTopology(w http.ResponseWriter, r *http.Request)
 				return
 			}
 		}
-		data := s.store.GetAnalyticsTopologyWithWindow(region, area, window)
+		data, err := s.store.readAnalyticsTopology(r.Context(), region, area, window)
+		if err != nil {
+			writeError(w, 500, "Unable to read retained topology history")
+			return
+		}
 		if s.cfg != nil && len(s.cfg.NodeBlacklist) > 0 {
 			data = s.filterBlacklistedFromTopology(data)
 		}
@@ -2372,7 +2381,7 @@ func (s *Server) handleAnalyticsHashCollisions(w http.ResponseWriter, r *http.Re
 
 func (s *Server) handleAnalyticsSubpaths(w http.ResponseWriter, r *http.Request) {
 	if s.store != nil {
-		if !s.store.SubpathIndexReady() {
+		if !s.store.packetHistoryRequired() && !s.store.SubpathIndexReady() {
 			writeIndexLoading503(w)
 			return
 		}
@@ -2385,7 +2394,13 @@ func (s *Server) handleAnalyticsSubpaths(w http.ResponseWriter, r *http.Request)
 		limit := queryLimit(r, 100, s.cfg.ListLimits.AnalyticsMax)
 		// Issue #1217: honor the Time window filter on Route Patterns.
 		window := ParseTimeWindow(r)
-		data := s.store.GetAnalyticsSubpathsWithWindow(region, minLen, maxLen, limit, window)
+		results, err := s.store.analyticsSubpaths(r.Context(), region,
+			[]subpathGroup{{minLen, maxLen, limit}}, window)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Subpath analytics unavailable")
+			return
+		}
+		data := results[0]
 		if s.subpathFilterActive() {
 			data, _ = s.dropHiddenPaths(data, "subpaths", "path", "", s.blacklistedNodeNames())
 		}
@@ -2403,7 +2418,7 @@ func (s *Server) handleAnalyticsSubpaths(w http.ResponseWriter, r *http.Request)
 //
 //	?groups=2-2:50,3-3:30,4-4:20,5-8:15   (minLen-maxLen:limit per group)
 func (s *Server) handleAnalyticsSubpathsBulk(w http.ResponseWriter, r *http.Request) {
-	if s.store != nil && !s.store.SubpathIndexReady() {
+	if s.store != nil && !s.store.packetHistoryRequired() && !s.store.SubpathIndexReady() {
 		writeIndexLoading503(w)
 		return
 	}
@@ -2451,7 +2466,11 @@ func (s *Server) handleAnalyticsSubpathsBulk(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	results := s.store.GetAnalyticsSubpathsBulkWithWindow(region, groups, ParseTimeWindow(r))
+	results, err := s.store.analyticsSubpaths(r.Context(), region, groups, ParseTimeWindow(r))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Subpath analytics unavailable")
+		return
+	}
 	if s.subpathFilterActive() {
 		names := s.blacklistedNodeNames()
 		for i, r := range results {
@@ -2487,11 +2506,15 @@ func (s *Server) handleAnalyticsSubpathDetail(w http.ResponseWriter, r *http.Req
 		}
 	}
 	if s.store != nil {
-		if !s.store.SubpathIndexReady() {
+		if !s.store.packetHistoryRequired() && !s.store.SubpathIndexReady() {
 			writeIndexLoading503(w)
 			return
 		}
-		detail := s.store.GetSubpathDetail(rawHops)
+		detail, err := s.store.subpathDetail(r.Context(), rawHops)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Subpath detail unavailable")
+			return
+		}
 		// #2184: the raw hops are prefixes, so the check above only catches a
 		// full key. Check the nodes the store resolved them to instead.
 		if s.subpathFilterActive() {
