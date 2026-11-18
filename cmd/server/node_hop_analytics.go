@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"iter"
+	"slices"
 	"strings"
 	"time"
 )
@@ -196,7 +199,14 @@ func (a *hopAttributor) onPath(pk string) bool {
 // for observations that contain the node's first prefix byte, and the strict
 // walk only for colliding prefixes.
 func computeNodeHopPackets(pubkey string, txs []*StoreTx, fromISO string, pm *prefixMap, graph *NeighborGraph) ([]NodeHopPacket, int) {
+	return collectNodeHopPackets(pubkey, slices.Values(txs), fromISO, pm, graph)
+}
+
+func collectNodeHopPackets(pubkey string, txs iter.Seq[*StoreTx], fromISO string, pm *prefixMap, graph *NeighborGraph) ([]NodeHopPacket, int) {
 	lowerPK := strings.ToLower(pubkey)
+	if len(lowerPK) < 2 {
+		return []NodeHopPacket{}, 0
+	}
 	// Every hop hash of the node, whatever its size, starts with its first
 	// pubkey byte, and path hops are written in upper case
 	// (internal/packetpath/path.go:50; none of 1,495,712 live observations of
@@ -208,7 +218,7 @@ func computeNodeHopPackets(pubkey string, txs []*StoreTx, fromISO string, pm *pr
 	attr := newHopAttributor(pm, graph)
 	onlyCandidate := map[string]bool{}
 
-	for _, tx := range txs {
+	for tx := range txs {
 		if tx.RouteType == nil || (*tx.RouteType != RouteFlood && *tx.RouteType != RouteTransportFlood) || tx.FirstSeen <= fromISO {
 			continue
 		}
@@ -310,6 +320,10 @@ func attributeByNeighbor(attr *hopAttributor, tx *StoreTx, idx int, prefix strin
 // GetNodeHopAnalytics returns the hop count at this node for every flood packet
 // it forwarded in the last days. Returns nil for an unknown node.
 func (s *PacketStore) GetNodeHopAnalytics(pubkey string, days int) (*NodeHopAnalyticsResponse, error) {
+	return s.readNodeHopAnalytics(context.Background(), pubkey, days)
+}
+
+func (s *PacketStore) readNodeHopAnalytics(ctx context.Context, pubkey string, days int) (*NodeHopAnalyticsResponse, error) {
 	node, err := s.db.GetNodeByPubkey(pubkey)
 	if err != nil || node == nil {
 		return nil, err
@@ -319,10 +333,24 @@ func (s *PacketStore) GetNodeHopAnalytics(pubkey string, days int) (*NodeHopAnal
 	now := time.Now().UTC()
 	fromISO := now.Add(-time.Duration(days) * 24 * time.Hour).Format(time.RFC3339)
 
-	s.mu.RLock()
 	_, pm := s.getCachedNodesAndPM()
-	packets, ambiguous := computeNodeHopPackets(pubkey, s.packets, fromISO, pm, s.graph.Load())
-	s.mu.RUnlock()
+	graph := s.graph.Load()
+	var packets []NodeHopPacket
+	var ambiguous int
+	if s.packetHistoryRequired() {
+		var readErr error
+		retained := func(yield func(*StoreTx) bool) {
+			readErr = s.visitRetainedHopHistory(ctx, pubkey, fromISO, func(tx *StoreTx) { yield(tx) })
+		}
+		packets, ambiguous = collectNodeHopPackets(pubkey, retained, fromISO, pm, graph)
+		if readErr != nil {
+			return nil, readErr
+		}
+	} else {
+		s.mu.RLock()
+		packets, ambiguous = computeNodeHopPackets(pubkey, s.packets, fromISO, pm, graph)
+		s.mu.RUnlock()
+	}
 
 	return &NodeHopAnalyticsResponse{
 		TimeRange: TimeRangeResp{From: fromISO, To: now.Format(time.RFC3339), Days: days},

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,24 +11,11 @@ import (
 
 // #1869: radio setting per observation, from the observer's radio history.
 
-// withRadioHistory installs a snapshot and observation radio ids for one test.
-func withRadioHistory(t testing.TB, snap *radioHistorySnapshot, ids map[int]string) {
+func withRadioHistory(t testing.TB, snap *radioHistorySnapshot) {
 	t.Helper()
 	prev := radioHistory.Load()
-	obsRadioMu.Lock()
-	prevIDs := obsRadioIDs
-	if ids == nil {
-		ids = map[int]string{}
-	}
-	obsRadioIDs = ids
-	obsRadioMu.Unlock()
 	radioHistory.Store(snap)
-	t.Cleanup(func() {
-		radioHistory.Store(prev)
-		obsRadioMu.Lock()
-		obsRadioIDs = prevIDs
-		obsRadioMu.Unlock()
-	})
+	t.Cleanup(func() { radioHistory.Store(prev) })
 }
 
 func TestRadioAt(t *testing.T) {
@@ -39,31 +27,29 @@ func TestRadioAt(t *testing.T) {
 				{Radio: "869.432,62.5,7,5", FirstSeen: "2026-10-28T00:05:00Z"},
 			},
 			byID:  map[string][]RadioStint{"b": {{RadioID: "b", Radio: "868.1,125,9,5", FirstSeen: "2026-10-26T00:00:00Z"}}},
-			multi: true,
 		},
 		"ONE": {main: []RadioStint{{Radio: "869.432,62.5,7,5", FirstSeen: "2026-10-01T00:00:00Z"}}},
 	}}
-	withRadioHistory(t, h, map[int]string{7: "b", 8: "nope"})
 	for _, c := range []struct {
 		observer string
-		obsID    int
+		radioID  string
 		ts, want string
 	}{
-		{"OBS", 1, "2026-09-01T00:00:00.000Z", "869.432,62.5,7,5"}, // before history: first stint
-		{"OBS", 1, "2026-10-25T09:20:00.000Z", "869.432,62.5,7,5"}, // between status messages: previous stint
-		{"OBS", 1, "2026-10-26T00:00:00.000Z", "869.618,62.5,8,8"},
-		{"OBS", 1, "2026-10-29T00:00:00.000Z", "869.432,62.5,7,5"},
-		{"OBS", 7, "2026-10-26T12:00:00.000Z", "868.1,125,9,5"},    // its own radio
-		{"OBS", 8, "2026-10-26T12:00:00.000Z", "869.618,62.5,8,8"}, // unknown radio id: main radio
-		{"ONE", 7, "2020-01-01T00:00:00.000Z", "869.432,62.5,7,5"}, // single stint, ids ignored
-		{"OTHER", 1, "2026-10-26T00:00:00Z", ""},
+		{"OBS", "", "2026-09-01T00:00:00.000Z", "869.432,62.5,7,5"}, // before history: first stint
+		{"OBS", "", "2026-10-25T09:20:00.000Z", "869.432,62.5,7,5"}, // between status messages: previous stint
+		{"OBS", "", "2026-10-26T00:00:00.000Z", "869.618,62.5,8,8"},
+		{"OBS", "", "2026-10-29T00:00:00.000Z", "869.432,62.5,7,5"},
+		{"OBS", "b", "2026-10-26T12:00:00.000Z", "868.1,125,9,5"},       // its own radio
+		{"OBS", "nope", "2026-10-26T12:00:00.000Z", "869.618,62.5,8,8"}, // unknown radio id: main radio
+		{"ONE", "b", "2020-01-01T00:00:00.000Z", "869.432,62.5,7,5"},    // single stint, ids ignored
+		{"OTHER", "", "2026-10-26T00:00:00Z", ""},
 	} {
-		if got := h.radioAt(c.observer, c.obsID, c.ts); got != c.want {
-			t.Errorf("radioAt(%s, %d, %s) = %q, want %q", c.observer, c.obsID, c.ts, got, c.want)
+		if got := h.radioAt(c.observer, c.radioID, c.ts); got != c.want {
+			t.Errorf("radioAt(%s, %q, %s) = %q, want %q", c.observer, c.radioID, c.ts, got, c.want)
 		}
 	}
 	var nilSnap *radioHistorySnapshot
-	if got := nilSnap.radioAt("OBS", 1, "2026-10-26T00:00:00Z"); got != "" {
+	if got := nilSnap.radioAt("OBS", "", "2026-10-26T00:00:00Z"); got != "" {
 		t.Errorf("nil snapshot = %q", got)
 	}
 }
@@ -102,7 +88,7 @@ func seedRadioHistory(t *testing.T, srv *Server) {
 			t.Fatal(err)
 		}
 	}
-	withRadioHistory(t, nil, nil)
+	withRadioHistory(t, nil)
 	refreshRadioHistory(srv.db.conn, true)
 }
 
@@ -203,25 +189,47 @@ func TestRadiosEndpointAndObserverHistory(t *testing.T) {
 	}
 }
 
-// The per-tick refresh sees a retune and new observation radio ids without
-// waiting for the full reload.
-func TestRefreshRadioHistoryIncremental(t *testing.T) {
-	srv, _ := setupTestServer(t)
+func TestRadioHistoryHydratesAndRefreshesObservationAssignments(t *testing.T) {
+	srv, router := setupTestServer(t)
 	seedRadioHistory(t, srv)
 	if _, err := srv.db.conn.Exec(`INSERT INTO observer_radios (observer_id, radio_id, radio, first_seen, last_seen) VALUES
 		('obs1', '', '869.618,62.5,8,8', '2098-01-01T00:00:00Z', '2098-01-01T00:00:00Z'),
-		('obs1', 'b', '868.1,125,9,5', '2026-01-01T00:00:00Z', '2099-01-01T00:00:00Z')`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := srv.db.conn.Exec(`INSERT INTO observation_radios (observation_id, radio_id) VALUES (42, 'b')`); err != nil {
+		('obs1', 'b', '868.1,125,9,5', '2026-01-01T00:00:00Z', '2099-01-01T00:00:00Z');
+		INSERT INTO observations (id, transmission_id, observer_idx, snr, rssi, path_json, timestamp)
+		VALUES (42, 1, 1, 10, -89, '["cc","dd","ee"]', 1780272000);
+		INSERT INTO observation_radios (observation_id, radio_id) VALUES (42, 'b');`); err != nil {
 		t.Fatal(err)
 	}
 	refreshRadioHistory(srv.db.conn, false)
-	if got := observationRadio(1, "obs1", "2098-06-01T00:00:00.000Z"); got != "869.618,62.5,8,8" {
+	if got := radioHistory.Load().radioAt("obs1", "", "2098-06-01T00:00:00.000Z"); got != "869.618,62.5,8,8" {
 		t.Errorf("after retune = %q", got)
 	}
-	if got := observationRadio(42, "obs1", "2026-06-01T00:00:00.000Z"); got != "868.1,125,9,5" {
-		t.Errorf("radio id of a new observation = %q", got)
+	broadcast := srv.store.IngestNewObservations(4, 50)
+	if len(broadcast) != 1 || broadcast[0]["radio"] != "868.1,125,9,5" {
+		t.Fatalf("new observation broadcast = %v", broadcast)
+	}
+	var matched packetsBody
+	getJSON(t, router, "/api/packets?observer=obs1&radio=868.1,125,9,5", &matched)
+	if matched.Total != 1 || len(matched.Packets) != 1 || matched.Packets[0]["hash"] != "abc123def4567890" {
+		t.Fatalf("new radio assignment filter = %+v", matched)
+	}
+	cold := NewPacketStore(srv.db, nil)
+	if err := cold.LoadChunked(2); err != nil {
+		t.Fatal(err)
+	}
+	rows := cold.QueryGroupedPackets(PacketQuery{Radio: "868.1,125,9,5"})
+	if rows.Total != 1 || len(rows.Packets) != 1 || rows.Packets[0]["radio"] != "868.1,125,9,5" {
+		t.Fatalf("cold grouped radio assignment = %+v", rows)
+	}
+	if _, err := srv.db.conn.Exec(`UPDATE observation_radios SET radio_id = 'unknown' WHERE observation_id = 42`); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.store.refreshObservationRadioIDs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	getJSON(t, router, "/api/packets?observer=obs1&radio=868.1,125,9,5", &matched)
+	if matched.Total != 0 {
+		t.Fatalf("rewritten radio assignment filter = %+v", matched)
 	}
 }
 
@@ -235,8 +243,15 @@ func TestLoadRadioHistoryWithoutTables(t *testing.T) {
 	if len(snap.observers) != 0 {
 		t.Errorf("empty DB gave %+v", snap)
 	}
-	if ids, _, err := loadObservationRadios(db.conn, 0); err != nil || len(ids) != 0 {
-		t.Errorf("observation radios = %v, %v", ids, err)
+	seedTestData(t, db)
+	withRadioHistory(t, snap)
+	store := NewPacketStore(db, nil)
+	if err := store.LoadChunked(2); err != nil {
+		t.Fatal(err)
+	}
+	result := store.GetPacketByHash("abc123def4567890")
+	if result == nil || result["radio"] != nil {
+		t.Fatalf("packet without a radio history = %v", result)
 	}
 }
 
@@ -251,7 +266,7 @@ func BenchmarkTxMatchesRadio(b *testing.B) {
 		}
 		h.observers[fmt.Sprintf("obs%d", i)] = o
 	}
-	withRadioHistory(b, h, nil)
+	withRadioHistory(b, h)
 	txs := make([]*StoreTx, 30000)
 	id := 0
 	for i := range txs {

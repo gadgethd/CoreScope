@@ -93,6 +93,12 @@ func buildTimeline(filtered []*StoreObs, days int) []TimeBucket {
 	return buildTimelineBuckets(counts, days)
 }
 
+func addObserverPacketType(counts map[string]int, tx *StoreTx) {
+	if tx != nil && tx.PayloadType != nil {
+		counts[strconv.Itoa(*tx.PayloadType)]++
+	}
+}
+
 // buildPacketTypes builds the payload-type histogram. Uses a direct
 // store.byTxID read (see #1828 triage) rather than enrichObs — the loop only
 // needs payload_type, which is a single indirection off the transmission.
@@ -101,11 +107,7 @@ func buildTimeline(filtered []*StoreObs, days int) []TimeBucket {
 func buildPacketTypes(filtered []*StoreObs, txByID map[int]*StoreTx) map[string]int {
 	out := map[string]int{}
 	for _, obs := range filtered {
-		tx := txByID[obs.TransmissionID]
-		if tx == nil || tx.PayloadType == nil {
-			continue
-		}
-		out[strconv.Itoa(*tx.PayloadType)]++
+		addObserverPacketType(out, txByID[obs.TransmissionID])
 	}
 	return out
 }
@@ -124,23 +126,7 @@ func buildNodesTimeline(filtered []*StoreObs, days int, txByID map[int]*StoreTx)
 		if nodeBucketSets[bucketStart] == nil {
 			nodeBucketSets[bucketStart] = map[string]struct{}{}
 		}
-		// Legacy handler read decoded_json via enrichObs (which pulls it off
-		// tx.DecodedJSON). Read tx directly for parity + savings.
-		if tx := txByID[obs.TransmissionID]; tx != nil && tx.DecodedJSON != "" {
-			var decoded map[string]interface{}
-			if json.Unmarshal([]byte(tx.DecodedJSON), &decoded) == nil {
-				for _, k := range []string{"pubKey", "srcHash", "destHash"} {
-					if v, ok := decoded[k].(string); ok && v != "" {
-						nodeBucketSets[bucketStart][v] = struct{}{}
-					}
-				}
-			}
-		}
-		for _, hop := range parsePathJSON(obs.PathJSON) {
-			if hop != "" {
-				nodeBucketSets[bucketStart][hop] = struct{}{}
-			}
-		}
+		addObserverNodes(nodeBucketSets[bucketStart], txByID[obs.TransmissionID], obs)
 	}
 	nodeCounts := make(map[int64]int, len(nodeBucketSets))
 	for k, nodes := range nodeBucketSets {
@@ -149,22 +135,50 @@ func buildNodesTimeline(filtered []*StoreObs, days int, txByID map[int]*StoreTx)
 	return buildTimelineBuckets(nodeCounts, days)
 }
 
+func addObserverNodes(nodes map[string]struct{}, tx *StoreTx, obs *StoreObs) {
+	if tx != nil && tx.DecodedJSON != "" {
+		var decoded map[string]json.RawMessage
+		if json.Unmarshal([]byte(tx.DecodedJSON), &decoded) == nil {
+			for _, key := range []string{"pubKey", "srcHash", "destHash"} {
+				var value string
+				if json.Unmarshal(decoded[key], &value) == nil && value != "" {
+					nodes[value] = struct{}{}
+				}
+			}
+		}
+	}
+	for _, hop := range parsePathJSON(obs.PathJSON) {
+		if hop != "" {
+			nodes[hop] = struct{}{}
+		}
+	}
+}
+
+func addObserverSnr(buckets map[int]*SnrDistributionEntry, obs *StoreObs) {
+	if obs.SNR == nil {
+		return
+	}
+	// Keep the established treatment of negative fractional values exactly.
+	bucket := int(*obs.SNR) / 2 * 2
+	if *obs.SNR < 0 && int(*obs.SNR) != bucket {
+		bucket -= 2
+	}
+	if buckets[bucket] == nil {
+		buckets[bucket] = &SnrDistributionEntry{Range: fmt.Sprintf("%d to %d", bucket, bucket+2)}
+	}
+	buckets[bucket].Count++
+}
+
 // buildSnrDistribution builds the SNR histogram (2-unit buckets, floor).
 func buildSnrDistribution(filtered []*StoreObs) []SnrDistributionEntry {
 	snrBuckets := map[int]*SnrDistributionEntry{}
 	for _, obs := range filtered {
-		if obs.SNR == nil {
-			continue
-		}
-		bucket := int(*obs.SNR) / 2 * 2
-		if *obs.SNR < 0 && int(*obs.SNR) != bucket {
-			bucket -= 2
-		}
-		if snrBuckets[bucket] == nil {
-			snrBuckets[bucket] = &SnrDistributionEntry{Range: fmt.Sprintf("%d to %d", bucket, bucket+2)}
-		}
-		snrBuckets[bucket].Count++
+		addObserverSnr(snrBuckets, obs)
 	}
+	return observerSnrDistribution(snrBuckets)
+}
+
+func observerSnrDistribution(snrBuckets map[int]*SnrDistributionEntry) []SnrDistributionEntry {
 	keys := make([]int, 0, len(snrBuckets))
 	for k := range snrBuckets {
 		keys = append(keys, k)
@@ -228,4 +242,70 @@ func txAnalyticsFields(tx *StoreTx) *StoreTx {
 		RouteType:   tx.RouteType,
 		DecodedJSON: tx.DecodedJSON,
 	}
+}
+
+type observerRecentPacket struct {
+	timestamp string
+	fields    packetFields
+}
+
+// Retained history is reduced without an observation snapshot. Only grouped
+// counters, distinct-node sets and the twenty rendered response rows survive
+// a visit; a historical packet or its observation list is never retained.
+type observerAnalyticsAccum struct {
+	days      int
+	bucketDur time.Duration
+	timeline  map[int64]int
+	types     map[string]int
+	nodes     map[int64]map[string]struct{}
+	snr       map[int]*SnrDistributionEntry
+	recent    []observerRecentPacket
+}
+
+func newObserverAnalyticsAccum(days int) *observerAnalyticsAccum {
+	return &observerAnalyticsAccum{days: days, bucketDur: observerAnalyticsBucketDur(days),
+		timeline: make(map[int64]int), types: make(map[string]int),
+		nodes: make(map[int64]map[string]struct{}), snr: make(map[int]*SnrDistributionEntry),
+		recent: make([]observerRecentPacket, 0, 20)}
+}
+
+func (a *observerAnalyticsAccum) add(tx *StoreTx, obs *StoreObs, render func() packetFields) {
+	stamp, ok := obs.ParsedTime()
+	if !ok {
+		return
+	}
+	bucket := stamp.UTC().Truncate(a.bucketDur).Unix()
+	a.timeline[bucket]++
+	addObserverPacketType(a.types, tx)
+	if a.nodes[bucket] == nil {
+		a.nodes[bucket] = make(map[string]struct{})
+	}
+	addObserverNodes(a.nodes[bucket], tx, obs)
+	addObserverSnr(a.snr, obs)
+	// Transmission traversal order is unrelated to reception time. Keep the
+	// actual newest twenty observations, using the handler's timestamp order.
+	position := sort.Search(len(a.recent), func(i int) bool { return a.recent[i].timestamp < obs.Timestamp })
+	if position >= 20 {
+		return
+	}
+	packet := observerRecentPacket{timestamp: obs.Timestamp, fields: render()}
+	if len(a.recent) < 20 {
+		a.recent = append(a.recent, observerRecentPacket{})
+	}
+	copy(a.recent[position+1:], a.recent[position:len(a.recent)-1])
+	a.recent[position] = packet
+}
+
+func (a *observerAnalyticsAccum) response() ObserverAnalyticsResponse {
+	nodeCounts := make(map[int64]int, len(a.nodes))
+	for bucket, nodes := range a.nodes {
+		nodeCounts[bucket] = len(nodes)
+	}
+	recent := make([]packetFields, 0, len(a.recent))
+	for _, packet := range a.recent {
+		recent = append(recent, packet.fields)
+	}
+	return ObserverAnalyticsResponse{Timeline: buildTimelineBuckets(a.timeline, a.days), PacketTypes: a.types,
+		NodesTimeline: buildTimelineBuckets(nodeCounts, a.days), SnrDistribution: observerSnrDistribution(a.snr),
+		RecentPackets: recent}
 }

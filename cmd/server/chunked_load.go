@@ -26,6 +26,7 @@ package main
 // HTTP handlers (which take s.mu.RLock) stay responsive.
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -303,6 +304,10 @@ func (s *PacketStore) LoadChunked(chunkSize int) error {
 	// failed load.
 	defer s.signalFirstChunk()
 
+	radioColumn, radioJoin, err := s.db.observationRadioSQL(context.Background())
+	if err != nil {
+		return err
+	}
 	t0 := time.Now()
 
 	// Build the retention/memory filter the legacy Load() uses so
@@ -418,19 +423,19 @@ func (s *PacketStore) LoadChunked(chunkSize int) error {
 			chunkSQL = `SELECT t.id, t.raw_hex, t.hash, t.first_seen, t.route_type,
 					t.payload_type, t.payload_version, t.decoded_json,
 					o.id, obs.id, obs.name, COALESCE(obs.iata, ''), o.direction,
-					o.snr, o.rssi, o.score, o.path_json, strftime('%Y-%m-%dT%H:%M:%fZ', o.timestamp, 'unixepoch')` + obsRawHexCol + rpCol + scopeNameCol + `
+					o.snr, o.rssi, o.score, o.path_json, strftime('%Y-%m-%dT%H:%M:%fZ', o.timestamp, 'unixepoch')` + obsRawHexCol + rpCol + scopeNameCol + radioColumn + `
 				FROM (SELECT * FROM transmissions t2 ` + whereClause + ` ORDER BY t2.id ASC LIMIT ` + fmt.Sprintf("%d", chunkSize) + `) AS t
 				LEFT JOIN observations o ON o.transmission_id = t.id
-				LEFT JOIN observers obs ON obs.rowid = o.observer_idx
+				LEFT JOIN observers obs ON obs.rowid = o.observer_idx` + radioJoin + `
 				ORDER BY t.id ASC, o.timestamp DESC`
 		} else {
 			chunkSQL = `SELECT t.id, t.raw_hex, t.hash, t.first_seen, t.route_type,
 					t.payload_type, t.payload_version, t.decoded_json,
 					o.id, o.observer_id, o.observer_name, COALESCE(obs.iata, ''), o.direction,
-					o.snr, o.rssi, o.score, o.path_json, o.timestamp` + obsRawHexCol + rpCol + scopeNameCol + `
+					o.snr, o.rssi, o.score, o.path_json, o.timestamp` + obsRawHexCol + rpCol + scopeNameCol + radioColumn + `
 				FROM (SELECT * FROM transmissions t2 ` + whereClause + ` ORDER BY t2.id ASC LIMIT ` + fmt.Sprintf("%d", chunkSize) + `) AS t
 				LEFT JOIN observations o ON o.transmission_id = t.id
-				LEFT JOIN observers obs ON obs.id = o.observer_id
+				LEFT JOIN observers obs ON obs.id = o.observer_id` + radioJoin + `
 				ORDER BY t.id ASC, o.timestamp DESC`
 		}
 
@@ -551,7 +556,7 @@ func (s *PacketStore) scanAndMergeChunk(rows *sql.Rows, relayPM *prefixMap, cold
 	var score sql.NullInt64
 	var obsRawHex sql.NullString
 	var resolvedPathStr sql.NullString
-	var scopeName sql.NullString
+	var scopeName, radioID sql.NullString
 
 	scanArgs := []interface{}{&txID, &rawHex, &hash, &firstSeen, &routeType, &payloadType,
 		&payloadVersion, &decodedJSON,
@@ -566,6 +571,7 @@ func (s *PacketStore) scanAndMergeChunk(rows *sql.Rows, relayPM *prefixMap, cold
 	if s.db.hasScopeName {
 		scanArgs = append(scanArgs, &scopeName)
 	}
+	scanArgs = append(scanArgs, &radioID)
 
 	for rows.Next() {
 		if err := rows.Scan(scanArgs...); err != nil {
@@ -633,6 +639,7 @@ func (s *PacketStore) scanAndMergeChunk(rows *sql.Rows, relayPM *prefixMap, cold
 				Timestamp:      normalizeTimestamp(nullStrVal(obsTimestamp)),
 				relayHopHexLen: n,
 			}
+			obs.setRadioID(radioID)
 
 			rpStr := nullStrVal(resolvedPathStr)
 			if rpStr != "" {

@@ -1172,30 +1172,34 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 			order = "ASC"
 		}
 		lim := queryLimit(r, 50, s.cfg.ListLimits.PacketsMax)
+		offset := max(0, queryInt(r, "offset", 0))
+		since, until := r.URL.Query().Get("since"), r.URL.Query().Get("until")
 		var result *PacketResult
 		var err error
-		if s.store != nil {
-			result = s.store.QueryMultiNodePackets(cleaned,
-				lim, queryInt(r, "offset", 0),
-				order, r.URL.Query().Get("since"), r.URL.Query().Get("until"))
-		} else {
-			result, err = s.db.QueryMultiNodePackets(cleaned,
-				lim, queryInt(r, "offset", 0),
-				order, r.URL.Query().Get("since"), r.URL.Query().Get("until"))
+		switch {
+		case len(cleaned) == 0:
+			result = &PacketResult{Packets: []packetFields{}}
+		case s.store != nil && s.store.packetHistoryRequired():
+			q := PacketQuery{Limit: lim, Offset: offset, Order: order, Since: since, Until: until}
+			result, err = s.store.queryRetainedPackets(r.Context(), q, false, cleaned)
+		case s.store != nil:
+			result = s.store.QueryMultiNodePackets(cleaned, lim, offset, order, since, until)
+		default:
+			result, err = s.db.QueryMultiNodePackets(cleaned, lim, offset, order, since, until)
 		}
 		if err != nil {
 			writeError(w, 500, err.Error())
 			return
 		}
 		result.Limit = lim
-		result.Offset = queryInt(r, "offset", 0)
+		result.Offset = offset
 		writeJSON(w, result)
 		return
 	}
 
 	q := PacketQuery{
 		Limit:              queryLimit(r, 50, s.cfg.ListLimits.PacketsMax),
-		Offset:             queryInt(r, "offset", 0),
+		Offset:             max(0, queryInt(r, "offset", 0)),
 		Observer:           r.URL.Query().Get("observer"),
 		ExcludeTx:          r.URL.Query().Get("excludeTx") == "true",
 		Hash:               r.URL.Query().Get("hash"),
@@ -1221,29 +1225,19 @@ func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
 		q.Route = &t
 	}
 
-	if r.URL.Query().Get("groupByHash") == "true" {
-		var result *PacketResult
-		var err error
-		if s.store != nil {
-			result = s.store.QueryGroupedPackets(q)
-		} else {
-			result, err = s.db.QueryGroupedPackets(q)
-		}
-		if err != nil {
-			writeError(w, 500, err.Error())
-			return
-		}
-		result.Limit = q.Limit
-		result.Offset = q.Offset
-		writeJSON(w, result)
-		return
-	}
-
+	grouped := r.URL.Query().Get("groupByHash") == "true"
 	var result *PacketResult
 	var err error
-	if s.store != nil {
+	switch {
+	case s.store != nil && (s.store.packetHistoryRequired() || (!grouped && q.unfilteredFlatPage())):
+		result, err = s.store.queryRetainedPackets(r.Context(), q, grouped, nil)
+	case s.store != nil && grouped:
+		result = s.store.QueryGroupedPackets(q)
+	case s.store != nil:
 		result = s.store.QueryPackets(q)
-	} else {
+	case grouped:
+		result, err = s.db.QueryGroupedPackets(q)
+	default:
 		result, err = s.db.QueryPackets(q)
 	}
 	if err != nil {
@@ -1260,6 +1254,15 @@ func (s *Server) handlePacketTimestamps(w http.ResponseWriter, r *http.Request) 
 	since := r.URL.Query().Get("since")
 	if since == "" {
 		writeError(w, 400, "since required")
+		return
+	}
+	if s.store != nil && s.store.packetHistoryRequired() {
+		timestamps, err := s.db.retainedTimestamps(r.Context(), since)
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		writeJSON(w, timestamps)
 		return
 	}
 	if s.store != nil {
@@ -1323,7 +1326,24 @@ func (s *Server) handleBatchObservations(w http.ResponseWriter, r *http.Request)
 	}
 
 	results := make(map[string][]ObservationResp, len(body.Hashes))
-	if s.store != nil {
+	if s.store != nil && s.store.packetHistoryRequired() {
+		packets, err := s.db.lookupRetainedPackets(r.Context(), body.Hashes, 0, false)
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		byHash := make(map[string]*retainedPacket, len(packets))
+		for _, packet := range packets {
+			byHash[packet.tx.Hash] = packet
+		}
+		for _, hash := range body.Hashes {
+			if packet := byHash[strings.ToLower(hash)]; packet != nil {
+				results[hash] = mapSliceToObservations(packet.renderObservations())
+			} else {
+				results[hash] = []ObservationResp{}
+			}
+		}
+	} else if s.store != nil {
 		for _, hash := range body.Hashes {
 			obs := s.store.GetObservationsForHash(hash)
 			results[hash] = mapSliceToObservations(obs)
@@ -1334,11 +1354,12 @@ func (s *Server) handleBatchObservations(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) handlePacketDetail(w http.ResponseWriter, r *http.Request) {
 	param := mux.Vars(r)["id"]
-	var packet map[string]interface{}
-	fromDB := false
+	var packet packetFields
+	var observations []packetFields
+	useHistory := s.store != nil && s.store.packetHistoryRequired()
 
 	isHash := hashPattern.MatchString(strings.ToLower(param))
-	if s.store != nil {
+	if s.store != nil && !useHistory {
 		if isHash {
 			packet = s.store.GetPacketByHash(param)
 		}
@@ -1351,39 +1372,25 @@ func (s *Server) handlePacketDetail(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-	}
-	// DB fallback: in-memory PacketStore prunes old entries, but the SQLite
-	// DB retains them and is the source for /api/nodes recentAdverts. Without
-	// this fallback, links from node-detail pages 404 once the packet ages out.
-	if packet == nil && s.db != nil {
-		if isHash {
-			if dbPkt, err := s.db.GetPacketByHash(param); err == nil && dbPkt != nil {
-				packet = dbPkt
-				fromDB = true
-			}
+		if packet != nil {
+			hash, _ := packet["hash"].(string)
+			observations = s.store.GetObservationsForHash(hash)
 		}
-		if packet == nil {
-			if id, parseErr := strconv.Atoi(param); parseErr == nil {
-				if dbPkt, err := s.db.GetTransmissionByID(id); err == nil && dbPkt != nil {
-					packet = dbPkt
-					fromDB = true
-				}
-			}
+	}
+	resident := packet != nil
+	if !resident && s.db != nil {
+		var err error
+		packet, observations, err = s.db.retainedPacketDetail(r.Context(), param)
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
 		}
 	}
 	if packet == nil {
 		writeError(w, 404, "Not found")
 		return
 	}
-
 	hash, _ := packet["hash"].(string)
-	var observations []map[string]interface{}
-	if s.store != nil {
-		observations = s.store.GetObservationsForHash(hash)
-	}
-	if len(observations) == 0 && fromDB && s.db != nil && hash != "" {
-		observations = s.db.GetObservationsForHash(hash)
-	}
 	// #1999: give each observation its OWN wire bytes. Neither the store nor
 	// the DB observation query carries them — both deliberately drop
 	// observations.raw_hex (#881, ~98MB on a 1.7M-observation store) on the
@@ -1410,7 +1417,7 @@ func (s *Server) handlePacketDetail(w http.ResponseWriter, r *http.Request) {
 	// raw_hex would skip every one of them and leave the bug in place on the
 	// main path. Only where no frame is stored does the canonical value stand.
 	canonicalHex, _ := packet["raw_hex"].(string)
-	if s.db != nil && hash != "" && len(observations) > 0 {
+	if resident && s.db != nil && hash != "" && len(observations) > 0 {
 		byObsID := s.db.ObservationRawHexForHash(hash)
 		for _, obs := range observations {
 			if id, ok := obs["id"].(int); ok {
@@ -2034,11 +2041,7 @@ func (s *Server) handleNetworkStatus(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleNodePaths(w http.ResponseWriter, r *http.Request) {
 	pubkey := mux.Vars(r)["pubkey"]
-	if s.cfg.IsBlacklisted(pubkey) {
-		writeError(w, 404, "Not found")
-		return
-	}
-	if s.isPubkeyHidden(pubkey) {
+	if s.cfg.IsBlacklisted(pubkey) || s.isPubkeyHidden(pubkey) {
 		writeError(w, 404, "Not found")
 		return
 	}
@@ -2051,377 +2054,34 @@ func (s *Server) handleNodePaths(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 503, "Packet store unavailable")
 		return
 	}
-	if !s.store.PathHopIndexReady() {
+	history := s.store.packetHistoryRequired()
+	if !history && !s.store.PathHopIndexReady() {
 		writeIndexLoading503(w)
 		return
 	}
 
-	// Use the precomputed byPathHop index instead of scanning all packets.
-	// Look up by full pubkey (resolved hops) and by short prefixes (raw hops).
 	lowerPK := strings.ToLower(pubkey)
-	prefix2 := lowerPK
-	if len(prefix2) > 4 {
-		prefix2 = prefix2[:4]
-	}
-	prefix1 := lowerPK
-	if len(prefix1) > 2 {
-		prefix1 = prefix1[:2]
-	}
-
-	s.store.mu.RLock()
 	_, pm := s.store.getCachedNodesAndPM()
-
-	// Collect candidate transmissions from the index, deduplicating by tx ID.
-	// confirmedByFullKey tracks TXs found via the full-pubkey index key — these are
-	// already resolved_path-confirmed and bypass the hop-level check below.
-	confirmedByFullKey := make(map[int]bool)
-	seen := make(map[int]bool)
-	var candidates []*StoreTx
-	addCandidates := func(key string, confirmed bool) {
-		for _, tx := range s.store.byPathHop[key] {
-			if !seen[tx.ID] {
-				seen[tx.ID] = true
-				if confirmed {
-					confirmedByFullKey[tx.ID] = true
-				}
-				candidates = append(candidates, tx)
-			}
+	aggregate := newNodePathAggregate(lowerPK, pm, s.store.graph.Load())
+	if history {
+		err := s.store.visitRetainedPathHistory(r.Context(), lowerPK, aggregate.addRetained)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Node paths unavailable")
+			return
 		}
+	} else {
+		s.store.collectResidentNodePaths(lowerPK, aggregate)
 	}
-	addCandidates(lowerPK, true)  // full pubkey match (from resolved_path) → confirmed
-	addCandidates(prefix1, false) // 2-char raw hop match
-	addCandidates(prefix2, false) // 4-char raw hop match
-	// Also check any raw hops that start with prefix2 (longer prefixes).
-	// Raw hops are typically 2 chars, so iterate only keys with HasPrefix
-	// on the small set of index keys rather than all packets.
-	for key := range s.store.byPathHop {
-		if len(key) > 4 && len(key) < len(lowerPK) && strings.HasPrefix(key, prefix2) {
-			addCandidates(key, false)
-		}
-	}
-
-	// Post-filter: verify target node actually appears in each candidate's resolved_path.
-	// The byPathHop index uses short prefixes which can collide (e.g. "c0" matches multiple nodes).
-	// We lean on resolved_path (from neighbor affinity graph) to disambiguate.
-	//
-	// Collect candidate IDs and index membership under the read lock, then release
-	// the lock before reading the stored resolved paths (disk I/O).
-	type candidateCheck struct {
-		tx         *StoreTx
-		hasReverse bool
-		inIndex    bool
-	}
-	checks := make([]candidateCheck, len(candidates))
-	// The stored resolved paths are read after s.mu is released, so they get
-	// a snapshot of each candidate's observations instead of tx.Observations,
-	// which ingest appends to under the write lock.
-	rpSnapshots := make(map[int][]rpObs, len(candidates))
-	for i, tx := range candidates {
-		cc := candidateCheck{tx: tx}
-		if !s.store.useResolvedPathIndex {
-			cc.inIndex = true // flag off — keep all
-		} else if _, hasRev := s.store.resolvedPubkeyReverse[tx.ID]; !hasRev {
-			cc.inIndex = true // no indexed pubkeys — keep (conservative)
-		} else {
-			h := resolvedPubkeyHash(lowerPK)
-			for _, id := range s.store.resolvedPubkeyIndex[h] {
-				if id == tx.ID {
-					cc.hasReverse = true // needs SQL confirmation
-					break
-				}
-			}
-			// If not in index at all, it's a definite no
-		}
-		checks[i] = cc
-		if cc.inIndex || cc.hasReverse {
-			rpSnapshots[tx.ID] = snapshotRPObs(tx)
-		}
-	}
-	s.store.mu.RUnlock()
-
-	// #1278: the CANONICAL persisted resolved_path of each candidate, the one
-	// bestResolvedPath returns, read in batches (#2146).
-	//
-	// Option A from the issue: the packets page renders each tx via
-	// bestResolvedPath. For /api/nodes/{pk}/paths to stay
-	// CONSISTENT with the packets page, BOTH the containsTarget membership
-	// decision AND the displayed hop names must come from that same
-	// canonical resolved_path — not a re-resolution biased by passing the
-	// queried node as hopContext anchor.
-	//
-	// Falls back to biased re-resolve only when a tx has no persisted
-	// resolved_path (older data / async backfill incomplete); in that case
-	// there's no canonical answer to be consistent with.
-	canonicalRP := s.store.loadCanonicalResolvedPaths(rpSnapshots)
-
-	// Collision check for candidates found through the resolved-pubkey hash
-	// index (hasReverse). A candidate with a canonical path needs none: the
-	// aggregation below keeps it only if that path names the node, and if no
-	// stored path names it the canonical one does not either. Only one without
-	// a canonical path is checked against SQL, as before.
-	confirmedBySQL := make(map[int]bool)
-	filtered := candidates[:0]
-	for _, cc := range checks {
-		if cc.inIndex {
-			filtered = append(filtered, cc.tx)
-		} else if cc.hasReverse {
-			if _, ok := canonicalRP[cc.tx.ID]; ok {
-				filtered = append(filtered, cc.tx)
-			} else if s.store.confirmResolvedPathContains(cc.tx.ID, lowerPK) {
-				filtered = append(filtered, cc.tx)
-				confirmedBySQL[cc.tx.ID] = true
-			}
-		}
-		// else: not in index → exclude
-	}
-	candidates = filtered
-
-	// Re-acquire read lock for the aggregation phase that reads store data.
-	s.store.mu.RLock()
-
-	type pathAgg struct {
-		Hops       []PathHopResp
-		Count      int
-		LastSeen   string
-		SampleHash string
-	}
-	pathGroups := map[string]*pathAgg{}
-	totalTransmissions := 0
-	hopCache := make(map[string]*nodeInfo)
-	// Anchor the resolver with the node being queried so tier-1/2 hop-context
-	// resolution lights up when a hop prefix matches the destination node
-	// (handleNodePaths aggregates paths terminating at lowerPK). Passing nil
-	// here re-introduced regression #1197 in production. See
-	// resolve_context_callsites_test.go.
-	//
-	// NOTE (#1278): this biased resolver is only consulted for the FALLBACK
-	// path — txs with no persisted resolved_path. Txs with a canonical
-	// resolved_path use the persisted pubkeys directly (see canonicalRP),
-	// which keeps results consistent with the packets page.
-	hopContext := []string{lowerPK}
-	resolveHop := func(hop string) *nodeInfo {
-		if cached, ok := hopCache[hop]; ok {
-			return cached
-		}
-		r, _, _ := pm.resolveWithContext(hop, hopContext, s.store.graph.Load())
-		hopCache[hop] = r
-		return r
-	}
-	// nodeByPK caches pubkey → *nodeInfo lookups when rendering canonical
-	// resolved_path entries. Cheap O(1) hit against pm.m (the prefix map
-	// stores the full pubkey as a key for pubkeys >= maxPrefixLen).
-	nodeByPK := make(map[string]*nodeInfo)
-	lookupNode := func(pk string) *nodeInfo {
-		key := strings.ToLower(pk)
-		if cached, ok := nodeByPK[key]; ok {
-			return cached
-		}
-		// Use plain resolve(); we have the full pubkey, no ambiguity.
-		n := pm.resolve(key)
-		if n == nil || !strings.EqualFold(n.PublicKey, key) {
-			// Full pubkey may not be present in pm (role filter, eviction).
-			// Fall through with nil; caller renders prefix-only entry.
-			nodeByPK[key] = nil
-			return nil
-		}
-		nodeByPK[key] = n
-		return n
-	}
-	for _, tx := range candidates {
-		hops := txGetParsedPath(tx)
-		resolvedHops := make([]PathHopResp, len(hops))
-		sigParts := make([]string, len(hops))
-		containsTarget := false
-
-		if rp, ok := canonicalRP[tx.ID]; ok {
-			// Option A: render hops + decide membership from the CANONICAL
-			// persisted resolved_path. resolved_path is parallel to the
-			// best-obs path_json which may be longer than tx.PathJSON used by
-			// txGetParsedPath; align by the shorter length.
-			rpLen := len(rp)
-			for i, hop := range hops {
-				entry := PathHopResp{Prefix: hop, Name: hop}
-				var resolvedPK string
-				if i < rpLen && rp[i] != nil {
-					resolvedPK = strings.ToLower(*rp[i])
-				}
-				if resolvedPK != "" {
-					if n := lookupNode(resolvedPK); n != nil {
-						entry.Name = n.Name
-						entry.Pubkey = n.PublicKey
-						if n.HasGPS {
-							entry.Lat = n.Lat
-							entry.Lon = n.Lon
-						}
-						sigParts[i] = n.PublicKey
-					} else {
-						entry.Pubkey = resolvedPK
-						sigParts[i] = resolvedPK
-					}
-					if resolvedPK == lowerPK {
-						containsTarget = true
-					}
-				} else {
-					sigParts[i] = hop
-				}
-				resolvedHops[i] = entry
-			}
-		} else {
-			// Fallback: no canonical resolved_path persisted (older data /
-			// async backfill incomplete). Use biased re-resolve and the
-			// legacy containsTarget heuristics (preserves #1197 behavior
-			// and the #929 prefix-collision exclusion test).
-			//
-			// #1352: When a hop prefix has MULTIPLE candidates (sibling
-			// prefix collisions), the biased resolver — anchored on the
-			// queried target via hopContext=[lowerPK] — will preferentially
-			// resolve to the target via tier-2 geo / tier-3 GPS. This
-			// causes the SAME tx to be attributed to every prefix sibling
-			// when each is queried in turn. To prevent wrong-node
-			// attribution, we ONLY accept a resolver match as evidence of
-			// target membership when:
-			//   (a) the tx was already pre-confirmed via
-			//       confirmedByFullKey (resolved_path index hit) or
-			//       confirmedBySQL (verified pubkey in resolved_path), OR
-			//   (b) the hop's prefix candidate set is UNIQUE — no
-			//       collision, so the resolver had no choice to bias.
-			// Multi-candidate hops with no SQL/index confirmation are
-			// treated as ambiguous and excluded from paths-through.
-			containsTarget = confirmedByFullKey[tx.ID] || confirmedBySQL[tx.ID]
-			// preconfirmed: SNAPSHOT of containsTarget BEFORE the per-hop
-			// loop runs. Captures only the SQL/full-key index pre-confirmation
-			// signal (independent of biased-resolver output). MUST NOT be
-			// reassigned inside the loop — doing so would let a biased-
-			// resolver match in hop[i] silently authorize a later ambiguous
-			// hop[j], re-opening the #1352 wrong-node attribution path.
-			//
-			// Note: today the loop only ever transitions containsTarget
-			// false → true, so the snapshot is functionally redundant for
-			// the preconfirmed==true case (containsTarget is already true).
-			// We keep the snapshot + the `preconfirmed ||` clauses below
-			// as a structural invariant: future edits that flip
-			// containsTarget back to false inside the loop (e.g. an
-			// "exclude if last hop doesn't match" tweak) would otherwise
-			// silently lose the SQL/index confirmation. The snapshot is
-			// the documented contract.
-			preconfirmed := containsTarget
-			for i, hop := range hops {
-				resolved := resolveHop(hop)
-				entry := PathHopResp{Prefix: hop, Name: hop}
-				lowerHop := strings.ToLower(hop)
-				// #1352 guard helper. We treat as "unique/safe" when the
-				// hop's prefix candidate set has EXACTLY ONE member: no
-				// sibling collision, so the biased resolver had no choice
-				// to bias. len(pm.m[lowerHop]) == 0 is also accepted as
-				// safe-by-default in the resolvable arm because the
-				// resolver returned a non-nil candidate from somewhere
-				// (e.g. a full-pubkey hop longer than maxPrefixLen, or a
-				// hop indexed under a different prefix length); there's
-				// no collision to resolve away. In the unresolvable arm
-				// below, len==0 is the ONLY reachable case (resolveHop
-				// returns nil iff pm.m[lowerHop] is empty — see
-				// resolveWithContext priority chain), so the guard there
-				// is intentionally permissive on len==0 and the
-				// `preconfirmed ||` clause is the meaningful gate.
-				uniquePrefix := len(pm.m[lowerHop]) <= 1
-				if resolved != nil {
-					entry.Name = resolved.Name
-					entry.Pubkey = resolved.PublicKey
-					if resolved.HasGPS {
-						entry.Lat = resolved.Lat
-						entry.Lon = resolved.Lon
-					}
-					sigParts[i] = resolved.PublicKey
-					if strings.ToLower(resolved.PublicKey) == lowerPK {
-						// #1352: only attribute when unambiguous OR
-						// already pre-confirmed via SQL/full-key index.
-						if preconfirmed || uniquePrefix {
-							containsTarget = true
-						}
-					}
-				} else {
-					sigParts[i] = hop
-					// Unresolvable hop: keep conservative if prefix could
-					// be the target AND there's no sibling collision.
-					// If multiple candidates share this prefix, attribution
-					// is ambiguous — don't claim membership without SQL
-					// confirmation (#1352). See comment on uniquePrefix
-					// above re: why len==0 is treated as safe here.
-					if strings.HasPrefix(lowerPK, lowerHop) {
-						if preconfirmed || uniquePrefix {
-							containsTarget = true
-						}
-					}
-				}
-				resolvedHops[i] = entry
-			}
-		}
-
-		if !containsTarget {
-			continue
-		}
-		totalTransmissions++
-
-		sig := strings.Join(sigParts, "→")
-		agg := pathGroups[sig]
-		if agg == nil {
-			pathGroups[sig] = &pathAgg{
-				Hops:       resolvedHops,
-				Count:      1,
-				LastSeen:   tx.FirstSeen,
-				SampleHash: tx.Hash,
-			}
-			continue
-		}
-		agg.Count++
-		if tx.FirstSeen > agg.LastSeen {
-			agg.LastSeen = tx.FirstSeen
-			agg.SampleHash = tx.Hash
-		}
-	}
-	s.store.mu.RUnlock()
-
-	paths := make([]PathEntryResp, 0, len(pathGroups))
-	for _, agg := range pathGroups {
-		var lastSeen interface{}
-		if agg.LastSeen != "" {
-			lastSeen = agg.LastSeen
-		}
-		paths = append(paths, PathEntryResp{
-			Hops:       agg.Hops,
-			Count:      agg.Count,
-			LastSeen:   lastSeen,
-			SampleHash: agg.SampleHash,
-		})
-	}
-	sort.Slice(paths, func(i, j int) bool {
-		li := ""
-		lj := ""
-		if paths[i].LastSeen != nil {
-			li = fmt.Sprintf("%v", paths[i].LastSeen)
-		}
-		if paths[j].LastSeen != nil {
-			lj = fmt.Sprintf("%v", paths[j].LastSeen)
-		}
-		if li != lj {
-			return li > lj
-		}
-		return paths[i].Count > paths[j].Count
-	})
-	if len(paths) > 50 {
-		paths = paths[:50]
-	}
-
 	writeJSON(w, NodePathsResponse{
-		Node: map[string]interface{}{
+		Node: packetFields{
 			"public_key": node["public_key"],
 			"name":       node["name"],
 			"lat":        node["lat"],
 			"lon":        node["lon"],
 		},
-		Paths:              paths,
-		TotalPaths:         len(pathGroups),
-		TotalTransmissions: totalTransmissions,
+		Paths:              aggregate.paths(),
+		TotalPaths:         len(aggregate.groups),
+		TotalTransmissions: aggregate.totalTransmissions,
 	})
 }
 
@@ -2438,8 +2098,12 @@ func (s *Server) handleNodeAnalytics(w http.ResponseWriter, r *http.Request) {
 	days := nodeAnalyticsDays(r)
 
 	if s.store != nil {
-		result, err := s.store.GetNodeAnalytics(pubkey, days)
-		if err != nil || result == nil {
+		result, err := s.store.GetNodeAnalyticsContext(r.Context(), pubkey, days)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Node analytics unavailable")
+			return
+		}
+		if result == nil {
 			writeError(w, 404, "Not found")
 			return
 		}
@@ -2465,8 +2129,12 @@ func (s *Server) handleNodeHopAnalytics(w http.ResponseWriter, r *http.Request) 
 		writeError(w, 404, "Not found")
 		return
 	}
-	result, err := s.store.GetNodeHopAnalytics(pubkey, nodeAnalyticsDays(r))
-	if err != nil || result == nil {
+	result, err := s.store.readNodeHopAnalytics(r.Context(), pubkey, nodeAnalyticsDays(r))
+	if err != nil {
+		writeError(w, 500, "Unable to read node hop history")
+		return
+	}
+	if result == nil {
 		writeError(w, 404, "Not found")
 		return
 	}
@@ -2479,7 +2147,11 @@ func (s *Server) handleNodeClockSkew(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "Not found")
 		return
 	}
-	result := s.store.GetNodeClockSkew(pubkey)
+	result, err := s.store.readNodeClockSkew(r.Context(), pubkey)
+	if err != nil {
+		writeError(w, 500, "Unable to read node clock history")
+		return
+	}
 	if result == nil {
 		writeError(w, 404, "No clock skew data for this node")
 		return
@@ -2492,7 +2164,12 @@ func (s *Server) handleObserverClockSkew(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, []ObserverCalibration{})
 		return
 	}
-	writeJSON(w, s.store.GetObserverCalibrations())
+	calibrations, err := s.store.readObserverCalibrations(r.Context())
+	if err != nil {
+		writeError(w, 500, "Unable to read observer clock history")
+		return
+	}
+	writeJSON(w, calibrations)
 }
 
 func (s *Server) handleFleetClockSkew(w http.ResponseWriter, r *http.Request) {
@@ -2501,7 +2178,12 @@ func (s *Server) handleFleetClockSkew(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	area := r.URL.Query().Get("area")
-	writeJSON(w, s.store.GetFleetClockSkew(area))
+	summaries, err := s.store.readFleetClockSkew(r.Context(), area)
+	if err != nil {
+		writeError(w, 500, "Unable to read fleet clock history")
+		return
+	}
+	writeJSON(w, summaries)
 }
 
 // --- Analytics Handlers ---
@@ -3237,10 +2919,26 @@ func (s *Server) handleObserverAnalytics(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	since := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
+	if s.store.packetHistoryRequired() {
+		accum := newObserverAnalyticsAccum(days)
+		err := s.store.visitRetainedObserverHistory(r.Context(), id, since, func(packet *retainedPacket, obs *StoreObs) {
+			accum.add(packet.tx, obs, func() packetFields { return packet.renderObservation(obs) })
+		})
+		if err == nil {
+			err = r.Context().Err()
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Observer analytics unavailable")
+			return
+		}
+		writeJSON(w, accum.response())
+		return
+	}
+
 	// #1828 Phase A: aggregate builders extracted into observer_analytics.go.
 	// Single snapshot under RLock (#1481 P0-2), then five composable helpers
 	// off the snapshot. No behavior change; JSON output is byte-identical.
-	since := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
 	s.store.mu.RLock()
 	obsList := s.store.byObserver[id]
 	obsSnapshot := make([]*StoreObs, len(obsList))

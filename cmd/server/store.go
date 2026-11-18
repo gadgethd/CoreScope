@@ -2,6 +2,7 @@ package main
 
 import (
 	"container/heap"
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
@@ -98,6 +99,7 @@ type StoreObs struct {
 	// the 160-byte allocation class. Zero includes missing legacy headers.
 	// Read/write under the owning store's mu after publication.
 	relayHopHexLen uint8
+	radioID        atomic.Pointer[string] // sparse assignment may be rewritten by the ingestor
 
 	// #1481 P0-2: cached parsed timestamp. The legacy handlers parse
 	// Timestamp as RFC3339Nano/RFC3339/"2006-01-02 15:04:05" with a
@@ -874,6 +876,10 @@ func NewPacketStore(db *DB, cfg *PacketStoreConfig, cacheTTLs ...map[string]inte
 // When maxMemoryMB > 0, loads only the newest N transmissions that fit
 // within the memory budget, avoiding OOM on large databases.
 func (s *PacketStore) Load() error {
+	radioColumn, radioJoin, err := s.db.observationRadioSQL(context.Background())
+	if err != nil {
+		return err
+	}
 	s.advertEvidenceMu.Lock()
 	defer s.advertEvidenceMu.Unlock()
 	s.mu.Lock()
@@ -923,8 +929,6 @@ func (s *PacketStore) Load() error {
 	if s.db.hasObsRawHex {
 		obsRawHexCol = ", o.raw_hex"
 	}
-	// #1751: scope_name is on the transmission row; append as the last
-	// selected column so the observation fan-out doesn't affect its position.
 	scopeNameCol := ""
 	if s.db.hasScopeName {
 		scopeNameCol = ", t.scope_name"
@@ -973,19 +977,19 @@ func (s *PacketStore) Load() error {
 		loadSQL = `SELECT t.id, t.raw_hex, t.hash, t.first_seen, t.route_type,
 				t.payload_type, t.payload_version, t.decoded_json,
 				o.id, obs.id, obs.name, COALESCE(obs.iata, ''), o.direction,
-				o.snr, o.rssi, o.score, o.path_json, strftime('%Y-%m-%dT%H:%M:%fZ', o.timestamp, 'unixepoch')` + obsRawHexCol + rpCol + scopeNameCol + `
+				o.snr, o.rssi, o.score, o.path_json, strftime('%Y-%m-%dT%H:%M:%fZ', o.timestamp, 'unixepoch')` + obsRawHexCol + rpCol + scopeNameCol + radioColumn + `
 			FROM transmissions t
 			LEFT JOIN observations o ON o.transmission_id = t.id
-			LEFT JOIN observers obs ON obs.rowid = o.observer_idx` + filterClause + `
+			LEFT JOIN observers obs ON obs.rowid = o.observer_idx` + radioJoin + filterClause + `
 			ORDER BY t.first_seen ASC, o.timestamp DESC`
 	} else {
 		loadSQL = `SELECT t.id, t.raw_hex, t.hash, t.first_seen, t.route_type,
 				t.payload_type, t.payload_version, t.decoded_json,
 				o.id, o.observer_id, o.observer_name, COALESCE(obs.iata, ''), o.direction,
-				o.snr, o.rssi, o.score, o.path_json, o.timestamp` + obsRawHexCol + rpCol + scopeNameCol + `
+				o.snr, o.rssi, o.score, o.path_json, o.timestamp` + obsRawHexCol + rpCol + scopeNameCol + radioColumn + `
 			FROM transmissions t
 			LEFT JOIN observations o ON o.transmission_id = t.id
-			LEFT JOIN observers obs ON obs.id = o.observer_id` + filterClause + `
+			LEFT JOIN observers obs ON obs.id = o.observer_id` + radioJoin + filterClause + `
 			ORDER BY t.first_seen ASC, o.timestamp DESC`
 	}
 
@@ -1021,7 +1025,7 @@ func (s *PacketStore) Load() error {
 	var score sql.NullInt64
 	var obsRawHex sql.NullString
 	var resolvedPathStr sql.NullString
-	var scopeName sql.NullString
+	var scopeName, radioID sql.NullString
 
 	scanArgs := []interface{}{&txID, &rawHex, &hash, &firstSeen, &routeType, &payloadType,
 		&payloadVersion, &decodedJSON,
@@ -1036,6 +1040,7 @@ func (s *PacketStore) Load() error {
 	if s.db.hasScopeName {
 		scanArgs = append(scanArgs, &scopeName)
 	}
+	scanArgs = append(scanArgs, &radioID)
 
 	for rows.Next() {
 		if err := rows.Scan(scanArgs...); err != nil {
@@ -1098,6 +1103,7 @@ func (s *PacketStore) Load() error {
 				Timestamp:      normalizeTimestamp(nullStrVal(obsTimestamp)),
 				relayHopHexLen: n,
 			}
+			obs.setRadioID(radioID)
 
 			// Decode-window: extract resolved pubkeys for index, don't store on struct.
 			rpStr := nullStrVal(resolvedPathStr)
@@ -1246,6 +1252,10 @@ func accumulateDedup(byTx map[int][]string, seenByTx map[int]map[string]bool, tx
 }
 
 func (s *PacketStore) loadChunk(from, to time.Time) error {
+	radioColumn, radioJoin, err := s.db.observationRadioSQL(context.Background())
+	if err != nil {
+		return err
+	}
 	fromStr := from.UTC().Format(time.RFC3339)
 	toStr := to.UTC().Format(time.RFC3339)
 	fromUnix := from.UTC().Unix()
@@ -1262,7 +1272,6 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 	if s.db.hasObsRawHex {
 		obsRawHexCol = ", o.raw_hex"
 	}
-	// #1751: scope_name is on the transmission row; append as the last column.
 	scopeNameCol := ""
 	if s.db.hasScopeName {
 		scopeNameCol = ", t.scope_name"
@@ -1286,19 +1295,19 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 		chunkSQL = `SELECT t.id, t.raw_hex, t.hash, t.first_seen, t.route_type,
 				t.payload_type, t.payload_version, t.decoded_json,
 				o.id, obs.id, obs.name, COALESCE(obs.iata, ''), o.direction,
-				o.snr, o.rssi, o.score, o.path_json, strftime('%Y-%m-%dT%H:%M:%fZ', o.timestamp, 'unixepoch')` + obsRawHexCol + rpCol + scopeNameCol + `
+				o.snr, o.rssi, o.score, o.path_json, strftime('%Y-%m-%dT%H:%M:%fZ', o.timestamp, 'unixepoch')` + obsRawHexCol + rpCol + scopeNameCol + radioColumn + `
 			FROM transmissions t
 			LEFT JOIN observations o ON o.transmission_id = t.id
-			LEFT JOIN observers obs ON obs.rowid = o.observer_idx` + filterClause + `
+			LEFT JOIN observers obs ON obs.rowid = o.observer_idx` + radioJoin + filterClause + `
 			ORDER BY t.first_seen ASC, o.timestamp DESC`
 	} else {
 		chunkSQL = `SELECT t.id, t.raw_hex, t.hash, t.first_seen, t.route_type,
 				t.payload_type, t.payload_version, t.decoded_json,
 				o.id, o.observer_id, o.observer_name, COALESCE(obs.iata, ''), o.direction,
-				o.snr, o.rssi, o.score, o.path_json, o.timestamp` + obsRawHexCol + rpCol + scopeNameCol + `
+				o.snr, o.rssi, o.score, o.path_json, o.timestamp` + obsRawHexCol + rpCol + scopeNameCol + radioColumn + `
 			FROM transmissions t
 			LEFT JOIN observations o ON o.transmission_id = t.id
-			LEFT JOIN observers obs ON obs.id = o.observer_id` + filterClause + `
+			LEFT JOIN observers obs ON obs.id = o.observer_id` + radioJoin + filterClause + `
 			ORDER BY t.first_seen ASC, o.timestamp DESC`
 	}
 
@@ -1357,7 +1366,7 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 	var score sql.NullInt64
 	var obsRawHex sql.NullString
 	var resolvedPathStr sql.NullString
-	var scopeName sql.NullString
+	var scopeName, radioID sql.NullString
 
 	scanArgs := []interface{}{&txID, &rawHex, &hash, &firstSeen, &routeType, &payloadType,
 		&payloadVersion, &decodedJSON,
@@ -1372,6 +1381,7 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 	if s.db.hasScopeName {
 		scanArgs = append(scanArgs, &scopeName)
 	}
+	scanArgs = append(scanArgs, &radioID)
 
 	for rows.Next() {
 		if err := rows.Scan(scanArgs...); err != nil {
@@ -1426,6 +1436,7 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 				Timestamp:      normalizeTimestamp(nullStrVal(obsTimestamp)),
 				relayHopHexLen: n,
 			}
+			obs.setRadioID(radioID)
 
 			tx.addObservation(obs)
 			if obs.Timestamp > tx.LatestSeen {
@@ -3009,11 +3020,30 @@ func (s *PacketStore) queryMultiNodePacketsLocked(resolved []string, limit, offs
 
 // IngestNewFromDB loads new transmissions from SQLite into memory and returns
 // broadcast-ready maps plus the new max transmission ID.
-func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interface{}, int) {
+func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]packetFields, int) {
+	messages, delivered := s.ingestNewTransmissions(sinceID, limit)
+	return messages, delivered.throughTx
+}
+
+// observationDeliveryWindow marks observations the transmission read already
+// covered. SQLite assigns new observations higher IDs than the joined snapshot.
+type observationDeliveryWindow struct {
+	afterTx    int
+	throughTx  int
+	throughObs int
+}
+
+func (s *PacketStore) ingestNewTransmissions(sinceID, limit int) ([]packetFields, observationDeliveryWindow) {
+	delivered := observationDeliveryWindow{afterTx: sinceID, throughTx: sinceID}
 	if limit <= 0 {
 		limit = 100
 	}
 
+	radioColumn, radioJoin, err := s.db.observationRadioSQL(context.Background())
+	if err != nil {
+		log.Printf("[store] ingest radio query: %v", err)
+		return nil, delivered
+	}
 	// NOTE: The SQL query intentionally does NOT select resolved_path from the DB.
 	// New ingests always resolve fresh using the current prefix map and neighbor graph.
 	// On restart, Load() handles reading persisted resolved_path values. (review item #7)
@@ -3022,7 +3052,6 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 	if s.db.hasObsRawHex {
 		obsRHCol = ", o.raw_hex"
 	}
-	// #1751: scope_name is on the transmission row; append as the last column.
 	scopeNameCol := ""
 	if s.db.hasScopeName {
 		scopeNameCol = ", t.scope_name"
@@ -3031,20 +3060,20 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 		querySQL = `SELECT t.id, t.raw_hex, t.hash, t.first_seen, t.route_type,
 				t.payload_type, t.payload_version, t.decoded_json,
 				o.id, obs.id, obs.name, COALESCE(obs.iata, ''), o.direction,
-				o.snr, o.rssi, o.score, o.path_json, strftime('%Y-%m-%dT%H:%M:%fZ', o.timestamp, 'unixepoch')` + obsRHCol + scopeNameCol + `
+				o.snr, o.rssi, o.score, o.path_json, strftime('%Y-%m-%dT%H:%M:%fZ', o.timestamp, 'unixepoch')` + obsRHCol + scopeNameCol + radioColumn + `
 			FROM transmissions t
 			LEFT JOIN observations o ON o.transmission_id = t.id
-			LEFT JOIN observers obs ON obs.rowid = o.observer_idx
+			LEFT JOIN observers obs ON obs.rowid = o.observer_idx` + radioJoin + `
 			WHERE t.id > ?
 			ORDER BY t.id ASC, o.timestamp DESC`
 	} else {
 		querySQL = `SELECT t.id, t.raw_hex, t.hash, t.first_seen, t.route_type,
 				t.payload_type, t.payload_version, t.decoded_json,
 				o.id, o.observer_id, o.observer_name, COALESCE(obs.iata, ''), o.direction,
-				o.snr, o.rssi, o.score, o.path_json, o.timestamp` + obsRHCol + scopeNameCol + `
+				o.snr, o.rssi, o.score, o.path_json, o.timestamp` + obsRHCol + scopeNameCol + radioColumn + `
 			FROM transmissions t
 			LEFT JOIN observations o ON o.transmission_id = t.id
-			LEFT JOIN observers obs ON obs.id = o.observer_id
+			LEFT JOIN observers obs ON obs.id = o.observer_id` + radioJoin + `
 			WHERE t.id > ?
 			ORDER BY t.id ASC, o.timestamp DESC`
 	}
@@ -3052,12 +3081,13 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 	rows, err := s.db.conn.Query(querySQL, sinceID)
 	if err != nil {
 		log.Printf("[store] ingest query error: %v", err)
-		return nil, sinceID
+		return nil, delivered
 	}
 	defer rows.Close()
 
 	// Scan into temp structures
 	type tempRow struct {
+		radioID                                                            sql.NullString
 		txID                                                               int
 		rawHex, hash, firstSeen, decodedJSON                               string
 		routeType, payloadType                                             *int
@@ -3072,6 +3102,7 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 	var tempRows []tempRow
 	txCount := 0
 	lastTxID := sinceID
+	lastObsID := 0
 
 	for rows.Next() {
 		var txID int
@@ -3082,7 +3113,7 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 		var snrVal, rssiVal sql.NullFloat64
 		var scoreVal sql.NullInt64
 		var obsRawHex sql.NullString
-		var scopeName sql.NullString
+		var scopeName, radioID sql.NullString
 
 		scanArgs2 := []interface{}{&txID, &rawHex, &hash, &firstSeen, &routeType, &payloadType,
 			&payloadVersion, &decodedJSON,
@@ -3094,8 +3125,10 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 		if s.db.hasScopeName {
 			scanArgs2 = append(scanArgs2, &scopeName)
 		}
+		scanArgs2 = append(scanArgs2, &radioID)
 		if err := rows.Scan(scanArgs2...); err != nil {
-			continue
+			log.Printf("[store] scan new transmissions: %v", err)
+			return nil, delivered
 		}
 
 		if txID != lastTxID {
@@ -3120,6 +3153,7 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 			direction:      internStr(nullStrVal(direction)),
 			pathJSON:       nullStrVal(pathJSON),
 			obsTS:          nullStrVal(obsTimestamp),
+			radioID:        radioID,
 			relayHopHexLen: observedRelayHopHexLen(nullStrVal(obsRawHex), nullStrVal(pathJSON)),
 			scopeName:      nullStrPtr(scopeName),
 			snr:            nullFloatPtr(snrVal),
@@ -3129,15 +3163,16 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 		if obsIDVal.Valid {
 			oid := int(obsIDVal.Int64)
 			tr.obsID = &oid
+			lastObsID = max(lastObsID, oid)
 		}
 		tempRows = append(tempRows, tr)
 	}
 
 	if len(tempRows) == 0 {
-		return nil, sinceID
+		return nil, delivered
 	}
 	if err := rows.Err(); err != nil {
-		return nil, sinceID
+		return nil, delivered
 	}
 	rows.Close()
 	s.advertEvidenceMu.Lock()
@@ -3151,7 +3186,7 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 	masks, err := s.db.advertEvidenceForIDs(ids)
 	if err != nil {
 		log.Printf("[store] load advert evidence: %v", err)
-		return nil, sinceID
+		return nil, delivered
 	}
 
 	// Now lock and merge into store
@@ -3242,6 +3277,7 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 				Timestamp:      normalizeTimestamp(r.obsTS),
 				relayHopHexLen: r.relayHopHexLen,
 			}
+			obs.setRadioID(r.radioID)
 
 			// Resolve path at ingest time using neighbor graph — decode-window discipline:
 			// decode once, feed consumers, never store on struct.
@@ -3323,59 +3359,9 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 	result := make([]map[string]interface{}, 0, len(broadcastOrder))
 	for _, txID := range broadcastOrder {
 		tx := broadcastTxs[txID]
-		// Build decoded object with header.payloadTypeName for live.js
-		decoded := map[string]interface{}{
-			"header": map[string]interface{}{
-				"payloadTypeName": resolvePayloadTypeName(tx.PayloadType),
-			},
-		}
-		if tx.DecodedJSON != "" {
-			if payload := broadcastPayload(tx); payload != nil {
-				decoded["payload"] = payload
-			}
-		}
-		// For TRACE packets, decode the full packet to include path.hopsCompleted
-		// so the frontend can distinguish completed vs remaining hops (#683).
-		if tx.PayloadType != nil && *tx.PayloadType == PayloadTRACE && tx.RawHex != "" {
-			if dp, err := DecodePacket(tx.RawHex, false); err == nil {
-				decoded["path"] = dp.Path
-			}
-		}
+		decoded := livePacketDecode(tx)
 		for _, obs := range tx.Observations {
-			// Build the nested packet object (packets.js checks m.data.packet)
-			pkt := map[string]interface{}{
-				"id":                tx.ID,
-				"raw_hex":           strOrNil(tx.RawHex),
-				"hash":              strOrNil(tx.Hash),
-				"first_seen":        strOrNil(tx.FirstSeen),
-				"timestamp":         strOrNil(tx.FirstSeen),
-				"route_type":        intPtrOrNil(tx.RouteType),
-				"payload_type":      intPtrOrNil(tx.PayloadType),
-				"decoded_json":      strOrNil(tx.DecodedJSON),
-				"observer_id":       strOrNil(obs.ObserverID),
-				"observer_name":     strOrNil(obs.ObserverName),
-				"snr":               floatPtrOrNil(obs.SNR),
-				"rssi":              floatPtrOrNil(obs.RSSI),
-				"path_json":         strOrNil(obs.PathJSON),
-				"direction":         strOrNil(obs.Direction),
-				"observation_count": tx.ObservationCount,
-				"scope_name":        strPtrOrNil(tx.ScopeName),
-				"radio":             strOrNil(observationRadio(obs.ID, obs.ObserverID, obs.Timestamp)),
-			}
-			// Use decode-window resolved path for broadcast (never from struct)
-			if broadcastRP != nil {
-				if rp, ok := broadcastRP[obs.ID]; ok && rp != nil {
-					pkt["resolved_path"] = rp
-				}
-			}
-			// Broadcast map: top-level fields for live.js + nested packet for packets.js
-			broadcastMap := make(map[string]interface{}, len(pkt)+2)
-			for k, v := range pkt {
-				broadcastMap[k] = v
-			}
-			broadcastMap["decoded"] = decoded
-			broadcastMap["packet"] = pkt
-			result = append(result, broadcastMap)
+			result = append(result, liveObservation(tx, obs, decoded, broadcastRP[obs.ID]))
 		}
 	}
 
@@ -3414,302 +3400,265 @@ func (s *PacketStore) IngestNewFromDB(sinceID, limit int) ([]map[string]interfac
 	if evidenceChanged {
 		s.invalidateAdvertEvidence()
 	}
-	return result, newMaxID
+	delivered.throughTx, delivered.throughObs = newMaxID, lastObsID
+	return result, delivered
 }
 
-// IngestNewObservations loads new observations for transmissions already in the
-// store. This catches observations that arrive after IngestNewFromDB has already
-// advanced past the transmission's ID (fixes #174).
-func (s *PacketStore) IngestNewObservations(sinceObsID, limit int) []map[string]interface{} {
-	// Must run even when observation IDs/timestamps have not changed.
-	s.refreshAdvertEvidence()
-	s.refreshTxRewrites() // #2107: rewrites never move IDs, so poll them here too
-	if limit <= 0 {
-		limit = 500
-	}
-
-	var querySQL string
-	obsRHCol2 := ""
-	if s.db.hasObsRawHex {
-		obsRHCol2 = ", o.raw_hex"
-	}
-	if s.db.isV3 {
-		querySQL = `SELECT o.id, o.transmission_id, obs.id, obs.name, COALESCE(obs.iata, ''), o.direction,
-				o.snr, o.rssi, o.score, o.path_json, strftime('%Y-%m-%dT%H:%M:%fZ', o.timestamp, 'unixepoch')` + obsRHCol2 + `
-			FROM observations o
-			LEFT JOIN observers obs ON obs.rowid = o.observer_idx
-			WHERE o.id > ?
-			ORDER BY o.id ASC
-			LIMIT ?`
-	} else {
-		querySQL = `SELECT o.id, o.transmission_id, o.observer_id, o.observer_name, COALESCE(obs.iata, ''), o.direction,
-				o.snr, o.rssi, o.score, o.path_json, o.timestamp` + obsRHCol2 + `
-			FROM observations o
-			LEFT JOIN observers obs ON obs.id = o.observer_id
-			WHERE o.id > ?
-			ORDER BY o.id ASC
-			LIMIT ?`
-	}
-
-	rows, err := s.db.conn.Query(querySQL, sinceObsID, limit)
+// IngestNewObservations loads late observations for parents already seen by the
+// transmission poll. Standalone callers do not have a separate broadcast
+// receipt, so they can read any committed parent, including a pending chunk.
+func (s *PacketStore) IngestNewObservations(sinceObsID, limit int) []packetFields {
+	throughTx := s.db.GetMaxTransmissionID()
+	messages, _, err := s.ingestLateObservations(sinceObsID, limit,
+		observationDeliveryWindow{afterTx: throughTx, throughTx: throughTx})
 	if err != nil {
-		log.Printf("[store] ingest observations query error: %v", err)
-		return nil
+		log.Printf("[store] ingest late observations: %v", err)
+	}
+	return messages
+}
+
+type polledObservation struct {
+	observation  *StoreObs
+	parent       *StoreTx
+	resolvedPath string
+	firstOfPath  bool
+}
+
+func (s *PacketStore) readPolledObservations(sinceObsID, limit int, delivered observationDeliveryWindow) ([]polledObservation, int, error) {
+	db := s.db
+	radioColumn, radioJoin, err := db.observationRadioSQL(context.Background())
+	if err != nil {
+		return nil, sinceObsID, err
+	}
+	rawFrame, resolvedPath, scopeName := "NULL", "NULL", "NULL"
+	if db.hasObsRawHex {
+		rawFrame = "o.raw_hex"
+	}
+	if db.hasResolvedPath {
+		resolvedPath = "o.resolved_path"
+	}
+	if db.hasScopeName {
+		scopeName = "t.scope_name"
+	}
+	observerCols := "o.observer_id, o.observer_name, obs.iata, o.timestamp"
+	observerJoin := "LEFT JOIN observers obs ON obs.id = o.observer_id"
+	signatureObserver, signatureJoin := "p.observer_id", ""
+	if db.isV3 {
+		observerCols = "obs.id, obs.name, obs.iata, strftime('%Y-%m-%dT%H:%M:%fZ', o.timestamp, 'unixepoch')"
+		observerJoin = "LEFT JOIN observers obs ON obs.rowid = o.observer_idx"
+		signatureObserver = "source.id"
+		signatureJoin = "LEFT JOIN observers source ON source.rowid = p.observer_idx"
+	}
+
+	// Compute retained counts once per eligible parent. Legacy stores may
+	// have duplicate observer/path rows; their first ID is the broadcast key.
+	// All batch IDs remain in the result so position and reads share a cursor.
+	query := fmt.Sprintf(`WITH batch AS (
+		SELECT id, transmission_id, (transmission_id <= ? AND (transmission_id <= ? OR id > ?)) AS eligible
+		FROM observations WHERE id > ? ORDER BY id LIMIT ?
+	), signatures AS (
+		SELECT p.transmission_id, MIN(p.id) AS first_id
+		FROM observations p %s
+		WHERE p.transmission_id IN (SELECT transmission_id FROM batch WHERE eligible)
+		GROUP BY p.transmission_id, COALESCE(%s,''), COALESCE(p.path_json,'')
+	), counts AS (
+		SELECT transmission_id, COUNT(*) AS total FROM signatures GROUP BY transmission_id
+	)
+	SELECT batch.id, %s, o.direction, o.snr, o.rssi, o.score, o.path_json,
+		%s, %s, t.id, t.raw_hex, t.hash, t.first_seen, t.route_type, t.payload_type, t.decoded_json,
+		%s, counts.total, signatures.first_id IS NOT NULL%s
+	FROM batch LEFT JOIN observations o ON o.id = batch.id AND batch.eligible
+	LEFT JOIN transmissions t ON t.id = o.transmission_id
+	LEFT JOIN counts ON counts.transmission_id = t.id
+	LEFT JOIN signatures ON signatures.first_id = o.id
+	%s %s
+	ORDER BY batch.id`, signatureJoin, signatureObserver, observerCols, rawFrame, resolvedPath,
+		scopeName, radioColumn, observerJoin, radioJoin)
+
+	rows, err := db.conn.Query(query, delivered.throughTx, delivered.afterTx, delivered.throughObs, sinceObsID, limit)
+	if err != nil {
+		return nil, sinceObsID, err
 	}
 	defer rows.Close()
 
-	type obsRow struct {
-		obsID          int
-		txID           int
-		observerID     string
-		observerName   string
-		observerIATA   string
-		direction      string
-		snr, rssi      *float64
-		score          *int
-		pathJSON       string
-		relayHopHexLen uint8
-		timestamp      string
-	}
-
-	var obsRows []obsRow
+	next := sinceObsID
+	var observations []polledObservation
 	for rows.Next() {
-		var oid, txID int
-		var observerID, observerName, observerIATA, direction, pathJSON, ts sql.NullString
+		var id int
+		var parentID, route, payload, score, count sql.NullInt64
+		var observer, name, iata, stamp, direction, path, frame, resolved, raw, hash, first, decoded, scope, radio sql.NullString
 		var snr, rssi sql.NullFloat64
-		var score sql.NullInt64
-		var obsRawHex sql.NullString
-
-		scanArgs3 := []interface{}{&oid, &txID, &observerID, &observerName, &observerIATA, &direction,
-			&snr, &rssi, &score, &pathJSON, &ts}
-		if s.db.hasObsRawHex {
-			scanArgs3 = append(scanArgs3, &obsRawHex)
+		var firstOfPath bool
+		if err := rows.Scan(&id, &observer, &name, &iata, &stamp, &direction, &snr, &rssi, &score, &path,
+			&frame, &resolved, &parentID, &raw, &hash, &first, &route, &payload, &decoded, &scope,
+			&count, &firstOfPath, &radio); err != nil {
+			return nil, sinceObsID, err
 		}
-		if err := rows.Scan(scanArgs3...); err != nil {
+		next = id
+		if !parentID.Valid {
 			continue
 		}
-
-		obsRows = append(obsRows, obsRow{
-			obsID:          oid,
-			txID:           txID,
-			observerID:     internStr(nullStrVal(observerID)),
-			observerName:   internStr(nullStrVal(observerName)),
-			observerIATA:   internStr(nullStrVal(observerIATA)),
-			direction:      internStr(nullStrVal(direction)),
-			snr:            nullFloatPtr(snr),
-			rssi:           nullFloatPtr(rssi),
-			score:          nullIntPtr(score),
-			pathJSON:       nullStrVal(pathJSON),
-			relayHopHexLen: observedRelayHopHexLen(nullStrVal(obsRawHex), nullStrVal(pathJSON)),
-			timestamp:      nullStrVal(ts),
-		})
+		parent := &StoreTx{
+			ID: int(parentID.Int64), RawHex: raw.String, Hash: hash.String, FirstSeen: first.String,
+			RouteType: nullIntPtr(route), PayloadType: nullIntPtr(payload), DecodedJSON: decoded.String,
+			ScopeName: nullStrPtr(scope), ObservationCount: int(count.Int64),
+		}
+		obs := &StoreObs{
+			ID: id, TransmissionID: parent.ID,
+			ObserverID: internStr(observer.String), ObserverName: internStr(name.String),
+			ObserverIATA: internStr(iata.String), Direction: internStr(direction.String),
+			SNR: nullFloatPtr(snr), RSSI: nullFloatPtr(rssi), Score: nullIntPtr(score),
+			PathJSON: path.String, Timestamp: normalizeTimestamp(stamp.String),
+			relayHopHexLen: observedRelayHopHexLen(frame.String, path.String),
+		}
+		obs.setRadioID(radio)
+		observations = append(observations, polledObservation{obs, parent, resolved.String, firstOfPath})
 	}
-
-	if len(obsRows) == 0 {
-		return nil
+	if err := rows.Err(); err != nil {
+		return nil, sinceObsID, err
 	}
+	return observations, next, nil
+}
+
+func (s *PacketStore) ingestLateObservations(sinceObsID, limit int, delivered observationDeliveryWindow) ([]packetFields, int, error) {
+	// Rewrites and advert evidence can commit without moving observation IDs.
+	s.refreshAdvertEvidence()
+	s.refreshTxRewrites()
+	if limit <= 0 {
+		limit = 500
+	}
+	observations, next, err := s.readPolledObservations(sinceObsID, limit, delivered)
+	if err != nil || len(observations) == 0 {
+		return nil, next, err
+	}
+	_, pm := s.getCachedNodesAndPM()
+	graph := s.graph.Load()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	updatedTxs := make(map[int]*StoreTx)
-	broadcastMaps := make([]map[string]interface{}, 0, len(obsRows))
-	// Track newly created observations for persistence — only these should be
-	// persisted, not all observations of each updated tx (fixes edge count inflation).
-	var newObs []*StoreObs
-	var obsRPMap map[int][]*string // obsID → resolved path (decode-window)
+	broadcasts := make([]packetFields, 0, len(observations))
+	hopsSeen := make(map[string]bool)
 
-	// Hoist getCachedNodesAndPM() before the loop — same pattern as IngestNewFromDB (review fix #1).
-	_, pm := s.getCachedNodesAndPM()
-	graphRef := s.graph.Load()
-
-	hopsSeen := make(map[string]bool) // reused across observations; cleared per use
-
-	for _, r := range obsRows {
-		// Already ingested (e.g. by IngestNewFromDB in same cycle)
-		if _, exists := s.byObsID[r.obsID]; exists {
+	for _, row := range observations {
+		obs := row.observation
+		if s.byObsID[obs.ID] != nil {
 			continue
 		}
-
-		tx := s.byTxID[r.txID]
+		tx := s.byTxID[obs.TransmissionID]
 		if tx == nil {
-			continue // transmission not yet in store
-		}
-
-		if obs := tx.mergeObservationEvidence(r.observerID, r.pathJSON, r.relayHopHexLen); obs != nil {
-			s.noteCertainRelays(tx, obs, pm)
+			if !row.firstOfPath {
+				continue
+			}
+			// The parent is already behind the transmission cursor. Deliver
+			// the persisted observation without rebuilding any hot indexes.
+			tx = row.parent
+			path := unmarshalResolvedPath(row.resolvedPath)
+			if path == nil && pm != nil && obs.PathJSON != "" && obs.PathJSON != "[]" {
+				path = resolvePathForObs(obs.PathJSON, obs.ObserverID, tx, pm, graph)
+			}
+			broadcasts = append(broadcasts, liveObservation(tx, obs, livePacketDecode(tx), path))
 			continue
 		}
-
-		obs := &StoreObs{
-			ID:             r.obsID,
-			TransmissionID: r.txID,
-			ObserverID:     r.observerID, // interned while scanning, outside s.mu
-			ObserverName:   r.observerName,
-			ObserverIATA:   r.observerIATA,
-			Direction:      r.direction,
-			SNR:            r.snr,
-			RSSI:           r.rssi,
-			Score:          r.score,
-			PathJSON:       r.pathJSON,
-			Timestamp:      normalizeTimestamp(r.timestamp),
-			relayHopHexLen: r.relayHopHexLen,
+		if previous := tx.mergeObservationEvidence(obs.ObserverID, obs.PathJSON, obs.relayHopHexLen); previous != nil {
+			s.noteCertainRelays(tx, previous, pm)
+			continue
 		}
-
-		// Resolve path at ingest time for late-arriving observations (review item #2).
-		// Decode-window discipline: decode, feed consumers, don't store on struct.
-		var obsResolvedPath []*string
-		if r.pathJSON != "" && r.pathJSON != "[]" {
-			if pm != nil {
-				obsResolvedPath = resolvePathForObs(r.pathJSON, r.observerID, tx, pm, graphRef)
-				pks := extractResolvedPubkeys(obsResolvedPath)
-				// Single point of truth — see indexResolvedPathHops doc + #1558.
-				s.indexResolvedPathHops(tx, pks, hopsSeen, pm, obs)
-			}
+		var path []*string
+		if pm != nil && obs.PathJSON != "" && obs.PathJSON != "[]" {
+			path = resolvePathForObs(obs.PathJSON, obs.ObserverID, tx, pm, graph)
+			s.indexResolvedPathHops(tx, extractResolvedPubkeys(path), hopsSeen, pm, obs)
 		}
-		// Stash for broadcast/persist
-		if obsResolvedPath != nil {
-			if obsRPMap == nil {
-				obsRPMap = make(map[int][]*string)
-			}
-			obsRPMap[r.obsID] = obsResolvedPath
-		}
-
 		tx.addObservation(obs)
-		newObs = append(newObs, obs)
 		if obs.Timestamp > tx.LatestSeen {
 			tx.LatestSeen = obs.Timestamp
 		}
-		s.byObsID[r.obsID] = obs
-		if r.obsID > s.maxObsID {
-			s.maxObsID = r.obsID
-		}
-		if r.observerID != "" {
-			s.byObserver[r.observerID] = append(s.byObserver[r.observerID], obs)
+		s.byObsID[obs.ID] = obs
+		s.maxObsID = max(s.maxObsID, obs.ID)
+		if obs.ObserverID != "" {
+			s.byObserver[obs.ObserverID] = append(s.byObserver[obs.ObserverID], obs)
 		}
 		s.totalObs++
 		s.trackedBytes += estimateStoreObsBytes(obs)
-		updatedTxs[r.txID] = tx
-
-		decoded := map[string]interface{}{
-			"header": map[string]interface{}{
-				"payloadTypeName": resolvePayloadTypeName(tx.PayloadType),
-			},
-		}
-		if tx.DecodedJSON != "" {
-			if payload := broadcastPayload(tx); payload != nil {
-				decoded["payload"] = payload
-			}
-		}
-		// For TRACE packets, decode the full packet to include path.hopsCompleted
-		// so the frontend can distinguish completed vs remaining hops (#683).
-		if tx.PayloadType != nil && *tx.PayloadType == PayloadTRACE && tx.RawHex != "" {
-			if dp, err := DecodePacket(tx.RawHex, false); err == nil {
-				decoded["path"] = dp.Path
-			}
-		}
-
-		pkt := map[string]interface{}{
-			"id":                tx.ID,
-			"raw_hex":           strOrNil(tx.RawHex),
-			"hash":              strOrNil(tx.Hash),
-			"first_seen":        strOrNil(tx.FirstSeen),
-			"timestamp":         strOrNil(tx.FirstSeen),
-			"route_type":        intPtrOrNil(tx.RouteType),
-			"payload_type":      intPtrOrNil(tx.PayloadType),
-			"decoded_json":      strOrNil(tx.DecodedJSON),
-			"observer_id":       strOrNil(obs.ObserverID),
-			"observer_name":     strOrNil(obs.ObserverName),
-			"snr":               floatPtrOrNil(obs.SNR),
-			"rssi":              floatPtrOrNil(obs.RSSI),
-			"path_json":         strOrNil(obs.PathJSON),
-			"direction":         strOrNil(obs.Direction),
-			"observation_count": tx.ObservationCount,
-			"scope_name":        strPtrOrNil(tx.ScopeName),
-			"radio":             strOrNil(observationRadio(obs.ID, obs.ObserverID, obs.Timestamp)),
-		}
-		// Use decode-window resolved path for broadcast
-		if obsRPMap != nil {
-			if rp, ok := obsRPMap[obs.ID]; ok && rp != nil {
-				pkt["resolved_path"] = rp
-			}
-		}
-		broadcastMap := make(map[string]interface{}, len(pkt)+2)
-		for k, v := range pkt {
-			broadcastMap[k] = v
-		}
-		broadcastMap["decoded"] = decoded
-		broadcastMap["packet"] = pkt
-		broadcastMaps = append(broadcastMaps, broadcastMap)
+		updatedTxs[tx.ID] = tx
+		broadcasts = append(broadcasts, liveObservation(tx, obs, livePacketDecode(tx), path))
 	}
 
-	// Re-pick best observation for updated transmissions and update subpath index
-	// if the path changed.
-	oldPaths := make(map[int]string, len(updatedTxs))
-	for txID, tx := range updatedTxs {
-		oldPaths[txID] = tx.PathJSON
-	}
+	var changedTxs []*StoreTx
 	for _, tx := range updatedTxs {
+		oldPath := tx.PathJSON
 		pickBestObservation(tx)
 		s.trackedBytes += rechargeTx(tx)
-	}
-	pathHopMutated := false
-	for txID, tx := range updatedTxs {
-		if tx.PathJSON != oldPaths[txID] {
-			// Path changed — re-index its hops.
-			oldHops := parsePathJSON(oldPaths[txID])
-			// Remove old path-hop index entries using old hops.
-			// Resolved pubkeys remain indexed independently of the best raw path.
-			if len(oldHops) > 0 {
-				saved, savedFlag := tx.parsedPath, tx.pathParsed
-				tx.parsedPath, tx.pathParsed = oldHops, true
-				removeTxFromPathHopIndex(s.byPathHop, tx)
-				tx.parsedPath, tx.pathParsed = saved, savedFlag
-			}
-			// pickBestObservation already parsed the new path into
-			// tx.parsedPath for addTxToPathHopIndex.
-			addTxToPathHopIndex(s.byPathHop, tx)
-			// #1164: coalesce — one invalidate after the loop, not per-tx.
-			pathHopMutated = true
+		if tx.PathJSON == oldPath {
+			continue
 		}
-	}
-	if pathHopMutated {
-		s.invalidateRelayStatsCache()
-	}
-
-	// Check if any paths changed (used for distance update and cache invalidation).
-	hasPathChanges := false
-	var changedTxs []*StoreTx
-	for txID, tx := range updatedTxs {
-		if tx.PathJSON != oldPaths[txID] {
-			hasPathChanges = true
-			changedTxs = append(changedTxs, tx)
+		// Resolved pubkeys are indexed independently of the best raw path.
+		if oldHops := parsePathJSON(oldPath); len(oldHops) > 0 {
+			saved, savedFlag := tx.parsedPath, tx.pathParsed
+			tx.parsedPath, tx.pathParsed = oldHops, true
+			removeTxFromPathHopIndex(s.byPathHop, tx)
+			tx.parsedPath, tx.pathParsed = saved, savedFlag
 		}
+		addTxToPathHopIndex(s.byPathHop, tx)
+		changedTxs = append(changedTxs, tx)
 	}
 	if len(changedTxs) > 0 {
+		s.invalidateRelayStatsCache()
 		s.updateDistanceIndexForTxs(changedTxs)
 	}
-
 	if len(updatedTxs) > 0 {
-		// Targeted cache invalidation: new observations always affect RF
-		// analytics; topology/distance/subpath caches only if paths changed.
-		// Channel and hash caches are unaffected by observation-only ingestion.
 		s.invalidateCachesFor(cacheInvalidation{
 			hasNewObservations: true,
-			hasNewPaths:        hasPathChanges,
+			hasNewPaths:        len(changedTxs) > 0,
 		})
 	}
+	return broadcasts, next, nil
+}
 
-	// Per #1287 (Option 4): server never writes to the DB and never
-	// mutates the in-memory neighbor graph incrementally — the
-	// ingestor owns both. recompNeighborGraph re-reads the snapshot
-	// every 60s and atomic-swaps into s.graph.
-	_ = obsRPMap // resolved path stays in-memory for broadcast; no SQL write.
-	_ = newObs
-	_ = pm
-	_ = graphRef
+func livePacketDecode(tx *StoreTx) packetFields {
+	decoded := packetFields{"header": packetFields{"payloadTypeName": resolvePayloadTypeName(tx.PayloadType)}}
+	if payload := broadcastPayload(tx); payload != nil {
+		decoded["payload"] = payload
+	}
+	// TRACE messages supply hopsCompleted to distinguish traversed relay hops.
+	if tx.PayloadType != nil && *tx.PayloadType == PayloadTRACE && tx.RawHex != "" {
+		if dp, err := DecodePacket(tx.RawHex, false); err == nil {
+			decoded["path"] = dp.Path
+		}
+	}
+	return decoded
+}
 
-	return broadcastMaps
+func liveObservation(tx *StoreTx, obs *StoreObs, decoded packetFields, path []*string) packetFields {
+	packet := packetFields{
+		"id":                tx.ID,
+		"raw_hex":           strOrNil(tx.RawHex),
+		"hash":              strOrNil(tx.Hash),
+		"first_seen":        strOrNil(tx.FirstSeen),
+		"timestamp":         strOrNil(tx.FirstSeen),
+		"route_type":        intPtrOrNil(tx.RouteType),
+		"payload_type":      intPtrOrNil(tx.PayloadType),
+		"decoded_json":      strOrNil(tx.DecodedJSON),
+		"observer_id":       strOrNil(obs.ObserverID),
+		"observer_name":     strOrNil(obs.ObserverName),
+		"snr":               floatPtrOrNil(obs.SNR),
+		"rssi":              floatPtrOrNil(obs.RSSI),
+		"path_json":         strOrNil(obs.PathJSON),
+		"direction":         strOrNil(obs.Direction),
+		"observation_count": tx.ObservationCount,
+		"scope_name":        strPtrOrNil(tx.ScopeName),
+		"radio":             strOrNil(observationRadio(obs)),
+	}
+	if path != nil {
+		packet["resolved_path"] = path
+	}
+	message := make(packetFields, len(packet)+2)
+	for k, v := range packet {
+		message[k] = v
+	}
+	message["decoded"] = decoded
+	message["packet"] = packet
+	return message
 }
 
 // MaxTransmissionID returns the highest transmission ID in the store.
@@ -3764,170 +3713,83 @@ func (s *PacketStore) resolvePacketFilterSets(q PacketQuery) packetFilterSets {
 	return f
 }
 
-// filterPackets applies PacketQuery filters to the in-memory packet list.
-// f holds q's filters resolved by resolvePacketFilterSets. Caller holds s.mu.
+// filterPackets uses the same predicates as retained reads. The hot node
+// index also includes paths already resolved by the live poller.
 func (s *PacketStore) filterPackets(q PacketQuery, f packetFilterSets) []*StoreTx {
 	source := s.packets
-	// Fast path: single-key index lookups
-	if q.Hash != "" && q.Type == nil && q.Route == nil && q.Observer == "" && q.Radio == "" &&
-		q.Region == "" && q.Area == "" && q.Node == "" && q.Channel == "" && q.Since == "" && q.Until == "" {
-		h := strings.ToLower(q.Hash)
-		tx := s.byHash[h]
+	if q.Node != "" {
+		source = s.byNode[f.nodePK]
+	} else if q.Hash != "" {
+		tx := s.byHash[strings.ToLower(q.Hash)]
 		if tx == nil {
 			return nil
 		}
 		source = []*StoreTx{tx}
-		if !q.ExcludeTx {
-			return source
-		}
-	}
-	if q.Observer != "" && q.Type == nil && q.Route == nil && q.Radio == "" &&
-		q.Region == "" && q.Area == "" && q.Node == "" && q.Channel == "" && q.Hash == "" && q.Since == "" && q.Until == "" {
+	} else if q.Observer != "" {
 		source = s.transmissionsForObserver(q.Observer, nil)
-		if !q.ExcludeTx {
-			return source
-		}
 	}
-
-	// Pre-compute filter parameters outside the hot loop.
-	var (
-		filterType  int
-		hasType     bool
-		filterRoute int
-		hasRoute    bool
-		filterHash  string
-		hasSince    = q.Since != ""
-		hasUntil    = q.Until != ""
-	)
-	if q.Type != nil {
-		hasType = true
-		filterType = *q.Type
-	}
-	if q.Route != nil {
-		hasRoute = true
-		filterRoute = *q.Route
-	}
-	if q.Hash != "" {
-		filterHash = strings.ToLower(q.Hash)
-	}
-	filterChannel := q.Channel
-
-	// Pre-compute observer set for observer filter.
-	var observerSet map[string]bool
-	if q.Observer != "" {
-		ids := strings.Split(q.Observer, ",")
-		observerSet = make(map[string]bool, len(ids))
-		for _, id := range ids {
-			observerSet[strings.TrimSpace(id)] = true
-		}
-	}
-
-	// One snapshot for the whole scan (#1869).
-	radioSnap := radioHistory.Load()
-
-	regionObservers := f.regionObs
-	if q.Region != "" && len(regionObservers) == 0 {
-		return nil
-	}
-	areaNodes := f.areaNodes
-
-	// Pre-compute node filter parameters.
-	var nodeHashSet map[string]bool
-	hasNode := q.Node != ""
-	if hasNode {
-		indexed := s.byNode[f.nodePK]
-		nodeHashSet = make(map[string]bool, len(indexed))
-		for _, tx := range indexed {
-			nodeHashSet[tx.Hash] = true
-		}
-	}
-
-	// Determine the source slice. Use index-based source when only node
-	// filter is active and an index exists.
-	if hasNode && !hasType && !hasRoute && q.Observer == "" &&
-		filterHash == "" && !hasSince && !hasUntil && q.Region == "" && q.Area == "" && filterChannel == "" && q.Radio == "" {
-		if indexed, ok := s.byNode[f.nodePK]; ok {
-			source = indexed
-			if !q.ExcludeTx {
-				return source
-			}
-		}
-	}
-	// Single-pass filter: apply all predicates in one scan.
-	results := filterTxSlice(source, func(tx *StoreTx) bool {
-		// Data integrity: exclude legacy rows missing hash or timestamp (#871)
-		if tx.Hash == "" || tx.FirstSeen == "" {
-			return false
-		}
-		if hasType && (tx.PayloadType == nil || *tx.PayloadType != filterType) {
-			return false
-		}
-		if hasRoute && (tx.RouteType == nil || *tx.RouteType != filterRoute) {
-			return false
-		}
-		if filterHash != "" && tx.Hash != filterHash {
-			return false
-		}
-		if hasSince && tx.FirstSeen <= q.Since {
-			return false
-		}
-		if hasUntil && tx.FirstSeen >= q.Until {
-			return false
-		}
-		if observerSet != nil || q.ExcludeTx {
-			found := false
-			for _, obs := range tx.Observations {
-				if (observerSet == nil || observerSet[obs.ObserverID]) && (!q.ExcludeTx || !obs.isOwnTransmission()) {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return false
-			}
-		}
-		if regionObservers != nil {
-			found := false
-			for _, obs := range tx.Observations {
-				if regionObservers[obs.ObserverID] {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return false
-			}
-		}
-		if areaNodes != nil {
-			// Only ADVERT packets carry the originator pubkey (public_key/pubKey).
-			// All other packet types (GRP_TXT, TXT_MSG, REQ, …) have encrypted
-			// senders so pk == "" and are excluded when an area filter is active.
-			d := tx.ParsedDecoded()
-			pk, _ := d["public_key"].(string)
-			if pk == "" {
-				pk, _ = d["pubKey"].(string)
-			}
-			if pk == "" || !areaNodes[pk] {
-				return false
-			}
-		}
-		if hasNode {
-			if !nodeHashSet[tx.Hash] {
-				return false
-			}
-		}
-		if filterChannel != "" {
-			if !packetMatchesChannel(tx, filterChannel) {
-				return false
-			}
-		}
-		if q.Radio != "" && !txMatchesRadio(radioSnap, tx, q.Radio, observerSet) {
-			return false
-		}
-		return true
+	match := newPacketMatcher(q, f)
+	return filterTxSlice(source, func(tx *StoreTx) bool {
+		return match.transmission(tx) && match.observations(tx)
 	})
+}
 
-	return results
+type packetMatcher struct {
+	query       PacketQuery
+	sets        packetFilterSets
+	hash        string
+	observerIDs map[string]bool
+	radio       *radioHistorySnapshot
+}
+
+func newPacketMatcher(q PacketQuery, f packetFilterSets) packetMatcher {
+	m := packetMatcher{query: q, sets: f, hash: strings.ToLower(q.Hash), radio: radioHistory.Load()}
+	if q.Observer != "" {
+		m.observerIDs = make(map[string]bool)
+		for _, id := range strings.Split(q.Observer, ",") {
+			m.observerIDs[strings.TrimSpace(id)] = true
+		}
+	}
+	return m
+}
+
+func (m packetMatcher) transmission(tx *StoreTx) bool {
+	q := m.query
+	if tx.Hash == "" || tx.FirstSeen == "" ||
+		(q.Type != nil && (tx.PayloadType == nil || *tx.PayloadType != *q.Type)) ||
+		(q.Route != nil && (tx.RouteType == nil || *tx.RouteType != *q.Route)) ||
+		(m.hash != "" && tx.Hash != m.hash) ||
+		(q.Since != "" && tx.FirstSeen <= q.Since) ||
+		(q.Until != "" && tx.FirstSeen >= q.Until) {
+		return false
+	}
+	if m.sets.areaNodes != nil {
+		decoded := tx.ParsedDecoded()
+		pk, _ := decoded["public_key"].(string)
+		if pk == "" {
+			pk, _ = decoded["pubKey"].(string)
+		}
+		if pk == "" || !m.sets.areaNodes[pk] {
+			return false
+		}
+	}
+	return q.Channel == "" || packetMatchesChannel(tx, q.Channel)
+}
+
+func (m packetMatcher) observations(tx *StoreTx) bool {
+	q := m.query
+	observerMatched := m.observerIDs == nil && !q.ExcludeTx
+	regionMatched := q.Region == ""
+	for _, obs := range tx.Observations {
+		observerMatched = observerMatched ||
+			((m.observerIDs == nil || m.observerIDs[obs.ObserverID]) && (!q.ExcludeTx || !obs.isOwnTransmission()))
+		regionMatched = regionMatched || m.sets.regionObs[obs.ObserverID]
+		if observerMatched && regionMatched {
+			break
+		}
+	}
+	return observerMatched && regionMatched &&
+		(q.Radio == "" || txMatchesRadio(m.radio, tx, q.Radio, m.observerIDs))
 }
 
 // packetMatchesChannel returns true if the transmission's decoded payload
@@ -3941,7 +3803,10 @@ func packetMatchesChannel(tx *StoreTx, filterChannel string) bool {
 	if tx.DecodedJSON == "" {
 		return false
 	}
-	d := tx.ParsedDecoded()
+	return matchesDecodedChannel(tx.ParsedDecoded(), filterChannel)
+}
+
+func matchesDecodedChannel(d packetFields, filterChannel string) bool {
 	if d == nil {
 		return false
 	}
@@ -4310,7 +4175,7 @@ func enrichObsFields(obs *StoreObs, tx *StoreTx) map[string]interface{} {
 		"rssi":          floatPtrOrNil(obs.RSSI),
 		"score":         intPtrOrNil(obs.Score),
 		"path_json":     strOrNil(obs.PathJSON),
-		"radio":         strOrNil(observationRadio(obs.ID, obs.ObserverID, obs.Timestamp)),
+		"radio":         strOrNil(observationRadio(obs)),
 	}
 
 	if tx != nil {
@@ -4371,7 +4236,7 @@ func txToMap(tx *StoreTx, includeObservations ...bool) map[string]interface{} {
 				"path_json":     strOrNil(o.PathJSON),
 				"timestamp":     strOrNil(o.Timestamp),
 				"direction":     strOrNil(o.Direction),
-				"radio":         strOrNil(observationRadio(o.ID, o.ObserverID, o.Timestamp)),
+				"radio":         strOrNil(observationRadio(o)),
 			}
 			obs = append(obs, om)
 		}
@@ -5151,7 +5016,7 @@ func estimateStoreTxBytesTypical(numObs int) int64 {
 // estimateStoreObsBytes returns the estimated memory cost of a StoreObs.
 // ResolvedPath membership index overhead is tracked separately.
 func estimateStoreObsBytes(obs *StoreObs) int64 {
-	base := int64(storeObsBaseBytes)
+	base := int64(storeObsBaseBytes) + obs.radioIDBytes()
 	base += int64(len(obs.PathJSON) + len(obs.ObserverID) + len(obs.ObserverName) +
 		len(obs.ObserverIATA) + len(obs.Direction) + len(obs.Timestamp))
 	base += int64(numIndexesPerObs * indexEntryBytes)
@@ -10315,352 +10180,95 @@ func parseStoreTime(s string) (time.Time, bool) {
 	return t, err == nil
 }
 
-// GetNodeAnalytics computes analytics for a single node using in-memory byNode index.
+// GetNodeAnalytics preserves the non-HTTP entry point.
 func (s *PacketStore) GetNodeAnalytics(pubkey string, days int) (*NodeAnalyticsResponse, error) {
-	node, err := s.db.GetNodeByPubkey(pubkey)
-	if err != nil || node == nil {
+	return s.GetNodeAnalyticsContext(context.Background(), pubkey, days)
+}
+
+// GetNodeAnalyticsContext reduces a node's complete retained history when the
+// active packet cache is capped. The same reduction serves the resident path.
+func (s *PacketStore) GetNodeAnalyticsContext(ctx context.Context, pubkey string, days int) (*NodeAnalyticsResponse, error) {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	rows, err := s.db.conn.QueryContext(ctx, fmt.Sprintf("SELECT %s FROM nodes WHERE public_key = ?", s.db.nodeSelectCols()), pubkey)
+	if err != nil {
+		return nil, err
+	}
+	if !rows.Next() {
+		err := rows.Err()
+		rows.Close()
+		return nil, err
+	}
+	node := s.db.scanNodeRow(rows)
+	err = rows.Err()
+	closeErr := rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
 
-	// UTC: FirstSeen is stored as UTC and compared as a string, so a local
-	// offset (+02:00) would shift the window on a non-UTC host.
 	now := time.Now().UTC()
 	fromTime := now.Add(-time.Duration(days) * 24 * time.Hour)
-	fromISO := fromTime.Format(time.RFC3339)
-	toISO := now.Format(time.RFC3339)
-	// Before s.mu: its rare inline rebuild must not run under the read lock.
-	_, pm := s.getCachedNodesAndPM()
-
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	// #748: the store only holds its in-memory window. When that starts
-	// after the requested range, count only what lies inside it and take
-	// the rates over it; dividing by the full range turned an 89% available
-	// node into 3.5% under "All". Older transmissions still in memory
-	// (re-heard, so loaded with a recent chunk) are left out too, or they
-	// show up as lone buckets weeks before the window.
 	coveredFrom := fromTime
 	dataFrom, dataFromReason := "", ""
-	// One now for both edges, and a minute of slack: with retentionHours
-	// equal to the range the edges coincide, and a hair's difference must
-	// not mark a full range partial (it did on staging, 168h vs 7d).
-	if cs, why := s.coverageStart(now); cs.After(fromTime.Add(coverageSlack)) {
-		coveredFrom = cs
-		dataFrom, dataFromReason = cs.Format(time.RFC3339), why
+	_, pm := s.getCachedNodesAndPM()
+	s.mu.RLock()
+	retained := s.maxMemoryMB > 0
+	coverage, reason := s.coverageStart(now)
+	s.mu.RUnlock()
+	if retained {
+		// Memory eviction is not a history boundary. Use the oldest committed
+		// transmission, preserving the existing database/slack semantics.
+		var oldest sql.NullString
+		if err := s.db.conn.QueryRowContext(ctx, "SELECT MIN(first_seen) FROM transmissions").Scan(&oldest); err != nil {
+			return nil, err
+		}
+		coverage, _ = parseStoreTime(oldest.String)
+		reason = coverageDatabase
 	}
-	packets := s.nodeTxsSince(pubkey, coveredFrom.Format(time.RFC3339))
-	coveredHours := now.Sub(coveredFrom).Hours()
-
-	// Activity timeline (hourly buckets). Certain counts the packets that
-	// can only be this node (#2260); the rest were attributed to it through
-	// a hop prefix it shares, and may be another node's.
-	timelineBuckets := map[string]int{}
-	certainBuckets := map[string]int{}
-	for _, p := range packets {
-		if len(p.FirstSeen) >= 13 {
-			bucket := p.FirstSeen[:13] + ":00:00Z"
-			timelineBuckets[bucket]++
-			if certainFor(p, pubkey, pm) {
-				certainBuckets[bucket]++
-			}
-		}
+	if coverage.After(fromTime.Add(coverageSlack)) {
+		coveredFrom = coverage
+		dataFrom, dataFromReason = coverage.Format(time.RFC3339), reason
 	}
-	bucketKeys := make([]string, 0, len(timelineBuckets))
-	for k := range timelineBuckets {
-		bucketKeys = append(bucketKeys, k)
-	}
-	sort.Strings(bucketKeys)
-	activityTimeline := make([]TimeBucket, 0, len(bucketKeys))
-	certainKeys := make([]string, 0, len(certainBuckets))
-	for _, k := range bucketKeys {
-		b := k
-		c := certainBuckets[k]
-		activityTimeline = append(activityTimeline, TimeBucket{Bucket: &b, Count: timelineBuckets[k], Certain: &c})
-		if c > 0 {
-			certainKeys = append(certainKeys, k)
+	accum := newNodeAnalyticsAccum(pubkey, pm)
+	since := coveredFrom.Format(time.RFC3339)
+	if retained {
+		if err := s.visitRetainedNodeHistory(ctx, pubkey, since, accum.add); err != nil {
+			return nil, err
 		}
-	}
-
-	// SNR trend
-	snrTrend := make([]SnrTrendEntry, 0)
-	for _, p := range packets {
-		if p.SNR != nil {
-			snrTrend = append(snrTrend, SnrTrendEntry{
-				Timestamp:    p.FirstSeen,
-				SNR:          floatPtrOrNil(p.SNR),
-				RSSI:         floatPtrOrNil(p.RSSI),
-				ObserverID:   strOrNil(p.ObserverID),
-				ObserverName: strOrNil(p.ObserverName),
-			})
-		}
-	}
-
-	// Packet type breakdown
-	typeBuckets := map[int]int{}
-	for _, p := range packets {
-		if p.PayloadType != nil {
-			typeBuckets[*p.PayloadType]++
-		}
-	}
-	packetTypeBreakdown := make([]PayloadTypeCount, 0, len(typeBuckets))
-	for pt, cnt := range typeBuckets {
-		packetTypeBreakdown = append(packetTypeBreakdown, PayloadTypeCount{PayloadType: pt, Count: cnt})
-	}
-
-	// Observer coverage
-	type obsAccum struct {
-		name                       string
-		snrSum, rssiSum            float64
-		snrCount, rssiCount, count int
-		first, last                string
-	}
-	obsMap := map[string]*obsAccum{}
-	for _, p := range packets {
-		if p.ObserverID == "" {
-			continue
-		}
-		o := obsMap[p.ObserverID]
-		if o == nil {
-			o = &obsAccum{name: p.ObserverName, first: p.FirstSeen, last: p.FirstSeen}
-			obsMap[p.ObserverID] = o
-		}
-		o.count++
-		if p.SNR != nil {
-			o.snrSum += *p.SNR
-			o.snrCount++
-		}
-		if p.RSSI != nil {
-			o.rssiSum += *p.RSSI
-			o.rssiCount++
-		}
-		if p.FirstSeen < o.first {
-			o.first = p.FirstSeen
-		}
-		if p.FirstSeen > o.last {
-			o.last = p.FirstSeen
-		}
-	}
-	observerCoverage := make([]NodeObserverStatsResp, 0, len(obsMap))
-	for id, o := range obsMap {
-		var avgSnr, avgRssi interface{}
-		if o.snrCount > 0 {
-			avgSnr = o.snrSum / float64(o.snrCount)
-		}
-		if o.rssiCount > 0 {
-			avgRssi = o.rssiSum / float64(o.rssiCount)
-		}
-		observerCoverage = append(observerCoverage, NodeObserverStatsResp{
-			ObserverID:   id,
-			ObserverName: o.name,
-			PacketCount:  o.count,
-			AvgSnr:       avgSnr,
-			AvgRssi:      avgRssi,
-			FirstSeen:    o.first,
-			LastSeen:     o.last,
-		})
-	}
-	sort.Slice(observerCoverage, func(i, j int) bool {
-		return observerCoverage[i].PacketCount > observerCoverage[j].PacketCount
-	})
-
-	// Hop distribution
-	hopCounts := map[string]int{}
-	totalWithPath := 0
-	relayedCount := 0
-	for _, p := range packets {
-		hops := txGetParsedPath(p)
-		if len(hops) > 0 {
-			key := fmt.Sprintf("%d", len(hops))
-			if len(hops) >= 4 {
-				key = "4+"
-			}
-			hopCounts[key]++
-			totalWithPath++
-			if len(hops) > 1 {
-				relayedCount++
-			}
-		} else {
-			hopCounts["0"]++
-		}
-	}
-	hopDistribution := make([]HopDistEntry, 0)
-	for _, h := range []string{"0", "1", "2", "3", "4+"} {
-		if c, ok := hopCounts[h]; ok {
-			hopDistribution = append(hopDistribution, HopDistEntry{Hops: h, Count: c})
-		}
-	}
-
-	// Peer interactions
-	type peerAccum struct {
-		key, name   string
-		count       int
-		lastContact string
-	}
-	peerMap := map[string]*peerAccum{}
-	for _, p := range packets {
-		if p.DecodedJSON == "" {
-			continue
-		}
-		decoded := p.ParsedDecoded()
-		if decoded == nil {
-			continue
-		}
-		type candidate struct{ key, name string }
-		var candidates []candidate
-		if sk, ok := decoded["sender_key"].(string); ok && sk != "" && sk != pubkey {
-			sn, _ := decoded["sender_name"].(string)
-			if sn == "" {
-				sn, _ = decoded["sender_short_name"].(string)
-			}
-			candidates = append(candidates, candidate{sk, sn})
-		}
-		if rk, ok := decoded["recipient_key"].(string); ok && rk != "" && rk != pubkey {
-			rn, _ := decoded["recipient_name"].(string)
-			if rn == "" {
-				rn, _ = decoded["recipient_short_name"].(string)
-			}
-			candidates = append(candidates, candidate{rk, rn})
-		}
-		if pk, ok := decoded["pubkey"].(string); ok && pk != "" && pk != pubkey {
-			nm, _ := decoded["name"].(string)
-			candidates = append(candidates, candidate{pk, nm})
-		}
-		for _, c := range candidates {
-			if c.key == "" {
-				continue
-			}
-			pm := peerMap[c.key]
-			if pm == nil {
-				pn := c.name
-				if pn == "" && len(c.key) >= 12 {
-					pn = c.key[:12]
+	} else {
+		err := func() error {
+			s.mu.RLock()
+			defer s.mu.RUnlock()
+			for _, tx := range s.byNode[pubkey] {
+				if err := ctx.Err(); err != nil {
+					return err
 				}
-				pm = &peerAccum{key: c.key, name: pn, lastContact: p.FirstSeen}
-				peerMap[c.key] = pm
-			}
-			pm.count++
-			if p.FirstSeen > pm.lastContact {
-				pm.lastContact = p.FirstSeen
-			}
-		}
-	}
-	peerSlice := make([]PeerInteraction, 0, len(peerMap))
-	for _, pm := range peerMap {
-		peerSlice = append(peerSlice, PeerInteraction{
-			PeerKey: pm.key, PeerName: pm.name,
-			MessageCount: pm.count, LastContact: pm.lastContact,
-		})
-	}
-	sort.Slice(peerSlice, func(i, j int) bool {
-		return peerSlice[i].MessageCount > peerSlice[j].MessageCount
-	})
-	if len(peerSlice) > 20 {
-		peerSlice = peerSlice[:20]
-	}
-
-	// Uptime heatmap
-	heatBuckets := map[string]*HeatmapCell{}
-	for _, p := range packets {
-		t, ok := parseStoreTime(p.FirstSeen)
-		if !ok {
-			continue
-		}
-		dow := int(t.UTC().Weekday())
-		hr := t.UTC().Hour()
-		k := fmt.Sprintf("%d:%d", dow, hr)
-		if heatBuckets[k] == nil {
-			heatBuckets[k] = &HeatmapCell{DayOfWeek: dow, Hour: hr}
-		}
-		heatBuckets[k].Count++
-	}
-	uptimeHeatmap := make([]HeatmapCell, 0, len(heatBuckets))
-	for _, cell := range heatBuckets {
-		uptimeHeatmap = append(uptimeHeatmap, *cell)
-	}
-
-	// Computed stats. Availability and the longest silence measure the node
-	// being heard, so only certain buckets count (#2260): a silent repeater
-	// must not look available through its namesake prefix.
-	totalPackets := len(packets)
-	distinctHours := len(certainKeys)
-	// Null under minCoveredHours: too short a window to extrapolate from.
-	var availabilityPct, avgPacketsPerDay *float64
-	if coveredHours >= minCoveredHours {
-		avail := math.Min(round(float64(distinctHours)*100.0/coveredHours, 1), 100)
-		perDay := round(float64(totalPackets)*24/coveredHours, 1)
-		availabilityPct, avgPacketsPerDay = &avail, &perDay
-	}
-
-	longestSilenceMs, longestSilenceStart := longestSilence(certainKeys, coveredFrom, now)
-
-	// Signal grade & SNR stats
-	var snrMean, snrStdDev float64
-	if len(snrTrend) > 0 {
-		var sum float64
-		for _, e := range snrTrend {
-			if v, ok := e.SNR.(float64); ok {
-				sum += v
-			}
-		}
-		snrMean = sum / float64(len(snrTrend))
-		if len(snrTrend) > 1 {
-			var sqSum float64
-			for _, e := range snrTrend {
-				if v, ok := e.SNR.(float64); ok {
-					sqSum += (v - snrMean) * (v - snrMean)
+				if tx.FirstSeen >= since {
+					accum.add(tx)
 				}
 			}
-			snrStdDev = math.Sqrt(sqSum / float64(len(snrTrend)))
+			return nil
+		}()
+		if err != nil {
+			return nil, err
 		}
 	}
-
-	signalGrade := "D"
-	if snrMean > 15 && snrStdDev < 2 {
-		signalGrade = "A"
-	} else if snrMean > 15 {
-		signalGrade = "A-"
-	} else if snrMean > 12 && snrStdDev < 3 {
-		signalGrade = "B+"
-	} else if snrMean > 8 {
-		signalGrade = "B"
-	} else if snrMean > 3 {
-		signalGrade = "C"
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-
-	var relayPct float64
-	if totalWithPath > 0 {
-		relayPct = round(float64(relayedCount)*100.0/float64(totalWithPath), 1)
+	clockSkew, err := s.readNodeClockSkew(ctx, pubkey)
+	if err != nil {
+		return nil, err
 	}
-
-	// Compute clock skew (already under RLock).
-	clockSkew := s.getNodeClockSkewLocked(pubkey)
-
-	return &NodeAnalyticsResponse{
-		Node:                node,
-		TimeRange:           TimeRangeResp{From: fromISO, To: toISO, Days: days, DataFrom: dataFrom, DataFromReason: dataFromReason, Partial: dataFrom != ""},
-		ActivityTimeline:    activityTimeline,
-		SnrTrend:            snrTrend,
-		PacketTypeBreakdown: packetTypeBreakdown,
-		ObserverCoverage:    observerCoverage,
-		HopDistribution:     hopDistribution,
-		PeerInteractions:    peerSlice,
-		UptimeHeatmap:       uptimeHeatmap,
-		ComputedStats: ComputedNodeStats{
-			AvailabilityPct:     availabilityPct,
-			LongestSilenceMs:    longestSilenceMs,
-			LongestSilenceStart: longestSilenceStart,
-			SignalGrade:         signalGrade,
-			SnrMean:             round(snrMean, 1),
-			SnrStdDev:           round(snrStdDev, 1),
-			RelayPct:            relayPct,
-			TotalPackets:        totalPackets,
-			UniqueObservers:     len(observerCoverage),
-			UniquePeers:         len(peerSlice),
-			AvgPacketsPerDay:    avgPacketsPerDay,
-		},
-		ClockSkew: clockSkew,
-	}, nil
+	result := &NodeAnalyticsResponse{Node: node, ClockSkew: clockSkew,
+		TimeRange: TimeRangeResp{From: fromTime.Format(time.RFC3339), To: now.Format(time.RFC3339), Days: days,
+			DataFrom: dataFrom, DataFromReason: dataFromReason, Partial: dataFrom != ""}}
+	accum.finish(result, coveredFrom, now)
+	return result, ctx.Err()
 }
 
 // GetAnalyticsSubpathsWithWindow is the window-aware variant of
