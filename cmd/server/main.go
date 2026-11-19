@@ -406,9 +406,12 @@ func main() {
 	// on-request compute-then-cache pattern for the default (region="",
 	// zero-window) analytics queries with a background refresh loop so
 	// reads always hit cache in <1ms.
+	retainedWorkReady := make(chan struct{})
+	analyticsIntervals := cfg.AnalyticsRecomputeIntervals()
+	analyticsIntervals.retainedWorkReady = retainedWorkReady
 	stopAnalyticsRecomp := store.StartAnalyticsRecomputers(
 		cfg.AnalyticsDefaultRecomputeInterval(),
-		cfg.AnalyticsRecomputeIntervals(),
+		analyticsIntervals,
 	)
 	defer stopAnalyticsRecomp()
 	log.Printf("[analytics-recompute] background recompute enabled (default=%s)", cfg.AnalyticsDefaultRecomputeInterval())
@@ -603,6 +606,7 @@ func main() {
 	// Migrate old content hashes in background (one-time, idempotent).
 	go migrateContentHashesAsync(store, 5000, 100*time.Millisecond)
 
+	close(retainedWorkReady)
 	if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("[server] %v", err)
 	}

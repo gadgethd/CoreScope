@@ -40,6 +40,7 @@ type retainedPacket struct {
 type packetHydration struct {
 	page, completeObservations, wireFrames bool
 	decodedKeys, relayPaths, relayEvidence bool
+	directReceptions                       bool
 }
 
 func (db *DB) retainedPacketRows(ctx context.Context, read *sql.Tx, ids []int, radioCols, radioJoin string, mode packetHydration) (map[int]*retainedPacket, error) {
@@ -60,6 +61,13 @@ func (db *DB) retainedPacketRows(ctx context.Context, read *sql.Tx, ids []int, r
 		}
 	} else if mode.decodedKeys {
 		txData = "NULL, NULL, NULL, t.decoded_json"
+	} else if mode.directReceptions {
+		txData = "NULL, t.route_type, t.payload_type, t.decoded_json"
+		if db.isV3 {
+			obsData = "o.snr, o.rssi, NULL, b.name, NULL"
+		} else {
+			obsData = "o.snr, o.rssi, NULL, o.observer_name, NULL"
+		}
 	}
 	if mode.page && db.hasScopeName {
 		scope = "t.scope_name"

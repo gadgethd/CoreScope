@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"runtime"
 	"sort"
 	"sync"
@@ -10,6 +11,62 @@ import (
 )
 
 func numGoroutinesForTest() int { return runtime.NumGoroutine() }
+
+func TestCancellableAnalyticsCanDeferItsInitialPass(t *testing.T) {
+	var computeContext context.Context
+	recomputer := newCancellableAnalyticsRecomputer("retained analytics", time.Hour, func(ctx context.Context) interface{} {
+		computeContext = ctx
+		return "complete"
+	})
+	recomputer.backgroundInitial = true
+	recomputer.Start()
+	t.Cleanup(recomputer.Stop)
+	if recomputer.ComputeRuns() != 0 {
+		t.Fatal("retained analytics ran on the startup goroutine")
+	}
+	recomputer.RecomputeNow()
+	if recomputer.Load() != "complete" {
+		t.Fatal("post-load work did not publish its snapshot")
+	}
+	recomputer.Stop()
+	if computeContext == nil || computeContext.Err() != context.Canceled {
+		t.Fatal("stop did not cancel the retained analytics context")
+	}
+}
+
+func TestRetainedAnalyticsWaitsWithoutHoldingTheWorkSlot(t *testing.T) {
+	ready := make(chan struct{})
+	var work analyticsWorkGate
+	recomputer := newAnalyticsRecomputer("retained analytics", time.Hour, func() interface{} {
+		return "complete"
+	})
+	recomputer.backgroundInitial = true
+	recomputer.ready = ready
+	recomputer.work = &work
+	recomputer.Start()
+	t.Cleanup(recomputer.Stop)
+	ack := make(chan struct{})
+	select {
+	case recomputer.recomputeReq <- ack:
+	case <-time.After(time.Second):
+		t.Fatal("the retained analytics worker did not accept work")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !work.acquire(ctx.Done()) {
+		t.Fatal("waiting retained analytics blocked synchronous prewarm work")
+	}
+	work.release()
+	if recomputer.ComputeRuns() != 0 {
+		t.Fatal("retained analytics began before synchronous prewarm completed")
+	}
+	close(ready)
+	select {
+	case <-ack:
+	case <-time.After(time.Second):
+		t.Fatal("the retained worker did not finish after prewarm")
+	}
+}
 
 func TestAnalyticsRecomputerReleasesItsSharedWorkSlot(t *testing.T) {
 	var store PacketStore

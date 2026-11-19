@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -73,7 +74,7 @@ func TestNodeHealth_CanRelayCaseInsensitive_Issue1290(t *testing.T) {
 	srv.store.byNode[nodePubkey] = append(srv.store.byNode[nodePubkey], tx)
 	srv.store.packets = append(srv.store.packets, tx)
 	srv.store.mu.Unlock()
-	srv.store.publishDirectHeard(srv.store.computeDirectHeard())
+	srv.store.publishDirectHeard(srv.store.computeDirectHeard(context.Background()))
 
 	req := httptest.NewRequest(http.MethodGet, "/api/nodes/"+nodePubkey+"/health", nil)
 	w := httptest.NewRecorder()

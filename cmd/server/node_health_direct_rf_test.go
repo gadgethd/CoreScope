@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -54,7 +56,7 @@ func TestNodeHealth_RelayedObserverIsNotHeardBy(t *testing.T) {
 	srv.store.byNode[nodePubkey] = append(srv.store.byNode[nodePubkey], relayed)
 	srv.store.packets = append(srv.store.packets, relayed)
 	srv.store.mu.Unlock()
-	srv.store.publishDirectHeard(srv.store.computeDirectHeard())
+	srv.store.publishDirectHeard(srv.store.computeDirectHeard(context.Background()))
 
 	req := httptest.NewRequest(http.MethodGet, "/api/nodes/"+nodePubkey+"/health", nil)
 	w := httptest.NewRecorder()
@@ -83,6 +85,38 @@ func TestNodeHealth_RelayedObserverIsNotHeardBy(t *testing.T) {
 	}
 	if relayCount < 1 {
 		t.Fatalf("relayObserverCount = %v, want at least 1 (the relayed observer must still be counted)", relayCount)
+	}
+}
+
+func TestDirectHeardUsesRetainedHistory(t *testing.T) {
+	server, _ := setupTestServer(t)
+	defer server.db.Close()
+	resident := server.store.computeDirectHeard(context.Background())
+	if len(resident["aabbccdd11223344"]) == 0 {
+		t.Fatal("the fixture produced no direct reception evidence")
+	}
+	server.store.mu.Lock()
+	server.store.maxMemoryMB = 1
+	server.store.packets = nil
+	server.store.mu.Unlock()
+	if retained := server.store.computeDirectHeard(context.Background()); !reflect.DeepEqual(retained, resident) {
+		t.Fatalf("retained direct receptions differ: got %+v, want %+v", retained, resident)
+	}
+}
+
+func TestDirectHeardCancelsAQueuedRetainedScan(t *testing.T) {
+	server, _ := setupTestServer(t)
+	defer server.db.Close()
+	server.store.maxMemoryMB = 1
+	release, err := server.db.claimRetainedScan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := server.store.computeDirectHeard(ctx); got != nil {
+		t.Fatalf("canceled scan returned a snapshot: %+v", got)
 	}
 }
 
