@@ -195,6 +195,17 @@ func (tx *StoreTx) ParsedDecoded() map[string]interface{} {
 	return tx.parsedDecoded
 }
 
+// A whole-history pass needs only the sender key. Skip the decoded map
+// when the property is absent. Escaped JSON property names still go
+// through the parser, which also handles non-string values as before.
+func (tx *StoreTx) decodedSenderPubkey() string {
+	if !strings.Contains(tx.DecodedJSON, `"pubKey"`) && !strings.ContainsRune(tx.DecodedJSON, '\\') {
+		return ""
+	}
+	key, _ := tx.ParsedDecoded()["pubKey"].(string)
+	return key
+}
+
 // PacketStore holds all transmissions in memory with indexes for fast queries.
 //
 // Lock ordering
@@ -5353,15 +5364,7 @@ func buildHopContextPubkeys(tx *StoreTx, pm *prefixMap) []string {
 		out = append(out, l)
 	}
 
-	// Sender / originator pubkey from decoded payload. Use the cached
-	// ParsedDecoded() (sync.Once-gated) instead of re-unmarshaling — the
-	// helper is hot (3 distance sites + analytics topology, all 30k+ tx
-	// loops). See #1197 (carmack/adversarial r1).
-	if dec := tx.ParsedDecoded(); dec != nil {
-		if pk, ok := dec["pubKey"].(string); ok {
-			add(pk)
-		}
-	}
+	add(tx.decodedSenderPubkey())
 
 	// Observer pubkey, where available. ObserverID is the observers.id PRIMARY
 	// KEY from the MQTT topic — it is NOT guaranteed to be a node pubkey hex
@@ -6446,7 +6449,7 @@ func (s *PacketStore) computeRF(ctx context.Context, region, area string, window
 	txCap := len(s.packets)
 	s.mu.RUnlock()
 	if !retained {
-		return aggregateRF(estCap, txCap, areaNodes, window, func(addTransmission func(*StoreTx), addRegional func(*StoreObs, *StoreTx)) error {
+		return aggregateRF(estCap, txCap, regionObs != nil, areaNodes, window, func(addTransmission func(*StoreTx, *rfPacketCounts), addRegional func(*StoreObs, *StoreTx)) error {
 			s.mu.RLock()
 			defer s.mu.RUnlock()
 			if regionObs != nil {
@@ -6456,8 +6459,14 @@ func (s *PacketStore) computeRF(ctx context.Context, region, area string, window
 					}
 				}
 			} else {
+				duplicates := make(map[string]*rfPacketCounts)
 				for _, tx := range s.packets {
-					addTransmission(tx)
+					if tx.Hash != "" && s.byHash[tx.Hash] != tx {
+						duplicates[tx.Hash] = &rfPacketCounts{}
+					}
+				}
+				for _, tx := range s.packets {
+					addTransmission(tx, duplicates[tx.Hash])
 				}
 			}
 			return nil
@@ -6472,12 +6481,12 @@ func (s *PacketStore) computeRF(ctx context.Context, region, area string, window
 	var result packetFields
 	err := s.db.withRetainedSnapshot(ctx, func(read *sql.Tx) error {
 		var err error
-		result, err = aggregateRF(estCap, txCap, areaNodes, window, func(addTransmission func(*StoreTx), addRegional func(*StoreObs, *StoreTx)) error {
+		result, err = aggregateRF(estCap, txCap, regionObs != nil, areaNodes, window, func(addTransmission func(*StoreTx, *rfPacketCounts), addRegional func(*StoreObs, *StoreTx)) error {
 			return s.db.visitRetainedPacketRows(ctx, read, "SELECT t.id"+where+" ORDER BY t.first_seen, t.id", args, ", NULL", "",
 				packetHydration{page: true}, func(packet *retainedPacket) {
 					tx := packet.tx
 					if regionObs == nil {
-						addTransmission(tx)
+						addTransmission(tx, nil)
 						return
 					}
 					for _, obs := range tx.Observations {
@@ -6492,142 +6501,111 @@ func (s *PacketStore) computeRF(ctx context.Context, region, area string, window
 	return result, err
 }
 
-func aggregateRF(estCap, txCap int, areaNodes map[string]bool, window TimeWindow,
-	scan func(addTransmission func(*StoreTx), addRegional func(*StoreObs, *StoreTx)) error) (packetFields, error) {
-	ptNames := payloadTypeNames
+type rfSignal struct {
+	count         int
+	sum, min, max float64
+}
 
-	// Collect all observations matching the region
+func (s rfSignal) add(value float64) rfSignal {
+	if s.count == 0 || value < s.min {
+		s.min = value
+	}
+	if s.count == 0 || value > s.max {
+		s.max = value
+	}
+	s.count++
+	s.sum += value
+	return s
+}
+
+// A background fill can briefly leave two resident copies of a packet.
+type rfPacketCounts struct {
+	transmission, size, payloadType bool
+	hours                           map[string]bool
+}
+
+func aggregateRF(estCap, txCap int, regional bool, areaNodes map[string]bool, window TimeWindow,
+	scan func(addTransmission func(*StoreTx, *rfPacketCounts), addRegional func(*StoreObs, *StoreTx)) error) (packetFields, error) {
 	snrVals := make([]float64, 0, estCap/2)
 	rssiVals := make([]float64, 0, estCap/2)
 	packetSizes := make([]int, 0, txCap)
-	seenSizeHashes := make(map[string]bool, txCap)
-	seenTypeHashes := make(map[string]bool, txCap)
 	typeBuckets := map[int]int{}
 	hourBuckets := map[string]int{}
-	seenHourHash := make(map[string]bool, txCap) // dedup packets-per-hour by hash+hour
-	snrByType := map[string]*struct{ vals []float64 }{}
-	sigTime := map[string]*struct {
-		snrs  []float64
-		count int
-	}{}
+	snrByType := map[string]rfSignal{}
+	sigTime := map[string]rfSignal{}
 	scatterAll := make([]struct{ snr, rssi float64 }, 0, estCap/4)
-	totalObs := 0
-	regionalHashes := make(map[string]bool, txCap)
+	totalObs, totalTransmissions := 0, 0
 	var minTimestamp, maxTimestamp string
+
+	// Regional scans visit observations through observer indexes. A hash
+	// can recur in different parts of the scan.
+	type hashHour struct{ hash, hour string }
+	var regionalHashes, seenSizeHashes, seenTypeHashes map[string]bool
+	var regionalHours map[hashHour]bool
+	if regional {
+		regionalHashes = make(map[string]bool, txCap)
+		seenSizeHashes = make(map[string]bool, txCap)
+		seenTypeHashes = make(map[string]bool, txCap)
+		regionalHours = make(map[hashHour]bool, txCap)
+	}
+
+	matchesArea := func(tx *StoreTx) bool {
+		if areaNodes == nil || tx == nil {
+			return true
+		}
+		d := tx.ParsedDecoded()
+		pk, _ := d["public_key"].(string)
+		if pk == "" {
+			pk, _ = d["pubKey"].(string)
+		}
+		return pk != "" && areaNodes[pk]
+	}
+	updateTimeSpan := func(ts string) {
+		if ts == "" {
+			return
+		}
+		if minTimestamp == "" || ts < minTimestamp {
+			minTimestamp = ts
+		}
+		if ts > maxTimestamp {
+			maxTimestamp = ts
+		}
+	}
+	observe := func(obs *StoreObs, typeName string) {
+		updateTimeSpan(obs.Timestamp)
+		if obs.RSSI != nil {
+			rssiVals = append(rssiVals, *obs.RSSI)
+		}
+		if obs.SNR == nil {
+			return
+		}
+		snr := *obs.SNR
+		snrVals = append(snrVals, snr)
+		snrByType[typeName] = snrByType[typeName].add(snr)
+		if obs.RSSI != nil {
+			scatterAll = append(scatterAll, struct{ snr, rssi float64 }{snr, *obs.RSSI})
+		}
+		if len(obs.Timestamp) >= 13 {
+			hour := obs.Timestamp[:13]
+			sigTime[hour] = sigTime[hour].add(snr)
+		}
+	}
 
 	addRegional := func(obs *StoreObs, tx *StoreTx) {
 		if !window.Includes(obs.Timestamp) {
 			return
 		}
 		totalObs++
-		if areaNodes != nil && tx != nil {
-			d := tx.ParsedDecoded()
-			pk, _ := d["public_key"].(string)
-			if pk == "" {
-				pk, _ = d["pubKey"].(string)
-			}
-			if pk == "" || !areaNodes[pk] {
-				return
-			}
-		}
-		hash := ""
-		if tx != nil {
-			hash = tx.Hash
-		}
-		if hash != "" {
-			regionalHashes[hash] = true
-		}
-
-		ts := obs.Timestamp
-		if ts != "" {
-			if minTimestamp == "" || ts < minTimestamp {
-				minTimestamp = ts
-			}
-			if ts > maxTimestamp {
-				maxTimestamp = ts
-			}
-		}
-
-		// SNR/RSSI
-		if obs.SNR != nil {
-			snrVals = append(snrVals, *obs.SNR)
-			typeName := "UNK"
-			if tx != nil && tx.PayloadType != nil {
-				if n, ok := ptNames[*tx.PayloadType]; ok {
-					typeName = n
-				} else {
-					typeName = fmt.Sprintf("UNK(%d)", *tx.PayloadType)
-				}
-			}
-			if snrByType[typeName] == nil {
-				snrByType[typeName] = &struct{ vals []float64 }{}
-			}
-			snrByType[typeName].vals = append(snrByType[typeName].vals, *obs.SNR)
-
-			if obs.RSSI != nil {
-				scatterAll = append(scatterAll, struct{ snr, rssi float64 }{*obs.SNR, *obs.RSSI})
-			}
-
-			// Signal over time
-			if len(ts) >= 13 {
-				hr := ts[:13]
-				if sigTime[hr] == nil {
-					sigTime[hr] = &struct {
-						snrs  []float64
-						count int
-					}{}
-				}
-				sigTime[hr].snrs = append(sigTime[hr].snrs, *obs.SNR)
-				sigTime[hr].count++
-			}
-		}
-		if obs.RSSI != nil {
-			rssiVals = append(rssiVals, *obs.RSSI)
-		}
-
-		// Packets per hour (unique by hash per hour)
-		if len(ts) >= 13 {
-			hr := ts[:13]
-			hk := hash + "|" + hr
-			if hash == "" || !seenHourHash[hk] {
-				if hash != "" {
-					seenHourHash[hk] = true
-				}
-				hourBuckets[hr]++
-			}
-		}
-
-		// Packet sizes (unique by hash)
-		if hash != "" && !seenSizeHashes[hash] && tx != nil && tx.RawHex != "" {
-			seenSizeHashes[hash] = true
-			packetSizes = append(packetSizes, len(tx.RawHex)/2)
-		}
-
-		// Payload type distribution (unique by hash)
-		if hash != "" && !seenTypeHashes[hash] && tx != nil && tx.PayloadType != nil {
-			seenTypeHashes[hash] = true
-			typeBuckets[*tx.PayloadType]++
-		}
-	}
-
-	addTransmission := func(tx *StoreTx) {
-		// Window filter: skip transmissions outside the requested window.
-		// We use tx.FirstSeen as the bounding timestamp; per-obs window
-		// filter below handles cases where individual obs timestamps differ.
-		if !window.Includes(tx.FirstSeen) {
+		if !matchesArea(tx) {
 			return
 		}
-		if areaNodes != nil {
-			d := tx.ParsedDecoded()
-			pk, _ := d["public_key"].(string)
-			if pk == "" {
-				pk, _ = d["pubKey"].(string)
-			}
-			if pk == "" || !areaNodes[pk] {
-				return
+		hash, typeName := "", "UNK"
+		if tx != nil {
+			hash = tx.Hash
+			if tx.PayloadType != nil {
+				typeName = resolvePayloadTypeName(tx.PayloadType)
 			}
 		}
-		hash := tx.Hash
 		if hash != "" {
 			regionalHashes[hash] = true
 			if !seenSizeHashes[hash] && tx.RawHex != "" {
@@ -6639,75 +6617,49 @@ func aggregateRF(estCap, txCap int, areaNodes map[string]bool, window TimeWindow
 				typeBuckets[*tx.PayloadType]++
 			}
 		}
+		observe(obs, typeName)
+		if len(obs.Timestamp) >= 13 {
+			hour := obs.Timestamp[:13]
+			key := hashHour{hash, hour}
+			if hash == "" || !regionalHours[key] {
+				if hash != "" {
+					regionalHours[key] = true
+				}
+				hourBuckets[hour]++
+			}
+		}
+	}
 
-		// Pre-resolve type name once per transmission
-		typeName := "UNK"
-		if tx.PayloadType != nil {
-			if n, ok := ptNames[*tx.PayloadType]; ok {
-				typeName = n
-			} else {
-				typeName = fmt.Sprintf("UNK(%d)", *tx.PayloadType)
+	// Ordinarily a global scan sees one row per hash. Reuse one hour set
+	// for delayed observations and keep cross-copy state only for duplicates.
+	packetHours := make(map[string]bool)
+	addTransmission := func(tx *StoreTx, duplicate *rfPacketCounts) {
+		if !window.Includes(tx.FirstSeen) || !matchesArea(tx) {
+			return
+		}
+		if tx.Hash != "" {
+			if duplicate == nil || !duplicate.transmission {
+				totalTransmissions++
+				if duplicate != nil {
+					duplicate.transmission = true
+				}
+			}
+			if tx.RawHex != "" && (duplicate == nil || !duplicate.size) {
+				packetSizes = append(packetSizes, len(tx.RawHex)/2)
+				if duplicate != nil {
+					duplicate.size = true
+				}
+			}
+			if tx.PayloadType != nil && (duplicate == nil || !duplicate.payloadType) {
+				typeBuckets[*tx.PayloadType]++
+				if duplicate != nil {
+					duplicate.payloadType = true
+				}
 			}
 		}
 
-		if len(tx.Observations) > 0 {
-			for _, obs := range tx.Observations {
-				totalObs++
-				ts := obs.Timestamp
-				if ts != "" {
-					if minTimestamp == "" || ts < minTimestamp {
-						minTimestamp = ts
-					}
-					if ts > maxTimestamp {
-						maxTimestamp = ts
-					}
-				}
-
-				if obs.SNR != nil {
-					snr := *obs.SNR
-					snrVals = append(snrVals, snr)
-					entry := snrByType[typeName]
-					if entry == nil {
-						entry = &struct{ vals []float64 }{}
-						snrByType[typeName] = entry
-					}
-					entry.vals = append(entry.vals, snr)
-
-					if obs.RSSI != nil {
-						scatterAll = append(scatterAll, struct{ snr, rssi float64 }{snr, *obs.RSSI})
-					}
-
-					if len(ts) >= 13 {
-						hr := ts[:13]
-						st := sigTime[hr]
-						if st == nil {
-							st = &struct {
-								snrs  []float64
-								count int
-							}{}
-							sigTime[hr] = st
-						}
-						st.snrs = append(st.snrs, snr)
-						st.count++
-					}
-				}
-				if obs.RSSI != nil {
-					rssiVals = append(rssiVals, *obs.RSSI)
-				}
-
-				if len(ts) >= 13 {
-					hr := ts[:13]
-					hk := hash + "|" + hr
-					if hash == "" || !seenHourHash[hk] {
-						if hash != "" {
-							seenHourHash[hk] = true
-						}
-						hourBuckets[hr]++
-					}
-				}
-			}
-		} else {
-			// Legacy: transmission without observations
+		if len(tx.Observations) == 0 {
+			// Legacy transmissions can have signal and a timestamp without observations.
 			totalObs++
 			if tx.SNR != nil {
 				snrVals = append(snrVals, *tx.SNR)
@@ -6715,24 +6667,48 @@ func aggregateRF(estCap, txCap int, areaNodes map[string]bool, window TimeWindow
 			if tx.RSSI != nil {
 				rssiVals = append(rssiVals, *tx.RSSI)
 			}
-			ts := tx.FirstSeen
-			if ts != "" {
-				if minTimestamp == "" || ts < minTimestamp {
-					minTimestamp = ts
-				}
-				if ts > maxTimestamp {
-					maxTimestamp = ts
-				}
+			updateTimeSpan(tx.FirstSeen)
+			if len(tx.FirstSeen) >= 13 {
+				hourBuckets[tx.FirstSeen[:13]]++
 			}
-			if len(ts) >= 13 {
-				hourBuckets[ts[:13]]++
+			return
+		}
+
+		typeName := "UNK"
+		if tx.PayloadType != nil {
+			typeName = resolvePayloadTypeName(tx.PayloadType)
+		}
+		var hours map[string]bool
+		if duplicate != nil {
+			if duplicate.hours == nil {
+				duplicate.hours = make(map[string]bool)
 			}
+			hours = duplicate.hours
+		} else if tx.Hash != "" && len(tx.Observations) > 1 {
+			clear(packetHours)
+			hours = packetHours
+		}
+		for _, obs := range tx.Observations {
+			totalObs++
+			observe(obs, typeName)
+			if len(obs.Timestamp) < 13 {
+				continue
+			}
+			hour := obs.Timestamp[:13]
+			if hours != nil {
+				if hours[hour] {
+					continue
+				}
+				hours[hour] = true
+			}
+			hourBuckets[hour]++
 		}
 	}
 
 	if err := scan(addTransmission, addRegional); err != nil {
 		return nil, err
 	}
+	totalTransmissions += len(regionalHashes)
 
 	// Stats helpers
 	stddevF64 := func(arr []float64, avg float64) float64 {
@@ -6840,10 +6816,7 @@ func aggregateRF(estCap, txCap int, areaNodes map[string]bool, window TimeWindow
 	}
 	payloadTypes := make([]ptEntry, 0, len(typeBuckets))
 	for t, c := range typeBuckets {
-		name := ptNames[t]
-		if name == "" {
-			name = fmt.Sprintf("UNK(%d)", t)
-		}
+		name := resolvePayloadTypeName(&t)
 		payloadTypes = append(payloadTypes, ptEntry{Type: t, Name: name, Count: c})
 	}
 	sort.Slice(payloadTypes, func(i, j int) bool { return payloadTypes[i].Count > payloadTypes[j].Count })
@@ -6858,14 +6831,10 @@ func aggregateRF(estCap, txCap int, areaNodes map[string]bool, window TimeWindow
 	}
 	snrByTypeArr := make([]snrTypeEntry, 0, len(snrByType))
 	for name, d := range snrByType {
-		sum := 0.0
-		for _, v := range d.vals {
-			sum += v
-		}
 		snrByTypeArr = append(snrByTypeArr, snrTypeEntry{
-			Name: name, Count: len(d.vals),
-			Avg: sum / float64(len(d.vals)),
-			Min: minF64(d.vals), Max: maxF64(d.vals),
+			Name: name, Count: d.count,
+			Avg: d.sum / float64(d.count),
+			Min: d.min, Max: d.max,
 		})
 	}
 	sort.Slice(snrByTypeArr, func(i, j int) bool { return snrByTypeArr[i].Count > snrByTypeArr[j].Count })
@@ -6884,11 +6853,7 @@ func aggregateRF(estCap, txCap int, areaNodes map[string]bool, window TimeWindow
 	signalOverTime := make([]sigTimeEntry, len(sigKeys))
 	for i, k := range sigKeys {
 		d := sigTime[k]
-		sum := 0.0
-		for _, v := range d.snrs {
-			sum += v
-		}
-		signalOverTime[i] = sigTimeEntry{Hour: k, Count: d.count, AvgSnr: sum / float64(d.count)}
+		signalOverTime[i] = sigTimeEntry{Hour: k, Count: d.count, AvgSnr: d.sum / float64(d.count)}
 	}
 
 	// Scatter (downsample to 500)
@@ -7013,7 +6978,7 @@ func aggregateRF(estCap, txCap int, areaNodes map[string]bool, window TimeWindow
 	return map[string]interface{}{
 		"totalPackets":       len(snrVals),
 		"totalAllPackets":    totalObs,
-		"totalTransmissions": len(regionalHashes),
+		"totalTransmissions": totalTransmissions,
 		"snr":                snrStats,
 		"rssi":               rssiStats,
 		"snrValues":          snrHistogram,

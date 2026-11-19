@@ -6,6 +6,21 @@ import (
 	"time"
 )
 
+func TestRepeaterRelayEvidencePreservesInstant(t *testing.T) {
+	observed, err := time.Parse(time.RFC3339Nano, "2026-11-18T13:00:00.000000001+01:00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := repeaterRelayEvidence{
+		seconds: observed.Unix(), nanoseconds: int32(observed.Nanosecond()), validTime: true,
+	}
+	for _, cutoff := range []time.Time{observed.Add(-time.Nanosecond), observed.UTC(), observed.Add(time.Nanosecond)} {
+		if got, want := evidence.after(cutoff), observed.After(cutoff); got != want {
+			t.Fatalf("observation %v after %v = %v, want %v", observed, cutoff, got, want)
+		}
+	}
+}
+
 // TestGetRepeaterRelayInfoMap_ServesStaleOnTTLExpiry is a regression guard
 // for issue #1272.
 //

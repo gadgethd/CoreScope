@@ -65,6 +65,18 @@ func (s *PacketStore) snapshotPathHopIndexLocked() map[string][]*StoreTx {
 	return snap
 }
 
+type repeaterRelayEvidence struct {
+	seconds     int64
+	nanoseconds int32
+	validTime   bool
+	advert      bool
+}
+
+func (e repeaterRelayEvidence) after(cutoff time.Time) bool {
+	seconds := cutoff.Unix()
+	return e.seconds > seconds || (e.seconds == seconds && int(e.nanoseconds) > cutoff.Nanosecond())
+}
+
 // computeRepeaterRelayInfoMap walks byPathHop once under a single RLock,
 // pre-parses every FirstSeen timestamp once (not once-per-pubkey-bucket),
 // and emits one RepeaterRelayInfo per hop key.
@@ -84,26 +96,33 @@ func (s *PacketStore) computeRepeaterRelayInfoMap(windowHours float64) map[strin
 	// re-parse the same FirstSeen N times when the same tx is indexed
 	// under multiple hop keys (very common — every hop on a path indexes
 	// the tx).
-	type parsedTx struct {
-		t  time.Time
-		ok bool
-		pt int
-	}
-	parseCache := make(map[int]parsedTx, 1<<14)
+	parseCache := make(map[int]repeaterRelayEvidence, 1<<14)
+	var scopes map[*StoreTx]string
 	for _, list := range snap {
 		for _, tx := range list {
 			if tx == nil {
 				continue
 			}
+			if tx.ScopeName != nil && *tx.ScopeName != "" {
+				if scopes == nil {
+					scopes = make(map[*StoreTx]string)
+				}
+				scopes[tx] = *tx.ScopeName
+			}
 			if _, ok := parseCache[tx.ID]; ok {
 				continue
 			}
-			pt := -1
-			if tx.PayloadType != nil {
-				pt = *tx.PayloadType
+			evidence := repeaterRelayEvidence{
+				advert: tx.PayloadType != nil && *tx.PayloadType == payloadTypeAdvert,
 			}
-			t, ok := parseRelayTS(tx.FirstSeen)
-			parseCache[tx.ID] = parsedTx{t: t, ok: ok, pt: pt}
+			if !evidence.advert {
+				if observed, ok := parseRelayTS(tx.FirstSeen); ok {
+					evidence.seconds = observed.Unix()
+					evidence.nanoseconds = int32(observed.Nanosecond())
+					evidence.validTime = true
+				}
+			}
+			parseCache[tx.ID] = evidence
 		}
 	}
 	s.mu.RUnlock()
@@ -152,14 +171,11 @@ func (s *PacketStore) computeRepeaterRelayInfoMap(windowHours float64) map[strin
 					seen[tx.ID] = true
 				}
 				p, ok := parseCache[tx.ID]
-				if !ok {
-					continue
-				}
-				if p.pt == payloadTypeAdvert {
+				if !ok || p.advert {
 					continue
 				}
 				// #1751: scope accumulation is intentionally NOT gated on
-				// p.ok (timestamp parseability) — a packet with an
+				// p.validTime (timestamp parseability) — a packet with an
 				// unparseable first_seen still proves the repeater
 				// transported that scope. RelayCount/LastRelayed below
 				// remain timestamp-gated.
@@ -167,27 +183,27 @@ func (s *PacketStore) computeRepeaterRelayInfoMap(windowHours float64) map[strin
 				// #1902: it IS gated on full-pubkey attribution — a 1-byte
 				// hop cannot prove which of the nodes sharing that byte
 				// carried the packet.
-				if tx.ScopeName != nil && *tx.ScopeName != "" && !viaPrefix {
+				if scope := scopes[tx]; !viaPrefix && scope != "" {
 					if scopeSet == nil {
 						scopeSet = map[string]struct{}{}
 					}
-					scopeSet[*tx.ScopeName] = struct{}{}
+					scopeSet[scope] = struct{}{}
 				}
-				if !p.ok {
+				if !p.validTime {
 					continue
 				}
-				if p.t.After(cutoff24h) {
+				if p.after(cutoff24h) {
 					info.RelayCount24h++
 					if tx.RouteType != nil && *tx.RouteType == routeTypeFlood {
 						info.UnscopedRelayCount24h++
 					}
-					if p.t.After(cutoff1h) {
+					if p.after(cutoff1h) {
 						info.RelayCount1h++
 					}
 				}
 				if info.LastRelayed == "" || tx.FirstSeen > info.LastRelayed {
 					info.LastRelayed = tx.FirstSeen
-					if windowHours > 0 && p.t.After(windowCutoff) {
+					if windowHours > 0 && p.after(windowCutoff) {
 						info.RelayActive = true
 					} else if windowHours > 0 {
 						info.RelayActive = false

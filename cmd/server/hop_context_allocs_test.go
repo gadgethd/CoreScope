@@ -51,3 +51,18 @@ func TestBuildHopContextPubkeysOrderAndDedup(t *testing.T) {
 		}
 	}
 }
+
+func TestHopContextAvoidsRetainingUnrelatedDecodedFields(t *testing.T) {
+	_, pm := hopContextFixture()
+	tx := &StoreTx{DecodedJSON: `{"ackHash":"aabb","sequence":24}`}
+	if got := buildHopContextPubkeys(tx, pm); len(got) != 0 || tx.parsedDecoded != nil {
+		t.Fatalf("ACK created sender context or retained a decoded map: %v", got)
+	}
+	if got := tx.ParsedDecoded()["ackHash"]; got != "aabb" {
+		t.Fatalf("decoded packet lost its ACK field: %v", got)
+	}
+	escaped := &StoreTx{DecodedJSON: `{"pub\u004bey":"AaBb"}`}
+	if got := buildHopContextPubkeys(escaped, pm); len(got) != 1 || got[0] != "aabb" {
+		t.Fatalf("escaped sender key changed hop context: %v", got)
+	}
+}
