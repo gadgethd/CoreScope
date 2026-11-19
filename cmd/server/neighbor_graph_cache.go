@@ -46,14 +46,23 @@ func (s *Server) startNeighborGraphRecomputer(interval time.Duration, stop <-cha
 	if interval <= 0 {
 		interval = neighborGraphCacheInterval
 	}
-	go func() {
+	refresh := func() {
+		if s.store != nil {
+			if !s.store.analyticsWork.acquire(stop) {
+				return
+			}
+			defer s.store.analyticsWork.release()
+		}
 		s.recomputeNeighborGraphCache()
+	}
+	go func() {
+		refresh()
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
 			select {
 			case <-t.C:
-				s.recomputeNeighborGraphCache()
+				refresh()
 			case <-stop:
 				return
 			}

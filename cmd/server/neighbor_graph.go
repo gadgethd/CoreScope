@@ -321,11 +321,9 @@ func BuildFromStoreWithOptions(store *PacketStore, opts BuildOptions) *NeighborG
 		// the originator in src/dst, which is deliberately excluded here
 		// (would manufacture false edges at ~1/256 collision odds).
 		hasFullOriginator := isAdvert || isAnonReq
-		fromNode := extractFromNode(tx)
-		// Pre-compute lowered originator once per tx (not per observation).
 		fromLower := ""
-		if fromNode != "" {
-			fromLower = cachedToLower(lowerCache, fromNode)
+		if hasFullOriginator {
+			fromLower = cachedToLower(lowerCache, extractFromNode(tx))
 		}
 
 		for _, obs := range p.observations {
@@ -337,7 +335,7 @@ func BuildFromStoreWithOptions(store *PacketStore, opts BuildOptions) *NeighborG
 
 			if len(path) == 0 {
 				// Zero-hop
-				if hasFullOriginator && fromLower != "" {
+				if fromLower != "" {
 					if fromLower != observerPK { // self-edge guard
 						g.upsertEdge(fromLower, observerPK, "", observerPK, obs.SNR, parseTimestamp(obs.Timestamp))
 					}
@@ -346,7 +344,7 @@ func BuildFromStoreWithOptions(store *PacketStore, opts BuildOptions) *NeighborG
 			}
 
 			// Edge 1: originator ↔ path[0] — ADVERT and ANON_REQ only (#1777)
-			if hasFullOriginator && fromLower != "" {
+			if fromLower != "" {
 				firstHop := cachedToLower(lowerCache, path[0])
 				if fromLower != firstHop { // self-edge guard (shouldn't happen but spec says check)
 					if packetpath.MeetsPathTrust(len(path[0])/2, opts.PathTrust) {
