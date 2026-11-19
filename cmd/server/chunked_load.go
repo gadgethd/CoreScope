@@ -478,8 +478,9 @@ func (s *PacketStore) LoadChunked(chunkSize int) error {
 	// Post-load: pick best observation, build indexes — same shape as
 	// legacy Load().
 	s.mu.Lock()
+	displayPaths := make(loadParsedPaths)
 	for _, tx := range s.packets {
-		pickBestObservation(tx)
+		pickBestObservationWithPaths(tx, displayPaths)
 		s.trackedBytes += rechargeTx(tx)
 		s.indexByNode(tx)
 	}
@@ -543,6 +544,8 @@ func (s *PacketStore) scanAndMergeChunk(rows *sql.Rows, relayPM *prefixMap, cold
 
 	hopsSeen := make(map[string]bool)
 	seenTxIDs := make(map[int]bool)
+	paths := make(loadPathStrings)
+	var timestamps loadTimestamps
 	var maxID int64
 
 	// Scan overwrites every target on each row, so one set (and one
@@ -587,12 +590,13 @@ func (s *PacketStore) scanAndMergeChunk(rows *sql.Rows, relayPM *prefixMap, cold
 		hashStr := nullStrVal(hash)
 		tx := s.byHash[hashStr]
 		if tx == nil {
+			first := timestamps.transmission(nullStrVal(firstSeen))
 			tx = &StoreTx{
 				ID:          txID,
 				RawHex:      nullStrVal(rawHex),
 				Hash:        hashStr,
-				FirstSeen:   nullStrVal(firstSeen),
-				LatestSeen:  nullStrVal(firstSeen),
+				FirstSeen:   first,
+				LatestSeen:  first,
 				RouteType:   nullIntPtr(routeType),
 				PayloadType: nullIntPtr(payloadType),
 				DecodedJSON: nullStrVal(decodedJSON),
@@ -616,7 +620,7 @@ func (s *PacketStore) scanAndMergeChunk(rows *sql.Rows, relayPM *prefixMap, cold
 		if obsID.Valid {
 			oid := int(obsID.Int64)
 			obsIDStr := nullStrVal(observerID)
-			obsPJ := nullStrVal(pathJSON)
+			obsPJ := paths.share(nullStrVal(pathJSON))
 
 			n := observedRelayHopHexLen(nullStrVal(obsRawHex), obsPJ)
 			if obs := tx.mergeObservationEvidence(obsIDStr, obsPJ, n); obs != nil {
@@ -636,7 +640,7 @@ func (s *PacketStore) scanAndMergeChunk(rows *sql.Rows, relayPM *prefixMap, cold
 				Score:          nullIntPtr(score),
 				PathJSON:       obsPJ,
 				// Keep only this frame's relay eligibility, not its raw bytes.
-				Timestamp:      normalizeTimestamp(nullStrVal(obsTimestamp)),
+				Timestamp:      timestamps.observation(nullStrVal(obsTimestamp)),
 				relayHopHexLen: n,
 			}
 			obs.setRadioID(radioID)

@@ -669,8 +669,19 @@ func DecodePacket(hexString string, validateSignatures bool) (*DecodedPacket, er
 // route-independent identifier for the same logical packet. For TRACE packets,
 // path_len is included in the hash to match firmware behavior.
 func ComputeContentHash(rawHex string) string {
-	buf, err := hex.DecodeString(rawHex)
-	if err != nil || len(buf) < 2 {
+	return contentHash(rawHex, "")
+}
+
+// contentHash can share the existing hash string during the startup scan.
+func contentHash(rawHex, existing string) string {
+	var frame [256]byte
+	buf := frame[:]
+	if n := hex.DecodedLen(len(rawHex)); n > len(frame) {
+		buf = make([]byte, n)
+	}
+	n, err := hex.Decode(buf, []byte(rawHex))
+	buf = buf[:n]
+	if err != nil || n < 2 {
 		if len(rawHex) >= 16 {
 			return rawHex[:16]
 		}
@@ -709,7 +720,9 @@ func ComputeContentHash(rawHex string) string {
 	// Using the full header caused different hashes for the same logical packet
 	// when route type or version bits differed. See issue #786.
 	payloadType := (headerByte >> 2) & 0x0F
-	toHash := []byte{payloadType}
+	var hashInput [259]byte
+	hashInput[0] = payloadType
+	toHash := hashInput[:1]
 	if int(payloadType) == PayloadTRACE {
 		// Firmware uses uint16_t path_len (2 bytes, little-endian)
 		toHash = append(toHash, pathByte, 0x00)
@@ -717,7 +730,12 @@ func ComputeContentHash(rawHex string) string {
 	toHash = append(toHash, payload...)
 
 	h := sha256.Sum256(toHash)
-	return hex.EncodeToString(h[:])[:16]
+	var encoded [16]byte
+	hex.Encode(encoded[:], h[:8])
+	if existing == string(encoded[:]) {
+		return existing
+	}
+	return string(encoded[:])
 }
 
 // PayloadJSON serializes the payload to JSON for DB storage.

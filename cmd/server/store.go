@@ -60,7 +60,7 @@ type StoreTx struct {
 	LatestSeen          string // max observation timestamp (or FirstSeen if no observations)
 	UniqueObserverCount int    // cached count of distinct observer IDs
 	// Cached parsed fields (set once, read many)
-	parsedPath          []string               // cached parsePathJSON result
+	parsedPath          []string               // immutable cached parsePathJSON result
 	pathParsed          bool                   // whether parsedPath has been set
 	AdvertRouteEvidence uint8                  // union of known flood/direct-empty-path evidence
 	decodedOnce         sync.Once              // guards parsedDecoded
@@ -1054,6 +1054,8 @@ func (s *PacketStore) Load() error {
 	}
 	scanArgs = append(scanArgs, &radioID)
 
+	paths := make(loadPathStrings)
+	var timestamps loadTimestamps
 	for rows.Next() {
 		if err := rows.Scan(scanArgs...); err != nil {
 			log.Printf("[store] scan error: %v", err)
@@ -1063,12 +1065,13 @@ func (s *PacketStore) Load() error {
 		hashStr := nullStrVal(hash)
 		tx := s.byHash[hashStr]
 		if tx == nil {
+			first := timestamps.transmission(nullStrVal(firstSeen))
 			tx = &StoreTx{
 				ID:          txID,
 				RawHex:      nullStrVal(rawHex),
 				Hash:        hashStr,
-				FirstSeen:   nullStrVal(firstSeen),
-				LatestSeen:  nullStrVal(firstSeen),
+				FirstSeen:   first,
+				LatestSeen:  first,
 				RouteType:   nullIntPtr(routeType),
 				PayloadType: nullIntPtr(payloadType),
 				DecodedJSON: nullStrVal(decodedJSON),
@@ -1092,7 +1095,7 @@ func (s *PacketStore) Load() error {
 		if obsID.Valid {
 			oid := int(obsID.Int64)
 			obsIDStr := nullStrVal(observerID)
-			obsPJ := nullStrVal(pathJSON)
+			obsPJ := paths.share(nullStrVal(pathJSON))
 
 			n := observedRelayHopHexLen(nullStrVal(obsRawHex), obsPJ)
 			// Dedup the observation, but retain a later eligible frame's evidence.
@@ -1112,7 +1115,7 @@ func (s *PacketStore) Load() error {
 				RSSI:           nullFloatPtr(rssi),
 				Score:          nullIntPtr(score),
 				PathJSON:       obsPJ,
-				Timestamp:      normalizeTimestamp(nullStrVal(obsTimestamp)),
+				Timestamp:      timestamps.observation(nullStrVal(obsTimestamp)),
 				relayHopHexLen: n,
 			}
 			obs.setRadioID(radioID)
@@ -1177,8 +1180,9 @@ func (s *PacketStore) Load() error {
 	// indexByNode was called earlier (on StoreTx creation) before observations
 	// were appended, so tx.ResolvedPath was nil at that point — call it again
 	// now that pickBestObservation has propagated the best path.
+	displayPaths := make(loadParsedPaths)
 	for _, tx := range s.packets {
-		pickBestObservation(tx)
+		pickBestObservationWithPaths(tx, displayPaths)
 		s.trackedBytes += rechargeTx(tx)
 		s.indexByNode(tx)
 	}
@@ -1351,6 +1355,8 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 	localByTxID := make(map[int]*StoreTx)
 	localByObsID := make(map[int]*StoreObs)
 	localByObserver := make(map[string][]*StoreObs)
+	paths := make(loadPathStrings)
+	var timestamps loadTimestamps
 	// Issue #1558: accumulate the union of resolved_path relay-hop
 	// pubkeys per tx outside the lock. We unmarshal + dedupe here so the
 	// merge critical section below only does map-append work, mirroring
@@ -1404,12 +1410,13 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 		hashStr := nullStrVal(hash)
 		tx := localByHash[hashStr]
 		if tx == nil {
+			first := timestamps.transmission(nullStrVal(firstSeen))
 			tx = &StoreTx{
 				ID:          txID,
 				RawHex:      nullStrVal(rawHex),
 				Hash:        hashStr,
-				FirstSeen:   nullStrVal(firstSeen),
-				LatestSeen:  nullStrVal(firstSeen),
+				FirstSeen:   first,
+				LatestSeen:  first,
 				RouteType:   nullIntPtr(routeType),
 				PayloadType: nullIntPtr(payloadType),
 				DecodedJSON: nullStrVal(decodedJSON),
@@ -1427,7 +1434,7 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 		if obsID.Valid {
 			oid := int(obsID.Int64)
 			obsIDStr := nullStrVal(observerID)
-			obsPJ := nullStrVal(pathJSON)
+			obsPJ := paths.share(nullStrVal(pathJSON))
 
 			n := observedRelayHopHexLen(nullStrVal(obsRawHex), obsPJ)
 			if tx.mergeObservationEvidence(obsIDStr, obsPJ, n) != nil {
@@ -1445,7 +1452,7 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 				RSSI:           nullFloatPtr(rssi),
 				Score:          nullIntPtr(score),
 				PathJSON:       obsPJ,
-				Timestamp:      normalizeTimestamp(nullStrVal(obsTimestamp)),
+				Timestamp:      timestamps.observation(nullStrVal(obsTimestamp)),
 				relayHopHexLen: n,
 			}
 			obs.setRadioID(radioID)
@@ -1496,8 +1503,9 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 	}
 
 	// Pick best observation for each local packet before merging.
+	displayPaths := make(loadParsedPaths)
 	for _, tx := range localPackets {
-		pickBestObservation(tx)
+		pickBestObservationWithPaths(tx, displayPaths)
 		localTrackedBytes += rechargeTx(tx)
 	}
 
@@ -1860,8 +1868,12 @@ func (s *PacketStore) loadBackgroundChunks() {
 // pickBestObservation selects the observation with the longest path
 // and sets it as the transmission's display observation.
 func pickBestObservation(tx *StoreTx) {
+	pickBestObservationWithPaths(tx, nil)
+}
+
+func pickBestObservationWithPaths(tx *StoreTx, paths loadParsedPaths) {
 	if len(tx.Observations) == 0 {
-		setTxPath(tx, tx.PathJSON)
+		setTxPath(tx, tx.PathJSON, paths)
 		return
 	}
 	best := tx.Observations[0]
@@ -1879,19 +1891,19 @@ func pickBestObservation(tx *StoreTx) {
 	tx.SNR = best.SNR
 	tx.RSSI = best.RSSI
 	tx.Direction = best.Direction
-	setTxPath(tx, best.PathJSON)
+	setTxPath(tx, best.PathJSON, paths)
 }
 
 // setTxPath sets tx's display path and fills its parsed-path cache. It runs
 // where tx is written (s.mu held for writing, or tx not yet in the store),
 // so readers calling txGetParsedPath under s.mu.RLock find the cache full
 // instead of filling it concurrently (#2237).
-func setTxPath(tx *StoreTx, pathJSON string) {
+func setTxPath(tx *StoreTx, pathJSON string, paths loadParsedPaths) {
 	if tx.pathParsed && tx.PathJSON == pathJSON {
 		return
 	}
 	tx.PathJSON = pathJSON
-	tx.parsedPath = parsePathJSON(pathJSON)
+	tx.parsedPath = paths.parse(pathJSON)
 	tx.pathParsed = true
 }
 
@@ -3119,6 +3131,7 @@ func (s *PacketStore) ingestNewTransmissions(sinceID, limit int) ([]packetFields
 	txCount := 0
 	lastTxID := sinceID
 	lastObsID := 0
+	paths := make(loadPathStrings)
 
 	for rows.Next() {
 		var txID int
@@ -3167,7 +3180,7 @@ func (s *PacketStore) ingestNewTransmissions(sinceID, limit int) ([]packetFields
 			observerName:   internStr(nullStrVal(observerName)),
 			observerIATA:   internStr(nullStrVal(observerIATA)),
 			direction:      internStr(nullStrVal(direction)),
-			pathJSON:       nullStrVal(pathJSON),
+			pathJSON:       paths.share(nullStrVal(pathJSON)),
 			obsTS:          nullStrVal(obsTimestamp),
 			radioID:        radioID,
 			relayHopHexLen: observedRelayHopHexLen(nullStrVal(obsRawHex), nullStrVal(pathJSON)),
@@ -4234,7 +4247,7 @@ func txToMap(tx *StoreTx, includeObservations ...bool) map[string]interface{} {
 	}
 	// Include parsed path array to match Node.js output shape
 	if hops := txGetParsedPath(tx); len(hops) > 0 {
-		m["_parsedPath"] = hops
+		m["_parsedPath"] = slices.Clone(hops)
 	} else {
 		m["_parsedPath"] = nil
 	}
@@ -4810,14 +4823,19 @@ func (s *PacketStore) buildDistanceIndex() {
 		}
 	}
 
-	hops := make([]distHopRecord, 0, len(s.packets))
-	paths := make([]distPathRecord, 0, len(s.packets)/2)
+	// A retained packet only contributes a record when its path resolves
+	// to coordinates. Bound the initial allocation by that uncertainty.
+	const initialRecords = 4096
+	hops := make([]distHopRecord, 0, min(len(s.packets), initialRecords))
+	paths := make([]distPathRecord, 0, min(len(s.packets)/2, initialRecords))
 
 	// Per-tx hop resolver shared across the per-tx loop (#1197 perf).
 	resolveHop, setContext := s.hopResolverPerTx(pm)
+	scratch := make([]string, 0, 8)
 	for _, tx := range s.packets {
 		// Per-tx context for hop disambiguation (#1197).
-		setContext(buildHopContextPubkeys(tx, pm))
+		scratch = appendHopContextPubkeys(scratch[:0], tx, pm)
+		setContext(scratch)
 		txHops, txPath := computeDistancesForTx(tx, nodeByPk, repeaterSet, resolveHop)
 		if len(txHops) > 0 {
 			hops = append(hops, txHops...)
@@ -5352,12 +5370,17 @@ func (s *PacketStore) StartEvictionTicker() func() {
 //
 // Returned pubkeys are de-duplicated and lowercased.
 func buildHopContextPubkeys(tx *StoreTx, pm *prefixMap) []string {
+	return appendHopContextPubkeys(make([]string, 0, 8), tx, pm)
+}
+
+// appendHopContextPubkeys lets aggregations reuse storage after they have
+// merged the returned keys. Callers pass an empty destination slice.
+func appendHopContextPubkeys(out []string, tx *StoreTx, pm *prefixMap) []string {
 	if tx == nil || pm == nil {
 		return nil
 	}
 	// A handful of keys: de-duplicate by scanning out rather than with a
 	// map, which cost an allocation per call on every analytics pass.
-	out := make([]string, 0, 8)
 	add := func(pk string) {
 		if pk == "" {
 			return
@@ -5481,8 +5504,10 @@ func buildAggregateHopContextPubkeys(txs []*StoreTx, pm *prefixMap) []string {
 	}
 	seen := make(map[string]struct{}, 32)
 	var out []string
+	scratch := make([]string, 0, 8)
 	for _, tx := range txs {
-		for _, pk := range buildHopContextPubkeys(tx, pm) {
+		scratch = appendHopContextPubkeys(scratch[:0], tx, pm)
+		for _, pk := range scratch {
 			if _, ok := seen[pk]; ok {
 				continue
 			}
@@ -5536,27 +5561,16 @@ func computeDistancesForTx(tx *StoreTx, nodeByPk map[string]*nodeInfo, repeaterS
 		return nil, nil
 	}
 
-	resolved := make([]*nodeInfo, len(pathHops))
-	for i, h := range pathHops {
-		resolved[i] = resolveHop(h)
-	}
-
-	var senderNode *nodeInfo
-	if tx.DecodedJSON != "" {
-		if dec := tx.ParsedDecoded(); dec != nil {
-			if pk, ok := dec["pubKey"].(string); ok && pk != "" {
-				senderNode = nodeByPk[pk]
-			}
+	var chainBuffer [8]*nodeInfo
+	chain := chainBuffer[:0]
+	if sender := tx.decodedSenderPubkey(); sender != "" {
+		if node := nodeByPk[sender]; node != nil && node.HasGPS {
+			chain = append(chain, node)
 		}
 	}
-
-	chain := make([]*nodeInfo, 0, len(pathHops)+1)
-	if senderNode != nil && senderNode.HasGPS {
-		chain = append(chain, senderNode)
-	}
-	for _, r := range resolved {
-		if r != nil && r.HasGPS {
-			chain = append(chain, r)
+	for _, hop := range pathHops {
+		if node := resolveHop(hop); node != nil && node.HasGPS {
+			chain = append(chain, node)
 		}
 	}
 	if len(chain) < 2 {
@@ -7701,8 +7715,10 @@ func (s *PacketStore) aggregateTopology(uniqueNodes int, pm *prefixMap, areaNode
 	// Read all hop context before resolving a single prefix (#1197).
 	var contextPubkeys []string
 	seen := make(map[string]struct{}, 64)
+	scratch := make([]string, 0, 8)
 	if err := scan(func(tx *StoreTx) {
-		for _, pk := range buildHopContextPubkeys(tx, pm) {
+		scratch = appendHopContextPubkeys(scratch[:0], tx, pm)
+		for _, pk := range scratch {
 			if _, ok := seen[pk]; !ok {
 				seen[pk] = struct{}{}
 				contextPubkeys = append(contextPubkeys, pk)

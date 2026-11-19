@@ -5,6 +5,11 @@ import (
 	"sync"
 )
 
+const (
+	loadPathEntries = 256
+	loadPathBytes   = 2048
+)
+
 // internMax bounds the intern table. Observer IDs, names, IATA codes and
 // directions number in the hundreds on a busy instance, so the cap is only a
 // guard against an unexpected flood of distinct values.
@@ -47,4 +52,58 @@ func internStr(s string) string {
 	c = strings.Clone(s) // do not pin a larger buffer s may be a slice of
 	internTable[c] = c
 	return c
+}
+
+// loadPathStrings shares repeated path JSON within one load batch without
+// retaining one-off paths in the process-wide observer string table.
+type loadPathStrings map[string]string
+
+func (paths loadPathStrings) share(raw string) string {
+	if shared, ok := paths[raw]; ok {
+		return shared
+	}
+	if len(paths) < loadPathEntries && len(raw) <= loadPathBytes {
+		paths[raw] = raw
+	}
+	return raw
+}
+
+// loadParsedPaths shares immutable parsed paths during the bulk display pass.
+// The pool is discarded when the pass completes. Unique paths beyond its
+// budget still use the same decoder.
+type loadParsedPaths map[string][]string
+
+func (paths loadParsedPaths) parse(raw string) []string {
+	if parsed, ok := paths[raw]; ok {
+		return parsed
+	}
+	parsed := parsePathJSON(raw)
+	if paths != nil && len(paths) < loadPathEntries && len(raw) <= loadPathBytes {
+		paths[raw] = parsed
+	}
+	return parsed
+}
+
+// loadTimestamps shares adjacent equal timestamps in the loader's row order.
+// The first-seen and observation formats have separate caches. Only two
+// timestamp values from the current batch can be retained by the cache.
+type loadTimestamps struct {
+	firstSeen      string
+	observationRaw string
+	observationAt  string
+}
+
+func (times *loadTimestamps) transmission(raw string) string {
+	if times.firstSeen != raw {
+		times.firstSeen = raw
+	}
+	return times.firstSeen
+}
+
+func (times *loadTimestamps) observation(raw string) string {
+	if times.observationRaw != raw {
+		times.observationRaw = raw
+		times.observationAt = normalizeTimestamp(raw)
+	}
+	return times.observationAt
 }

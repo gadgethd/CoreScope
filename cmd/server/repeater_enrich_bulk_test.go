@@ -6,18 +6,13 @@ import (
 	"time"
 )
 
-func TestRepeaterRelayEvidencePreservesInstant(t *testing.T) {
-	observed, err := time.Parse(time.RFC3339Nano, "2026-11-18T13:00:00.000000001+01:00")
-	if err != nil {
-		t.Fatal(err)
-	}
-	evidence := repeaterRelayEvidence{
-		seconds: observed.Unix(), nanoseconds: int32(observed.Nanosecond()), validTime: true,
-	}
-	for _, cutoff := range []time.Time{observed.Add(-time.Nanosecond), observed.UTC(), observed.Add(time.Nanosecond)} {
-		if got, want := evidence.after(cutoff), observed.After(cutoff); got != want {
-			t.Fatalf("observation %v after %v = %v, want %v", observed, cutoff, got, want)
-		}
+func TestRepeaterRelayRefreshPreservesOffsetAndPrecision(t *testing.T) {
+	tx := &StoreTx{FirstSeen: time.Now().Add(-30 * time.Minute).
+		In(time.FixedZone("offset", 3600)).Format(time.RFC3339Nano)}
+	store := &PacketStore{byPathHop: map[string][]*StoreTx{"aa": {tx}}}
+	info := store.computeRepeaterRelayInfoMap(1)["aa"]
+	if info.RelayCount1h != 1 || info.RelayCount24h != 1 || !info.RelayActive || info.LastRelayed != tx.FirstSeen {
+		t.Fatalf("recent relay timestamp changed during refresh: %+v", info)
 	}
 }
 
