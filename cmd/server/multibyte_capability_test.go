@@ -72,11 +72,12 @@ func makeTestAdvert(pubkey string, hashSize int) *StoreTx {
 	prefix := strings.ToLower(pubkey[:hashSize*2])
 	rawHex := "01" + pathByte + prefix // flood header + path byte + hop prefix
 	return &StoreTx{
-		RawHex:      rawHex,
-		PayloadType: &pt,
-		DecodedJSON: string(decoded),
-		PathJSON:    `["` + prefix + `"]`,
-		FirstSeen:   recentTS(24),
+		selectedObservation: &StoreObs{PathJSON: `["` + prefix + `"]`},
+		RawHex:              rawHex,
+		PayloadType:         &pt,
+		DecodedJSON:         string(decoded),
+
+		FirstSeen: recentTS(24),
 	}
 }
 
@@ -123,10 +124,11 @@ func TestMultiByteCapability_Suspected(t *testing.T) {
 	rawHex := "01" + pathByte + "aabb"
 	pt := 1
 	pkt := &StoreTx{
-		RawHex:      rawHex,
-		PayloadType: &pt,
-		PathJSON:    `["aabb"]`,
-		FirstSeen:   recentTS(48),
+		selectedObservation: &StoreObs{PathJSON: `["aabb"]`},
+		RawHex:              rawHex,
+		PayloadType:         &pt,
+
+		FirstSeen: recentTS(48),
 	}
 	addTestPacket(store, pkt)
 
@@ -194,10 +196,11 @@ func TestMultiByteCapability_PrefixCollision(t *testing.T) {
 	rawHex := "01" + pathByte + "aa"
 	pt := 1
 	pkt := &StoreTx{
-		RawHex:      rawHex,
-		PayloadType: &pt,
-		PathJSON:    `["aa"]`,
-		FirstSeen:   recentTS(48),
+		selectedObservation: &StoreObs{PathJSON: `["aa"]`},
+		RawHex:              rawHex,
+		PayloadType:         &pt,
+
+		FirstSeen: recentTS(48),
 	}
 	addTestPacket(store, pkt)
 
@@ -237,10 +240,11 @@ func TestMultiByteCapability_TraceExcluded(t *testing.T) {
 	rawHex := "01" + pathByte + "aabb"
 	pt := 8
 	pkt := &StoreTx{
-		RawHex:      rawHex,
-		PayloadType: &pt,
-		PathJSON:    `["aabb"]`,
-		FirstSeen:   recentTS(48),
+		selectedObservation: &StoreObs{PathJSON: `["aabb"]`},
+		RawHex:              rawHex,
+		PayloadType:         &pt,
+
+		FirstSeen: recentTS(48),
 	}
 	addTestPacket(store, pkt)
 
@@ -269,10 +273,11 @@ func TestMultiByteCapability_NonTraceStillSuspected(t *testing.T) {
 	rawHex := "01" + pathByte + "aabb"
 	pt := 1
 	pkt := &StoreTx{
-		RawHex:      rawHex,
-		PayloadType: &pt,
-		PathJSON:    `["aabb"]`,
-		FirstSeen:   recentTS(48),
+		selectedObservation: &StoreObs{PathJSON: `["aabb"]`},
+		RawHex:              rawHex,
+		PayloadType:         &pt,
+
+		FirstSeen: recentTS(48),
 	}
 	addTestPacket(store, pkt)
 
@@ -304,10 +309,11 @@ func TestMultiByteCapability_ConfirmedUnaffectedByTraceExclusion(t *testing.T) {
 	rawHex := "01" + pathByte + "aabb"
 	pt := 8
 	pkt := &StoreTx{
-		RawHex:      rawHex,
-		PayloadType: &pt,
-		PathJSON:    `["aabb"]`,
-		FirstSeen:   recentTS(48),
+		selectedObservation: &StoreObs{PathJSON: `["aabb"]`},
+		RawHex:              rawHex,
+		PayloadType:         &pt,
+
+		FirstSeen: recentTS(48),
 	}
 	addTestPacket(store, pkt)
 
@@ -402,10 +408,11 @@ func TestMultiByteCapability_AdopterEvidenceTakesPrecedence(t *testing.T) {
 	rawHex := "01" + pathByte + "aabb"
 	pt := 1
 	pkt := &StoreTx{
-		RawHex:      rawHex,
-		PayloadType: &pt,
-		PathJSON:    `["aabb"]`,
-		FirstSeen:   recentTS(48),
+		selectedObservation: &StoreObs{PathJSON: `["aabb"]`},
+		RawHex:              rawHex,
+		PayloadType:         &pt,
+
+		FirstSeen: recentTS(48),
 	}
 	addTestPacket(store, pkt)
 

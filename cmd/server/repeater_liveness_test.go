@@ -23,10 +23,11 @@ func TestRepeaterRelayActivity_Active(t *testing.T) {
 	// the resolved-path entries that decode-window writes.
 	pt := 1
 	relayed := &StoreTx{
-		RawHex:      "0100",
-		PayloadType: &pt,
-		PathJSON:    `["aa"]`,
-		FirstSeen:   recentTS(2),
+		selectedObservation: &StoreObs{PathJSON: `["aa"]`},
+		RawHex:              "0100",
+		PayloadType:         &pt,
+
+		FirstSeen: recentTS(2),
 	}
 	store.mu.Lock()
 	relayed.ID = len(store.packets) + 1
@@ -67,7 +68,7 @@ func seedUnscopedRelayFixture(t *testing.T, hashPrefix string) (*PacketStore, st
 	flood := routeTypeFlood
 	direct := 2 // ROUTE_TYPE_DIRECT - scoped/directed, must NOT count as unscoped
 	mk := func(hash string, rt int) *StoreTx {
-		return &StoreTx{RawHex: "0100", PayloadType: &pt, RouteType: &rt, PathJSON: `["aa"]`, FirstSeen: recentTS(2), Hash: hash}
+		return &StoreTx{selectedObservation: &StoreObs{PathJSON: `["aa"]`}, RawHex: "0100", PayloadType: &pt, RouteType: &rt, FirstSeen: recentTS(2), Hash: hash}
 	}
 	store.mu.Lock()
 	for _, tx := range []*StoreTx{mk(hashPrefix+"unscoped-1", flood), mk(hashPrefix+"direct-1", direct)} {
@@ -142,10 +143,11 @@ func TestRepeaterRelayActivity_Stale(t *testing.T) {
 	pt := 1
 	staleTS := time.Now().UTC().Add(-48 * time.Hour).Format("2006-01-02T15:04:05.000Z")
 	old := &StoreTx{
-		RawHex:      "0100",
-		PayloadType: &pt,
-		PathJSON:    `["11"]`,
-		FirstSeen:   staleTS,
+		selectedObservation: &StoreObs{PathJSON: `["11"]`},
+		RawHex:              "0100",
+		PayloadType:         &pt,
+
+		FirstSeen: staleTS,
 	}
 	store.mu.Lock()
 	old.ID = len(store.packets) + 1
@@ -184,10 +186,11 @@ func TestRepeaterRelayActivity_IgnoresAdverts(t *testing.T) {
 	// Self-advert with the repeater as its own first hop. Should NOT count.
 	pt := 4
 	adv := &StoreTx{
-		RawHex:      "0140de",
-		PayloadType: &pt,
-		PathJSON:    `["de"]`,
-		FirstSeen:   recentTS(2),
+		selectedObservation: &StoreObs{PathJSON: `["de"]`},
+		RawHex:              "0140de",
+		PayloadType:         &pt,
+
+		FirstSeen: recentTS(2),
 	}
 	store.mu.Lock()
 	adv.ID = len(store.packets) + 1
@@ -237,10 +240,11 @@ func TestRepeaterRelayActivity_PrefixHop(t *testing.T) {
 	// does — under the raw hop key only, not the full pubkey.
 	pt := 1
 	tx := &StoreTx{
-		RawHex:      "0100",
-		PayloadType: &pt,
-		PathJSON:    `["a3"]`,
-		FirstSeen:   recentTS(2),
+		selectedObservation: &StoreObs{PathJSON: `["a3"]`},
+		RawHex:              "0100",
+		PayloadType:         &pt,
+
+		FirstSeen: recentTS(2),
 	}
 	store.mu.Lock()
 	tx.ID = len(store.packets) + 1
@@ -281,10 +285,11 @@ func TestRepeaterRelayActivity_DedupAcrossPrefixAndFullKey(t *testing.T) {
 
 	pt := 1
 	tx := &StoreTx{
-		RawHex:      "0100",
-		PayloadType: &pt,
-		PathJSON:    `["a3"]`,
-		FirstSeen:   recentTS(2),
+		selectedObservation: &StoreObs{PathJSON: `["a3"]`},
+		RawHex:              "0100",
+		PayloadType:         &pt,
+
+		FirstSeen: recentTS(2),
 	}
 	store.mu.Lock()
 	tx.ID = len(store.packets) + 1

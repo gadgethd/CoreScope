@@ -406,9 +406,12 @@ func main() {
 	// on-request compute-then-cache pattern for the default (region="",
 	// zero-window) analytics queries with a background refresh loop so
 	// reads always hit cache in <1ms.
+	retainedWorkReady := make(chan struct{})
+	analyticsIntervals := cfg.AnalyticsRecomputeIntervals()
+	analyticsIntervals.retainedWorkReady = retainedWorkReady
 	stopAnalyticsRecomp := store.StartAnalyticsRecomputers(
 		cfg.AnalyticsDefaultRecomputeInterval(),
-		cfg.AnalyticsRecomputeIntervals(),
+		analyticsIntervals,
 	)
 	defer stopAnalyticsRecomp()
 	log.Printf("[analytics-recompute] background recompute enabled (default=%s)", cfg.AnalyticsDefaultRecomputeInterval())
@@ -446,10 +449,16 @@ func main() {
 		log.Printf("[known-channels] disabled (knownChannelsUrl unset in config)")
 	}
 
-	// Radio settings observers listened on, over time (#1869). Small tables,
-	// reloaded once a minute; see radio_history.go.
+	// Refresh assignments on the current store after a public generation swap.
 	rhCtx, stopRadioHistory := context.WithCancel(context.Background())
-	runRadioHistory(rhCtx, database.conn)
+	runRadioHistory(rhCtx, database, func() *PacketStore {
+		if reader := hub.publicProjection; reader != nil {
+			reader.mu.Lock()
+			defer reader.mu.Unlock()
+			return reader.store
+		}
+		return store
+	})
 	defer stopRadioHistory()
 
 	// LoRa RF parameters from the MeshCore map (issue #1268). OPT-IN, like
@@ -597,6 +606,7 @@ func main() {
 	// Migrate old content hashes in background (one-time, idempotent).
 	go migrateContentHashesAsync(store, 5000, 100*time.Millisecond)
 
+	close(retainedWorkReady)
 	if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("[server] %v", err)
 	}

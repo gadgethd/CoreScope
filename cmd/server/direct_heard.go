@@ -28,6 +28,8 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"sort"
 	"strings"
 )
@@ -156,36 +158,40 @@ func directHeardNode(tx *StoreTx, obs *StoreObs, pm *prefixMap) string {
 func buildDirectHeardIndex(packets []*StoreTx, pm *prefixMap) directHeardIndex {
 	idx := make(directHeardIndex, 256)
 	for _, tx := range packets {
-		for _, obs := range tx.Observations {
-			if obs.ObserverID == "" || obs.isOwnTransmission() {
-				continue
-			}
-			pk := directHeardNode(tx, obs, pm)
-			if pk == "" {
-				continue
-			}
-			byObs := idx[pk]
-			if byObs == nil {
-				byObs = make(map[string]*directHeardAgg, 4)
-				idx[pk] = byObs
-			}
-			agg := byObs[obs.ObserverID]
-			if agg == nil {
-				agg = &directHeardAgg{ObserverName: obs.ObserverName}
-				byObs[obs.ObserverID] = agg
-			}
-			agg.Count++
-			if obs.SNR != nil {
-				agg.SNRSum += *obs.SNR
-				agg.SNRCount++
-			}
-			if obs.RSSI != nil {
-				agg.RSSISum += *obs.RSSI
-				agg.RSSICount++
-			}
-		}
+		idx.addPacket(tx, pm)
 	}
 	return idx
+}
+
+func (idx directHeardIndex) addPacket(tx *StoreTx, pm *prefixMap) {
+	for _, obs := range tx.Observations {
+		if obs.ObserverID == "" || obs.isOwnTransmission() {
+			continue
+		}
+		pk := directHeardNode(tx, obs, pm)
+		if pk == "" {
+			continue
+		}
+		byObs := idx[pk]
+		if byObs == nil {
+			byObs = make(map[string]*directHeardAgg, 4)
+			idx[pk] = byObs
+		}
+		agg := byObs[obs.ObserverID]
+		if agg == nil {
+			agg = &directHeardAgg{ObserverName: obs.ObserverName}
+			byObs[obs.ObserverID] = agg
+		}
+		agg.Count++
+		if obs.SNR != nil {
+			agg.SNRSum += *obs.SNR
+			agg.SNRCount++
+		}
+		if obs.RSSI != nil {
+			agg.RSSISum += *obs.RSSI
+			agg.RSSICount++
+		}
+	}
 }
 
 // computeDirectHeard rebuilds the whole index from the current store. Run by
@@ -195,10 +201,23 @@ func buildDirectHeardIndex(packets []*StoreTx, pm *prefixMap) directHeardIndex {
 //
 // Rebuilding wholesale also means eviction needs no bookkeeping — a pass
 // simply does not see transmissions that are gone.
-func (s *PacketStore) computeDirectHeard() directHeardIndex {
+func (s *PacketStore) computeDirectHeard(ctx context.Context) directHeardIndex {
+	_, pm := s.getCachedNodesAndPM()
+	if s.packetHistoryRequired() {
+		idx := make(directHeardIndex, 256)
+		err := s.db.withRetainedSnapshot(ctx, func(read *sql.Tx) error {
+			return s.db.visitRetainedPacketRows(ctx, read, "SELECT id FROM transmissions ORDER BY first_seen, id", nil,
+				", NULL", "", packetHydration{directReceptions: true}, func(packet *retainedPacket) {
+					idx.addPacket(packet.tx, pm)
+				})
+		})
+		if err != nil {
+			return nil
+		}
+		return idx
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	_, pm := s.getCachedNodesAndPM()
 	return buildDirectHeardIndex(s.packets, pm)
 }
 

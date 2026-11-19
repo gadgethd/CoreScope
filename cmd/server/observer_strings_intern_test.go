@@ -87,6 +87,25 @@ func TestObserverStringsShared_Load(t *testing.T) {
 	assertObserverStringsShared(t, store, 50)
 }
 
+func TestLoadTimestampsSharesAdjacentValues(t *testing.T) {
+	var timestamps loadTimestamps
+	first := timestamps.transmission(strings.Clone("2026-11-18T13:00:00Z"))
+	repeated := timestamps.transmission(strings.Clone(first))
+	if first != "2026-11-18T13:00:00Z" || unsafe.StringData(first) != unsafe.StringData(repeated) {
+		t.Fatal("adjacent first-seen rows should keep one exact string")
+	}
+	const stored = "2026-11-18 13:00:00"
+	observed := timestamps.observation(strings.Clone(stored))
+	repeated = timestamps.observation(strings.Clone(stored))
+	if observed != "2026-11-18T13:00:00.000Z" || unsafe.StringData(observed) != unsafe.StringData(repeated) {
+		t.Fatal("adjacent observations should keep one normalized string")
+	}
+	if timestamps.observation("unrecognized") != "unrecognized" || timestamps.observation("") != "" ||
+		timestamps.transmission("different") != "different" || timestamps.transmission("") != "" {
+		t.Fatal("different, unrecognized or empty timestamps must keep their existing representation")
+	}
+}
+
 func TestObserverStringsShared_LoadChunked(t *testing.T) {
 	store := openInternTestStore(t, 50)
 	if err := store.LoadChunked(10); err != nil {

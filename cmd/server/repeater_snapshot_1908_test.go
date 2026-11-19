@@ -41,24 +41,17 @@ func relaySnapshotStore1908(count, nodes, expired int) *PacketStore {
 
 func TestRelaySnapshotSurvivesEviction1908(t *testing.T) {
 	store := relaySnapshotStore1908(4, 8, 2)
-	store.mu.RLock()
-	snapshot := store.snapshotPathHopIndexLocked()
-	store.mu.RUnlock()
-	if len(snapshot) != 16 {
-		t.Fatalf("snapshot has %d buckets, want eight raw and eight resolved", len(snapshot))
+	before := store.computeRepeaterRelayInfoMap(24)
+	if len(before) != 16 {
+		t.Fatalf("snapshot has %d buckets, want eight raw and eight resolved", len(before))
 	}
 	if got := store.RunEviction(); got != 2 {
 		t.Fatalf("evicted %d transmissions, want 2", got)
 	}
-	for key, list := range snapshot {
-		if len(list) != 4 {
-			t.Fatalf("snapshot bucket %q has %d transmissions, want 4", key, len(list))
-		}
-		for i, tx := range list {
-			if tx == nil || tx.ID != i+1 {
-				t.Errorf("eviction changed snapshot bucket %q at slot %d: got %v, want tx %d", key, i, tx, i+1)
-				break
-			}
+	after := store.computeRepeaterRelayInfoMap(24)
+	for key, info := range before {
+		if info.RelayCount24h != 4 || after[key].RelayCount24h != 2 {
+			t.Errorf("bucket %q: before %d after %d, want 4 and 2", key, info.RelayCount24h, after[key].RelayCount24h)
 		}
 	}
 }
@@ -83,9 +76,8 @@ func TestRelayComputeConcurrentEviction1908(t *testing.T) {
 	}()
 	close(start)
 
-	// Either lock order is valid, including on a single CPU. The separate
-	// snapshot-preservation test deterministically checks bucket ownership;
-	// this exercises real concurrent callers without assuming a scheduler order.
+	// Either lock order is valid. Each concurrent rebuild must observe one
+	// complete iteration of the index, on either side of the eviction.
 	deadline := time.After(30 * time.Second)
 	select {
 	case got := <-evicted:
@@ -114,14 +106,12 @@ func BenchmarkRelaySnapshot1908(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				store.mu.RLock()
-				snapshot := store.snapshotPathHopIndexLocked()
-				store.mu.RUnlock()
+				snapshot := store.computeRepeaterRelayInfoMap(24)
 				if len(snapshot) != len(store.byPathHop) {
-					b.Fatal("snapshot lost a hop bucket")
+					b.Fatal("refresh lost a hop bucket")
 				}
 			}
-			b.ReportMetric(float64(size.tx*16), "entries/snapshot")
+			b.ReportMetric(float64(size.tx*16), "entries/refresh")
 		})
 	}
 }

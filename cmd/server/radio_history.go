@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"log"
 	"net/http"
+	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,23 +22,12 @@ import (
 // observers.radio keeps only the latest one. The ingestor records each
 // stretch of time an observer stayed on one setting in observer_radios, and
 // the radio id a multi-radio node puts on a packet (`rx_radio_id`) in the
-// sparse observation_radios, keyed by observation id (schema and reasoning:
-// internal/dbschema/observer_radios.go). The server keeps both in memory and
-// resolves the setting of an observation from its observer, its radio id
-// and its timestamp.
+// sparse observation_radios, keyed by observation id. SQLite supplies the ID
+// when the observation is loaded so it can leave memory with the packet.
 //
-// Freshness: the live poller calls refreshRadioHistory on every tick, so a
-// new stretch (a retune) and the radio id of a new observation are known
-// before that observation is broadcast. Both checks are primary-key lookups.
-// A full reload every radioHistoryFullReload also picks up what the cheap
-// checks cannot see: rows deleted by retention and an observation radio id
-// rewritten in place.
-//
-// Cost (rule 0): per observation one map lookup by observer id; observers
-// with a single stretch and no radio ids (nearly all) answer from it
-// directly, others add a binary search over their few stretches and, on a
-// multi-radio node, one map lookup by observation id.
-// BenchmarkTxMatchesRadio pins the filter over a 30K-packet store.
+// The poller refreshes stints before loading observations for broadcast. A
+// periodic reload also catches assignments rewritten in place by legacy
+// upserts. Historical SQLite reads always use the persisted assignment.
 
 const radioHistoryFullReload = 10 * time.Minute
 
@@ -54,32 +46,28 @@ type RadioStint struct {
 // observerRadios is one observer's history: the main radio and, on a
 // multi-radio node, each radio id. Stints are ordered by FirstSeen.
 type observerRadios struct {
-	main  []RadioStint
-	byID  map[string][]RadioStint
-	multi bool // has radio ids: observations may carry rx_radio_id
+	main []RadioStint
+	byID map[string][]RadioStint
 }
 
 type radioHistorySnapshot struct {
-	observers   map[string]*observerRadios
-	maxStintID  int64
-	stintCount  int64
-	maxObsRadio int64
+	observers  map[string]*observerRadios
+	maxStintID int64
+	stintCount int64
 }
 
 var (
-	radioHistory atomic.Pointer[radioHistorySnapshot]
-
-	// obsRadioIDs maps observation id -> rx_radio_id. Grows in place on every
-	// poll tick (new observations only), rebuilt on the full reload.
-	obsRadioMu  sync.RWMutex
-	obsRadioIDs = map[int]string{}
-
-	radioRefreshMu sync.Mutex // one refresh at a time (poller, full reload)
+	radioHistory   atomic.Pointer[radioHistorySnapshot]
+	radioRefreshMu sync.Mutex
 )
 
-func tableExists(conn *sql.DB, name string) bool {
-	var n int
-	return conn.QueryRow(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`, name).Scan(&n) == nil
+func radioTableExists(ctx context.Context, conn *sql.DB, name string) (bool, error) {
+	var present int
+	err := conn.QueryRowContext(ctx, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", name).Scan(&present)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // loadRadioStints reads observer_radios whole. A table the ingestor has not
@@ -87,8 +75,9 @@ func tableExists(conn *sql.DB, name string) bool {
 // is probed again on the next refresh.
 func loadRadioStints(conn *sql.DB) (*radioHistorySnapshot, error) {
 	snap := &radioHistorySnapshot{observers: map[string]*observerRadios{}}
-	if !tableExists(conn, "observer_radios") {
-		return snap, nil
+	present, err := radioTableExists(context.Background(), conn, "observer_radios")
+	if err != nil || !present {
+		return snap, err
 	}
 	rows, err := conn.Query(`SELECT id, observer_id, radio_id, radio, first_seen, last_seen
 		FROM observer_radios ORDER BY observer_id, radio_id, first_seen, id`)
@@ -118,7 +107,6 @@ func loadRadioStints(conn *sql.DB) (*radioHistorySnapshot, error) {
 				o.byID = map[string][]RadioStint{}
 			}
 			o.byID[st.RadioID] = append(o.byID[st.RadioID], st)
-			o.multi = true
 		}
 		if id > snap.maxStintID {
 			snap.maxStintID = id
@@ -128,93 +116,135 @@ func loadRadioStints(conn *sql.DB) (*radioHistorySnapshot, error) {
 	return snap, rows.Err()
 }
 
-// loadObservationRadios returns the rx_radio_id rows above sinceID.
-func loadObservationRadios(conn *sql.DB, sinceID int64) (map[int]string, int64, error) {
-	out := map[int]string{}
-	maxID := sinceID
-	if !tableExists(conn, "observation_radios") {
-		return out, maxID, nil
-	}
-	rows, err := conn.Query(`SELECT observation_id, radio_id FROM observation_radios
-		WHERE observation_id > ? ORDER BY observation_id`, sinceID)
-	if err != nil {
-		return nil, sinceID, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var id int64
-		var radioID string
-		if err := rows.Scan(&id, &radioID); err != nil {
-			return nil, sinceID, err
+// observationRadioSQL selects the optional sparse radio ID for observation alias o.
+func (db *DB) observationRadioSQL(ctx context.Context) (column, join string, err error) {
+	if !db.observationRadioTable.Load() {
+		present, err := radioTableExists(ctx, db.conn, "observation_radios")
+		if err != nil {
+			return "", "", err
 		}
-		out[int(id)] = radioID
-		maxID = id
+		if !present {
+			return ", NULL", "", nil
+		}
+		db.observationRadioTable.Store(true)
 	}
-	return out, maxID, rows.Err()
+	return ", radio_assignment.radio_id", " LEFT JOIN observation_radios radio_assignment ON radio_assignment.observation_id = o.id ", nil
 }
 
-// refreshRadioHistory brings the in-memory history up to date. full=false
-// is the per-tick check: reload stretches only when one was added or removed,
-// and append observation radio ids above the last one seen.
-func refreshRadioHistory(conn *sql.DB, full bool) {
-	if conn == nil {
-		return
+func (obs *StoreObs) setRadioID(id sql.NullString) {
+	if !id.Valid || id.String == "" {
+		obs.radioID.Store(nil)
+	} else if current := obs.radioID.Load(); current == nil || *current != id.String {
+		radioID := id.String
+		obs.radioID.Store(&radioID)
 	}
+}
+
+func (obs *StoreObs) radioIDBytes() int64 {
+	if id := obs.radioID.Load(); id != nil {
+		return int64(strHdr + len(*id))
+	}
+	return 0
+}
+
+func refreshRadioHistory(conn *sql.DB, full bool) {
 	radioRefreshMu.Lock()
 	defer radioRefreshMu.Unlock()
-
-	cur := radioHistory.Load()
-	reloadStints := full || cur == nil
-	if !reloadStints && tableExists(conn, "observer_radios") {
+	if current := radioHistory.Load(); current != nil && !full {
+		present, err := radioTableExists(context.Background(), conn, "observer_radios")
+		if err != nil {
+			log.Printf("[radio-history] schema check failed: %v", err)
+			return
+		}
+		if !present {
+			return
+		}
 		var maxID, count int64
 		if err := conn.QueryRow(`SELECT COALESCE(MAX(id), 0), COUNT(*) FROM observer_radios`).Scan(&maxID, &count); err != nil {
 			log.Printf("[radio-history] check failed: %v", err)
 			return
 		}
-		reloadStints = maxID != cur.maxStintID || count != cur.stintCount
-	}
-	next := cur
-	if reloadStints {
-		snap, err := loadRadioStints(conn)
-		if err != nil {
-			log.Printf("[radio-history] reload failed: %v", err)
+		if maxID == current.maxStintID && count == current.stintCount {
 			return
 		}
-		if cur != nil && !full {
-			snap.maxObsRadio = cur.maxObsRadio
-		}
-		next = snap
-	} else {
-		c := *cur
-		next = &c
 	}
-
-	since := next.maxObsRadio
-	if full {
-		since = 0
-	}
-	ids, maxID, err := loadObservationRadios(conn, since)
+	snapshot, err := loadRadioStints(conn)
 	if err != nil {
-		log.Printf("[radio-history] observation radios: %v", err)
+		log.Printf("[radio-history] reload failed: %v", err)
 		return
 	}
-	next.maxObsRadio = maxID
-	obsRadioMu.Lock()
-	if full {
-		obsRadioIDs = ids
-	} else {
-		for k, v := range ids {
-			obsRadioIDs[k] = v
-		}
-	}
-	obsRadioMu.Unlock()
-	radioHistory.Store(next)
+	radioHistory.Store(snapshot)
 }
 
-// runRadioHistory loads the history now and fully again every
-// radioHistoryFullReload until ctx ends. The poller does the per-tick part.
-func runRadioHistory(ctx context.Context, conn *sql.DB) {
-	refreshRadioHistory(conn, true)
+// refreshObservationRadioIDs rechecks sparse assignments for cached rows only.
+// Close each SQLite cursor before updating the store so SQL never holds s.mu.
+func (s *PacketStore) refreshObservationRadioIDs(ctx context.Context) error {
+	_, join, err := s.db.observationRadioSQL(ctx)
+	if err != nil || join == "" {
+		return err
+	}
+	snapshot := radioHistory.Load()
+	var ids []int
+	s.mu.RLock()
+	for id, obs := range s.byObsID {
+		if obs.radioID.Load() != nil || snapshot.hasRadioIDs(obs.ObserverID) {
+			ids = append(ids, id)
+		}
+	}
+	s.mu.RUnlock()
+
+	sort.Ints(ids)
+	for batch := range slices.Chunk(ids, 512) {
+		assignments, err := s.db.observationRadioIDs(ctx, batch)
+		if err != nil {
+			return err
+		}
+		s.mu.Lock()
+		for _, id := range batch {
+			if obs := s.byObsID[id]; obs != nil {
+				prior := obs.radioIDBytes()
+				obs.setRadioID(assignments[id])
+				s.trackedBytes += obs.radioIDBytes() - prior
+			}
+		}
+		s.mu.Unlock()
+	}
+	return nil
+}
+
+func (h *radioHistorySnapshot) hasRadioIDs(observer string) bool {
+	if h == nil {
+		return false
+	}
+	o := h.observers[observer]
+	return o != nil && len(o.byID) > 0
+}
+
+func (db *DB) observationRadioIDs(ctx context.Context, ids []int) (map[int]sql.NullString, error) {
+	tokens := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	rows, err := db.conn.QueryContext(ctx, `SELECT observation_id, radio_id FROM observation_radios WHERE observation_id IN (`+tokens+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	assignments := make(map[int]sql.NullString, len(args))
+	for rows.Next() {
+		var id int
+		var radio sql.NullString
+		if err := rows.Scan(&id, &radio); err != nil {
+			return nil, err
+		}
+		assignments[id] = radio
+	}
+	return assignments, rows.Err()
+}
+
+func runRadioHistory(ctx context.Context, db *DB, currentStore func() *PacketStore) {
+	refreshRadioHistory(db.conn, true)
 	go func() {
 		t := time.NewTicker(radioHistoryFullReload)
 		defer t.Stop()
@@ -223,7 +253,12 @@ func runRadioHistory(ctx context.Context, conn *sql.DB) {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				refreshRadioHistory(conn, true)
+				refreshRadioHistory(db.conn, true)
+				if store := currentStore(); store != nil {
+					if err := store.refreshObservationRadioIDs(ctx); err != nil {
+						log.Printf("[radio-history] observation assignments: %v", err)
+					}
+				}
 			}
 		}
 	}()
@@ -232,9 +267,8 @@ func runRadioHistory(ctx context.Context, conn *sql.DB) {
 // radioAt returns the setting the observer was on at ts, "" when it never
 // reported one. Before its first recorded stretch the first one is assumed:
 // the history starts when this feature was deployed, seeded with each
-// observer's setting of that moment. obsID is consulted only for multi-radio
-// observers.
-func (h *radioHistorySnapshot) radioAt(observer string, obsID int, ts string) string {
+// observer's setting at that time. An unrecognised ID uses the main radio.
+func (h *radioHistorySnapshot) radioAt(observer, radioID, ts string) string {
 	if h == nil || observer == "" {
 		return ""
 	}
@@ -243,13 +277,8 @@ func (h *radioHistorySnapshot) radioAt(observer string, obsID int, ts string) st
 		return ""
 	}
 	stints := o.main
-	if o.multi {
-		obsRadioMu.RLock()
-		id := obsRadioIDs[obsID]
-		obsRadioMu.RUnlock()
-		if s := o.byID[id]; id != "" && len(s) > 0 {
-			stints = s
-		}
+	if assigned := o.byID[radioID]; len(assigned) > 0 {
+		stints = assigned
 	}
 	switch len(stints) {
 	case 0:
@@ -267,8 +296,16 @@ func (h *radioHistorySnapshot) radioAt(observer string, obsID int, ts string) st
 }
 
 // observationRadio is the setting one observation was heard on.
-func observationRadio(obsID int, observer, ts string) string {
-	return radioHistory.Load().radioAt(observer, obsID, ts)
+func observationRadio(obs *StoreObs) string {
+	return radioHistory.Load().radioForObservation(obs)
+}
+
+func (h *radioHistorySnapshot) radioForObservation(obs *StoreObs) string {
+	id := ""
+	if assignment := obs.radioID.Load(); assignment != nil {
+		id = *assignment
+	}
+	return h.radioAt(obs.ObserverID, id, obs.Timestamp)
 }
 
 // txRadio is the setting of the observation a transmission is displayed by
@@ -277,20 +314,20 @@ func txRadio(tx *StoreTx) string {
 	h := radioHistory.Load()
 	var fallback *StoreObs
 	for _, o := range tx.Observations {
-		if o.ObserverID != tx.ObserverID {
+		if o.ObserverID != tx.displayObservation().ObserverID {
 			continue
 		}
-		if o.PathJSON == tx.PathJSON {
-			return h.radioAt(o.ObserverID, o.ID, o.Timestamp)
+		if o.PathJSON == tx.displayObservation().PathJSON {
+			return h.radioForObservation(o)
 		}
 		if fallback == nil {
 			fallback = o
 		}
 	}
 	if fallback != nil {
-		return h.radioAt(fallback.ObserverID, fallback.ID, fallback.Timestamp)
+		return h.radioForObservation(fallback)
 	}
-	return h.radioAt(tx.ObserverID, 0, tx.FirstSeen)
+	return h.radioAt(tx.displayObservation().ObserverID, "", tx.FirstSeen)
 }
 
 // txMatchesRadio reports whether some observation of tx was heard on radio
@@ -301,7 +338,7 @@ func txMatchesRadio(h *radioHistorySnapshot, tx *StoreTx, radio string, observer
 		if observers != nil && !observers[obs.ObserverID] {
 			continue
 		}
-		if h.radioAt(obs.ObserverID, obs.ID, obs.Timestamp) == radio {
+		if h.radioForObservation(obs) == radio {
 			return true
 		}
 	}

@@ -53,7 +53,7 @@ func TestRelayAirtimeShare_AdvertRouting(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tx := advertAirtimeTx(1, tc.route, tc.raw)
-			tx.PathJSON = tc.path // Longest observation's display path is not the original path.
+			tx.selectedObservation = &StoreObs{PathJSON: tc.path} // Longest observation's display path is not the original path.
 			result := newRelayAirtimeShareTestStore([]*StoreTx{tx}).computeRelayAirtimeShare(TimeWindow{})
 			rows := result["rows"].([]map[string]interface{})
 			if len(rows) != 1 || rows[0]["advert_kind"] != tc.want {

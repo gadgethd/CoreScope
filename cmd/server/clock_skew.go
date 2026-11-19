@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"math"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // ── Clock Skew Severity ────────────────────────────────────────────────────────
@@ -191,13 +194,21 @@ type txSkewResult = map[string]*NodeClockSkew
 
 // ClockSkewEngine computes and caches clock skew data for nodes and observers.
 type ClockSkewEngine struct {
-	mu              sync.RWMutex
-	observerOffsets map[string]float64 // observerID → calibrated offset (seconds)
-	observerSamples map[string]int     // observerID → number of multi-observer packets used
-	nodeSkew        txSkewResult
-	hashEvidence    map[string][]hashEvidenceEntry // hash → per-observer raw/corrected data
-	lastComputed    time.Time
-	computeInterval time.Duration
+	mu                     sync.RWMutex
+	observerOffsets        map[string]float64 // observerID → calibrated offset (seconds)
+	observerSamples        map[string]int     // observerID → number of multi-observer packets used
+	nodeSkew               txSkewResult
+	hashEvidence           map[string][]hashEvidenceEntry // hash → per-observer raw/corrected data
+	lastComputed           time.Time
+	computeInterval        time.Duration
+	retainedCalibration    *clockCalibration
+	retainedCalibrationRun singleflight.Group
+}
+
+type clockCalibration struct {
+	offsets map[string]float64
+	counts  map[string]int
+	at      time.Time
 }
 
 // hashEvidenceEntry stores raw evidence per observer per hash, cached during Recompute.
@@ -225,6 +236,7 @@ func NewClockSkewEngine() *ClockSkewEngine {
 func (e *ClockSkewEngine) Invalidate() {
 	e.mu.Lock()
 	e.lastComputed = time.Time{}
+	e.retainedCalibration = nil
 	e.mu.Unlock()
 }
 
@@ -285,30 +297,21 @@ func collectSamples(store *PacketStore) []skewSample {
 
 	samples := make([]skewSample, 0, len(adverts)*2)
 	for _, tx := range adverts {
-		decoded := tx.ParsedDecoded()
-		if decoded == nil {
-			continue
-		}
-		// Extract advert timestamp from decoded JSON.
-		advertTS := extractTimestamp(decoded)
-		if advertTS <= 0 {
-			continue
-		}
-		// Sanity: skip timestamps before year 2020 or after year 2100.
-		if advertTS < 1577836800 || advertTS > 4102444800 {
-			continue
-		}
+		samples = appendSkewSamples(samples, tx)
+	}
+	return samples
+}
 
-		for _, obs := range tx.Observations {
-			obsTS := parseISO(obs.Timestamp)
-			if obsTS <= 0 {
-				continue
-			}
+func appendSkewSamples(samples []skewSample, tx *StoreTx) []skewSample {
+	decoded := tx.ParsedDecoded()
+	advertTS := extractTimestamp(decoded)
+	if advertTS < 1577836800 || advertTS > 4102444800 {
+		return samples
+	}
+	for _, obs := range tx.Observations {
+		if obsTS := parseISO(obs.Timestamp); obsTS > 0 {
 			samples = append(samples, skewSample{
-				advertTS:   advertTS,
-				observedTS: obsTS,
-				observerID: obs.ObserverID,
-				hash:       tx.Hash,
+				advertTS: advertTS, observedTS: obsTS, observerID: obs.ObserverID, hash: tx.Hash,
 			})
 		}
 	}
@@ -376,25 +379,28 @@ func calibrateObservers(samples []skewSample) (map[string]float64, map[string]in
 		byHash[s.hash] = append(byHash[s.hash], s)
 	}
 
-	// For each multi-observer packet, compute per-observer deviation from median.
-	deviations := make(map[string][]float64) // observerID → list of deviations
+	deviations := make(map[string][]float64)
 	for _, group := range byHash {
-		if len(group) < 2 {
-			continue // single-observer packet, can't calibrate
-		}
-		// Compute median observation timestamp for this packet.
-		obsTimes := make([]float64, len(group))
-		for i, s := range group {
-			obsTimes[i] = float64(s.observedTS)
-		}
-		medianObs := median(obsTimes)
-		for _, s := range group {
-			dev := float64(s.observedTS) - medianObs
-			deviations[s.observerID] = append(deviations[s.observerID], dev)
-		}
+		addObserverDeviations(deviations, group)
 	}
+	return observerClockOffsets(deviations)
+}
 
-	// Each observer's offset = median of its deviations.
+func addObserverDeviations(deviations map[string][]float64, group []skewSample) {
+	if len(group) < 2 {
+		return
+	}
+	obsTimes := make([]float64, len(group))
+	for i, s := range group {
+		obsTimes[i] = float64(s.observedTS)
+	}
+	medianObs := median(obsTimes)
+	for _, s := range group {
+		deviations[s.observerID] = append(deviations[s.observerID], float64(s.observedTS)-medianObs)
+	}
+}
+
+func observerClockOffsets(deviations map[string][]float64) (map[string]float64, map[string]int) {
 	offsets := make(map[string]float64, len(deviations))
 	counts := make(map[string]int, len(deviations))
 	for obsID, devs := range deviations {
@@ -534,6 +540,83 @@ func (s *PacketStore) getNodeClockSkewLocked(pubkey string) *NodeClockSkew {
 	s.clockSkew.mu.RLock()
 	defer s.clockSkew.mu.RUnlock()
 
+	return summarizeNodeClockSkew(pubkey, txs, s.clockSkew.nodeSkew, s.clockSkew.hashEvidence)
+}
+
+func (s *PacketStore) readNodeClockSkew(ctx context.Context, pubkey string) (*NodeClockSkew, error) {
+	if !s.packetHistoryRequired() {
+		return s.GetNodeClockSkew(pubkey), nil
+	}
+	calibration, err := s.retainedClockOffsets(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var ownSamples []skewSample
+	var ownAdverts []*StoreTx
+	advert := PayloadADVERT
+	scope := retainedHistoryScope{query: PacketQuery{Type: &advert}, advertOrigin: strings.ToLower(pubkey)}
+	err = s.visitRetainedHistory(ctx, scope, func(packet *retainedPacket) {
+		tx := packet.tx
+		if txOriginatedBy(tx, pubkey) {
+			n := len(ownSamples)
+			ownSamples = appendSkewSamples(ownSamples, tx)
+			if len(ownSamples) > n {
+				ownAdverts = append(ownAdverts, tx)
+			}
+		}
+	})
+	if err != nil || len(ownSamples) == 0 {
+		return nil, err
+	}
+	skews, evidence := computeNodeSkew(ownSamples, calibration.offsets)
+	return summarizeNodeClockSkew(pubkey, ownAdverts, skews, evidence), ctx.Err()
+}
+
+func (s *PacketStore) retainedClockOffsets(ctx context.Context) (*clockCalibration, error) {
+	engine := s.clockSkew
+	snapshot := func() *clockCalibration {
+		engine.mu.RLock()
+		defer engine.mu.RUnlock()
+		if current := engine.retainedCalibration; current != nil && time.Since(current.at) < engine.computeInterval {
+			return current
+		}
+		return nil
+	}
+	if current := snapshot(); current != nil {
+		return current, nil
+	}
+	future := engine.retainedCalibrationRun.DoChan("observers", func() (any, error) {
+		if current := snapshot(); current != nil {
+			return current, nil
+		}
+		deviations := make(map[string][]float64)
+		advert := PayloadADVERT
+		scope := retainedHistoryScope{query: PacketQuery{Type: &advert}}
+		err := s.visitRetainedHistory(ctx, scope, func(packet *retainedPacket) {
+			addObserverDeviations(deviations, appendSkewSamples(nil, packet.tx))
+		})
+		if err != nil {
+			return nil, err
+		}
+		offsets, counts := observerClockOffsets(deviations)
+		current := &clockCalibration{offsets: offsets, counts: counts, at: time.Now()}
+		engine.mu.Lock()
+		engine.retainedCalibration = current
+		engine.mu.Unlock()
+		return current, nil
+	})
+	select {
+	case result := <-future:
+		if result.Err != nil {
+			return nil, result.Err
+		}
+		return result.Val.(*clockCalibration), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func summarizeNodeClockSkew(pubkey string, txs []*StoreTx, skews txSkewResult, evidence map[string][]hashEvidenceEntry) *NodeClockSkew {
 	var allSkews []float64
 	var lastSkew float64
 	var lastObsTS, lastAdvTS int64
@@ -551,7 +634,7 @@ func (s *PacketStore) getNodeClockSkewLocked(pubkey string) *NodeClockSkew {
 			// txOriginatedBy and #1816/#1818.
 			continue
 		}
-		cs, ok := s.clockSkew.nodeSkew[tx.Hash]
+		cs, ok := skews[tx.Hash]
 		if !ok {
 			continue
 		}
@@ -720,7 +803,7 @@ func (s *PacketStore) getNodeClockSkewLocked(pubkey string) *NodeClockSkew {
 			// above — don't show relayed adverts as this node's evidence.
 			continue
 		}
-		ev, ok := s.clockSkew.hashEvidence[tx.Hash]
+		ev, ok := evidence[tx.Hash]
 		if !ok || len(ev) == 0 {
 			continue
 		}
@@ -740,7 +823,7 @@ func (s *PacketStore) getNodeClockSkewLocked(pubkey string) *NodeClockSkew {
 	var recentEvidence []HashEvidence
 	var calSummary CalibrationSummary
 	for _, eh := range evidenceHashes {
-		entries := s.clockSkew.hashEvidence[eh.hash]
+		entries := evidence[eh.hash]
 		var observers []HashEvidenceObserver
 		var corrSkews []float64
 		for _, e := range entries {
@@ -861,6 +944,70 @@ func (s *PacketStore) computeFleetClockSkewForArea(area string) []*NodeClockSkew
 	return results
 }
 
+func (s *PacketStore) readFleetClockSkew(ctx context.Context, area string) ([]*NodeClockSkew, error) {
+	if !s.packetHistoryRequired() {
+		return s.GetFleetClockSkew(area), nil
+	}
+	calibration, err := s.retainedClockOffsets(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var areaNodes map[string]bool
+	if area != "" {
+		areaNodes = s.resolveAreaNodes(area)
+	}
+	allNodes, _ := s.getCachedNodesAndPM()
+	nameMap := make(map[string]nodeInfo, len(allNodes))
+	for _, node := range allNodes {
+		nameMap[node.PublicKey] = node
+	}
+
+	results := []*NodeClockSkew{}
+	var current string
+	var samples []skewSample
+	var adverts []*StoreTx
+	flush := func() {
+		if len(samples) == 0 {
+			return
+		}
+		skews, evidence := computeNodeSkew(samples, calibration.offsets)
+		summary := summarizeNodeClockSkew(current, adverts, skews, evidence)
+		if summary != nil {
+			if node, ok := nameMap[current]; ok {
+				summary.NodeName, summary.NodeRole = node.Name, node.Role
+			}
+			summary.Samples, summary.RecentHashEvidence, summary.CalibrationSummary = nil, nil, nil
+			results = append(results, summary)
+		}
+		samples = nil
+		adverts = nil
+	}
+	advert := PayloadADVERT
+	scope := retainedHistoryScope{query: PacketQuery{Type: &advert}, groupByOrigin: true}
+	err = s.visitRetainedHistory(ctx, scope, func(packet *retainedPacket) {
+		tx := packet.tx
+		raw, _ := tx.ParsedDecoded()["pubKey"].(string)
+		pubkey := strings.ToLower(raw)
+		if pubkey == "" || (areaNodes != nil && !areaNodes[pubkey]) {
+			return
+		}
+		if current != pubkey {
+			flush()
+			current = pubkey
+		}
+		n := len(samples)
+		samples = appendSkewSamples(samples, tx)
+		if len(samples) > n {
+			adverts = append(adverts, tx)
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	flush()
+	return results, ctx.Err()
+}
+
 // GetObserverCalibrations returns the current observer clock offsets,
 // preferring the steady-state recomputer snapshot (issue #1265). Falls
 // back to an on-request compute when the recomputer is not running.
@@ -889,12 +1036,27 @@ func (s *PacketStore) computeObserverCalibrations() []ObserverCalibration {
 	s.clockSkew.mu.RLock()
 	defer s.clockSkew.mu.RUnlock()
 
-	result := make([]ObserverCalibration, 0, len(s.clockSkew.observerOffsets))
-	for obsID, offset := range s.clockSkew.observerOffsets {
+	return formatObserverCalibrations(s.clockSkew.observerOffsets, s.clockSkew.observerSamples)
+}
+
+func (s *PacketStore) readObserverCalibrations(ctx context.Context) ([]ObserverCalibration, error) {
+	if !s.packetHistoryRequired() {
+		return s.GetObserverCalibrations(), nil
+	}
+	calibration, err := s.retainedClockOffsets(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return formatObserverCalibrations(calibration.offsets, calibration.counts), nil
+}
+
+func formatObserverCalibrations(offsets map[string]float64, counts map[string]int) []ObserverCalibration {
+	result := make([]ObserverCalibration, 0, len(offsets))
+	for obsID, offset := range offsets {
 		result = append(result, ObserverCalibration{
 			ObserverID: obsID,
 			OffsetSec:  round(offset, 1),
-			Samples:    s.clockSkew.observerSamples[obsID],
+			Samples:    counts[obsID],
 		})
 	}
 	// Sort by absolute offset descending.

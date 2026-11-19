@@ -38,11 +38,14 @@ const routeTypeNonTransportSQL = "route_type IN (1, 2)"
 
 // DB wraps a read-only connection to the MeshCore SQLite database.
 type DB struct {
+	observationRadioTable   atomic.Bool // optional observation_radios table, re-probed until present
 	advertEvidenceTable     atomic.Bool
 	txRewriteFeedTable      atomic.Bool // tx_rewrite_feed present (#2107); re-probed while absent
 	clientNodeNamesTable    atomic.Bool // client_node_names present; re-probed while absent (clientNodeNamesPresent)
 	inactiveNodesTable      atomic.Bool // inactive_nodes present; re-probed while absent (clientNameHeard)
 	advertEvidenceReadHook  func()      // test-only: immediately before a bulk mask query
+	retainedScanInit        sync.Once
+	retainedScanSlot        chan struct{}
 	conn                    *sql.DB
 	path                    string // filesystem path to the database file
 	isV3                    bool   // v3 schema: observer_idx in observations (vs observer_id in v2)
@@ -719,12 +722,15 @@ type PacketQuery struct {
 	ExpandObservations bool   // when true, include observation sub-maps in txToMap output
 }
 
+// packetFields is the wire representation shared by the packet page formatters.
+type packetFields = map[string]interface{}
+
 // PacketResult wraps paginated packet list.
 type PacketResult struct {
-	Packets []map[string]interface{} `json:"packets"`
-	Total   int                      `json:"total"`
-	Limit   int                      `json:"limit"`
-	Offset  int                      `json:"offset"`
+	Packets []packetFields `json:"packets"`
+	Total   int            `json:"total"`
+	Limit   int            `json:"limit"`
+	Offset  int            `json:"offset"`
 }
 
 // QueryPackets returns paginated, filtered packets as transmissions (matching Node.js shape).

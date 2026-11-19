@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -50,15 +51,15 @@ func TestNodeHealth_CanRelayCaseInsensitive_Issue1290(t *testing.T) {
 	routeFlood := RouteFlood
 	payloadAdvert := PayloadADVERT
 	tx := &StoreTx{
-		Hash:             "1290casebadge00",
-		FirstSeen:        now,
-		RouteType:        &routeFlood,
-		PayloadType:      &payloadAdvert,
-		DecodedJSON:      `{"type":"ADVERT","pubKey":"` + nodePubkey + `"}`,
-		SNR:              &snr,
+		selectedObservation: &StoreObs{SNR: &snr, ObserverID: obsIDMixed, ObserverName: "ListenerOnly"},
+		Hash:                "1290casebadge00",
+		FirstSeen:           now,
+		RouteType:           &routeFlood,
+		PayloadType:         &payloadAdvert,
+		DecodedJSON:         `{"type":"ADVERT","pubKey":"` + nodePubkey + `"}`,
+
 		ObservationCount: 1,
-		ObserverID:       obsIDMixed,
-		ObserverName:     "ListenerOnly",
+
 		Observations: []*StoreObs{{
 			ObserverID:   obsIDMixed,
 			ObserverName: "ListenerOnly",
@@ -73,7 +74,7 @@ func TestNodeHealth_CanRelayCaseInsensitive_Issue1290(t *testing.T) {
 	srv.store.byNode[nodePubkey] = append(srv.store.byNode[nodePubkey], tx)
 	srv.store.packets = append(srv.store.packets, tx)
 	srv.store.mu.Unlock()
-	srv.store.publishDirectHeard(srv.store.computeDirectHeard())
+	srv.store.publishDirectHeard(srv.store.computeDirectHeard(context.Background()))
 
 	req := httptest.NewRequest(http.MethodGet, "/api/nodes/"+nodePubkey+"/health", nil)
 	w := httptest.NewRecorder()

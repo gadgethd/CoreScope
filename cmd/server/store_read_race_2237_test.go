@@ -83,7 +83,7 @@ func makeRaceStore2237(n int) *PacketStore {
 	for _, tx := range s.packets {
 		tx.LatestSeen = tx.FirstSeen
 		tx.RawHex = "0102030405"
-		tx.ObserverID = tx.Observations[0].ObserverID
+		pickBestObservation(tx)
 	}
 	return s
 }
@@ -124,8 +124,8 @@ func TestGroupedPageReflectsHeaderAfterIngest2237(t *testing.T) {
 	if row["observer_id"] != "race-obs-5" {
 		t.Errorf("observer_id = %v, want race-obs-5", row["observer_id"])
 	}
-	if row["path_json"] != tx.PathJSON || row["observation_count"] != 3 || row["latest"] != tx.LatestSeen {
-		t.Errorf("row = %v, want path %s, 3 observations, latest %s", row, tx.PathJSON, tx.LatestSeen)
+	if row["path_json"] != tx.displayObservation().PathJSON || row["observation_count"] != 3 || row["latest"] != tx.LatestSeen {
+		t.Errorf("row = %v, want path %s, 3 observations, latest %s", row, tx.displayObservation().PathJSON, tx.LatestSeen)
 	}
 	if got := fmt.Sprint(row["distinct_iatas"]); got != "[I05]" {
 		t.Errorf("distinct_iatas = %s, want [I05]", got)
@@ -162,7 +162,7 @@ func TestTxGetParsedPathReadersRace2237(t *testing.T) {
 	runIngestAgainst2237(t, s, s.packets, 300, func(int) { readParsed() })
 	close(stop)
 	wg.Wait()
-	if got, want := fmt.Sprint(readParsed()), fmt.Sprint(parsePathJSON(tx.PathJSON)); got != want {
+	if got, want := fmt.Sprint(readParsed()), fmt.Sprint(parsePathJSON(tx.displayObservation().PathJSON)); got != want {
 		t.Fatalf("parsed path %s, want %s", got, want)
 	}
 }

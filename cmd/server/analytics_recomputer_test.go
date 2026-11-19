@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"runtime"
 	"sort"
 	"sync"
@@ -10,6 +11,105 @@ import (
 )
 
 func numGoroutinesForTest() int { return runtime.NumGoroutine() }
+
+func TestCancellableAnalyticsCanDeferItsInitialPass(t *testing.T) {
+	var computeContext context.Context
+	recomputer := newCancellableAnalyticsRecomputer("retained analytics", time.Hour, func(ctx context.Context) interface{} {
+		computeContext = ctx
+		return "complete"
+	})
+	recomputer.backgroundInitial = true
+	recomputer.Start()
+	t.Cleanup(recomputer.Stop)
+	if recomputer.ComputeRuns() != 0 {
+		t.Fatal("retained analytics ran on the startup goroutine")
+	}
+	recomputer.RecomputeNow()
+	if recomputer.Load() != "complete" {
+		t.Fatal("post-load work did not publish its snapshot")
+	}
+	recomputer.Stop()
+	if computeContext == nil || computeContext.Err() != context.Canceled {
+		t.Fatal("stop did not cancel the retained analytics context")
+	}
+}
+
+func TestRetainedAnalyticsWaitsWithoutHoldingTheWorkSlot(t *testing.T) {
+	ready := make(chan struct{})
+	var work analyticsWorkGate
+	recomputer := newAnalyticsRecomputer("retained analytics", time.Hour, func() interface{} {
+		return "complete"
+	})
+	recomputer.backgroundInitial = true
+	recomputer.ready = ready
+	recomputer.work = &work
+	recomputer.Start()
+	t.Cleanup(recomputer.Stop)
+	ack := make(chan struct{})
+	select {
+	case recomputer.recomputeReq <- ack:
+	case <-time.After(time.Second):
+		t.Fatal("the retained analytics worker did not accept work")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !work.acquire(ctx.Done()) {
+		t.Fatal("waiting retained analytics blocked synchronous prewarm work")
+	}
+	work.release()
+	if recomputer.ComputeRuns() != 0 {
+		t.Fatal("retained analytics began before synchronous prewarm completed")
+	}
+	close(ready)
+	select {
+	case <-ack:
+	case <-time.After(time.Second):
+		t.Fatal("the retained worker did not finish after prewarm")
+	}
+}
+
+func TestAnalyticsRecomputerReleasesItsSharedWorkSlot(t *testing.T) {
+	var store PacketStore
+	recomputer := newAnalyticsRecomputer("test analytics", time.Hour, func() interface{} {
+		if len(store.analyticsWork.slot) != 1 {
+			t.Fatal("analytics compute did not hold the store work slot")
+		}
+		return "complete"
+	})
+	recomputer.work = &store.analyticsWork
+	recomputer.runOnce()
+	if len(store.analyticsWork.slot) != 0 {
+		t.Fatal("analytics compute left the store work slot held")
+	}
+	if snapshot := recomputer.cache.Load(); snapshot != "complete" {
+		t.Fatalf("analytics snapshot = %v", snapshot)
+	}
+}
+
+func TestAnalyticsRecomputerCancelsWorkWait(t *testing.T) {
+	var gate analyticsWorkGate
+	gate.acquire(nil)
+	recomputer := newAnalyticsRecomputer("test analytics", time.Hour, func() interface{} {
+		return "compute should not start"
+	})
+	recomputer.work = &gate
+	done := make(chan struct{})
+	go func() {
+		recomputer.runOnce()
+		close(done)
+	}()
+	recomputer.signalStop()
+	select {
+	case <-done:
+		gate.release()
+	case <-time.After(time.Second):
+		gate.release()
+		t.Fatal("stopped analytics kept waiting on the store work slot")
+	}
+	if recomputer.ComputeRuns() != 0 {
+		t.Fatal("stopped analytics started a queued computation")
+	}
+}
 
 // TestAnalyticsRecomputerSteadyStateLatency asserts that issue #1240's
 // steady-state background recompute is in place: reads of the common

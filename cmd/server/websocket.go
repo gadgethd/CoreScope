@@ -336,6 +336,7 @@ func (p *Poller) Start() {
 			lastObsID = storeMaxObs
 		}
 	}
+	delivered := observationDeliveryWindow{afterTx: lastID, throughTx: lastID}
 	log.Printf("[poller] starting from transmission ID %d, obs ID %d, interval %v", lastID, lastObsID, p.interval)
 
 	ticker := time.NewTicker(p.interval)
@@ -369,27 +370,19 @@ func (p *Poller) Start() {
 				}
 			}
 			if p.store != nil {
-				// Radio history first (#1869): a retune or the radio id of a
-				// new observation must be known before it is broadcast.
+				// Apply observer retunes before broadcasting newly read observations.
 				refreshRadioHistory(p.db.conn, false)
-				// Ingest new transmissions into in-memory store and broadcast
-				newTxs, newMax := p.store.IngestNewFromDB(lastID, 100)
-				if newMax > lastID {
-					lastID = newMax
+				var newTxs []packetFields
+				// Keep one coverage window until the observation cursor catches up.
+				// It prevents duplicate delivery even if a new parent is evicted.
+				if delivered.throughObs <= lastObsID {
+					newTxs, delivered = p.store.ingestNewTransmissions(lastID, 100)
+					lastID = delivered.throughTx
 				}
-				// Ingest new observations for existing transmissions (fixes #174)
-				nextObsID := lastObsID
-				if err := p.db.conn.QueryRow(`
-					SELECT COALESCE(MAX(id), ?) FROM (
-						SELECT id FROM observations
-						WHERE id > ?
-						ORDER BY id ASC
-						LIMIT 500
-					)`, lastObsID, lastObsID).Scan(&nextObsID); err != nil {
-					nextObsID = lastObsID
-				}
-				newObs := p.store.IngestNewObservations(lastObsID, 500)
-				if nextObsID > lastObsID {
+				newObs, nextObsID, err := p.store.ingestLateObservations(lastObsID, 500, delivered)
+				if err != nil {
+					log.Printf("[poller] ingest late observations: %v", err)
+				} else {
 					lastObsID = nextObsID
 				}
 				if len(newTxs) > 0 {

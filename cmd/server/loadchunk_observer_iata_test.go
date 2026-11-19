@@ -47,8 +47,8 @@ func TestLoadChunkKeepsObserverIATA(t *testing.T) {
 				t.Fatalf("tx %d: observation IATA = %q, want SJC", tx.ID, o.ObserverIATA)
 			}
 		}
-		if tx.ObserverIATA != "SJC" {
-			t.Fatalf("tx %d: IATA = %q, want SJC", tx.ID, tx.ObserverIATA)
+		if tx.displayObservation().ObserverIATA != "SJC" {
+			t.Fatalf("tx %d: IATA = %q, want SJC", tx.ID, tx.displayObservation().ObserverIATA)
 		}
 	}
 }

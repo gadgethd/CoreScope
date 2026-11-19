@@ -584,7 +584,7 @@ func TestMultiByteCapabilityIgnoresDuplicateEntries_2108(t *testing.T) {
 		"aabbccdd11223344", "RepB", "repeater", recentTS(48))
 	store := NewPacketStore(db, nil)
 	pt := 1
-	pkt := &StoreTx{RawHex: "01" + buildPathByte(2, 1) + "aabb", PayloadType: &pt, PathJSON: `["aabb"]`, FirstSeen: recentTS(48)}
+	pkt := &StoreTx{selectedObservation: &StoreObs{PathJSON: `["aabb"]`}, RawHex: "01" + buildPathByte(2, 1) + "aabb", PayloadType: &pt, FirstSeen: recentTS(48)}
 	addTestPacket(store, pkt)
 	before := store.computeMultiByteCapability(nil)
 	store.mu.Lock()

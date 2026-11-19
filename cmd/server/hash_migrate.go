@@ -56,7 +56,7 @@ func migrateContentHashesAsync(store *PacketStore, batchSize int, yieldDuration 
 			if tx.RawHex == "" {
 				continue
 			}
-			newHash := ComputeContentHash(tx.RawHex)
+			newHash := contentHash(tx.RawHex, tx.Hash)
 			if newHash != tx.Hash {
 				updates = append(updates, hashUpdate{tx: tx, oldHash: tx.Hash, newHash: newHash})
 			}

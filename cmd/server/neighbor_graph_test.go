@@ -84,6 +84,24 @@ func TestBuildNeighborGraph_EmptyStore(t *testing.T) {
 	}
 }
 
+func TestBuildNeighborGraph_NonOriginatingPacketLeavesDecodedCacheCold(t *testing.T) {
+	nodes := []nodeInfo{
+		{Role: "repeater", PublicKey: "aaaa1111"},
+		{Role: "repeater", PublicKey: "bbaa1122"},
+		{Role: "repeater", PublicKey: "ccee1133"},
+	}
+	tx := ngMakeTx(1, PayloadACK, ngFromNodeJSON("aaaa1111"), []*StoreObs{
+		ngMakeObs("ccee1133", `["bbaa"]`, nowStr, ngFloatPtr(-10)),
+	})
+	edges := BuildFromStore(ngTestStore(nodes, []*StoreTx{tx})).AllEdges()
+	if len(edges) != 1 || edges[0].NodeA != "bbaa1122" || edges[0].NodeB != "ccee1133" {
+		t.Fatalf("expected only the last-hop-to-observer edge, got %+v", edges)
+	}
+	if tx.parsedDecoded != nil {
+		t.Fatal("last-hop edge populated the decoded packet cache")
+	}
+}
+
 func TestBuildNeighborGraph_AdvertSingleHopPath(t *testing.T) {
 	// ADVERT from X, path=["R1_prefix"] → edges: X↔R1 and Observer↔R1
 	nodes := []nodeInfo{

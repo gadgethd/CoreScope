@@ -6,6 +6,16 @@ import (
 	"time"
 )
 
+func TestRepeaterRelayRefreshPreservesOffsetAndPrecision(t *testing.T) {
+	tx := &StoreTx{FirstSeen: time.Now().Add(-30 * time.Minute).
+		In(time.FixedZone("offset", 3600)).Format(time.RFC3339Nano)}
+	store := &PacketStore{byPathHop: map[string][]*StoreTx{"aa": {tx}}}
+	info := store.computeRepeaterRelayInfoMap(1)["aa"]
+	if info.RelayCount1h != 1 || info.RelayCount24h != 1 || !info.RelayActive || info.LastRelayed != tx.FirstSeen {
+		t.Fatalf("recent relay timestamp changed during refresh: %+v", info)
+	}
+}
+
 // TestGetRepeaterRelayInfoMap_ServesStaleOnTTLExpiry is a regression guard
 // for issue #1272.
 //

@@ -31,10 +31,9 @@ func BenchmarkBuildHopContextPubkeys(b *testing.B) {
 	}
 	pathJSON, _ := json.Marshal(hops)
 	decoded, _ := json.Marshal(map[string]interface{}{"pubKey": "cc4444444444"})
-	tx := &StoreTx{
-		PathJSON:    string(pathJSON),
+	tx := &StoreTx{selectedObservation: &StoreObs{PathJSON: string(pathJSON), ObserverID: "dd5555555555"},
+
 		DecodedJSON: string(decoded),
-		ObserverID:  "dd5555555555",
 	}
 
 	b.ReportAllocs()
@@ -82,10 +81,9 @@ func BenchmarkBuildAggregateHopContextPubkeys(b *testing.B) {
 		decoded, _ := json.Marshal(map[string]interface{}{
 			"pubKey": fmt.Sprintf("cc%010x", i),
 		})
-		txs = append(txs, &StoreTx{
-			PathJSON:    string(pathJSON),
+		txs = append(txs, &StoreTx{selectedObservation: &StoreObs{PathJSON: string(pathJSON), ObserverID: fmt.Sprintf("dd%010x", i%32)},
+
 			DecodedJSON: string(decoded),
-			ObserverID:  fmt.Sprintf("dd%010x", i%32),
 		})
 	}
 

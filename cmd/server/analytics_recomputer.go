@@ -10,6 +10,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strings"
@@ -17,6 +18,31 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// analyticsWorkGate admits one scratch-heavy recompute per packet store.
+// Waiting work can leave immediately when its recomputer stops.
+type analyticsWorkGate struct {
+	init sync.Once
+	slot chan struct{}
+}
+
+func (g *analyticsWorkGate) acquire(stop <-chan struct{}) bool {
+	g.init.Do(func() { g.slot = make(chan struct{}, 1) })
+	select {
+	case g.slot <- struct{}{}:
+	case <-stop:
+		return false
+	}
+	select {
+	case <-stop:
+		g.release()
+		return false
+	default:
+		return true
+	}
+}
+
+func (g *analyticsWorkGate) release() { <-g.slot }
 
 // analyticsRecomputer holds the latest snapshot of an analytics result
 // in an atomic.Value, refreshed periodically by a background goroutine.
@@ -33,9 +59,13 @@ import (
 // Compute func is called WITHOUT any lock held by this struct, so it
 // may freely take any application-level locks it needs.
 type analyticsRecomputer struct {
-	name     string
-	interval time.Duration
-	compute  func() interface{}
+	name              string
+	interval          time.Duration
+	compute           func() interface{}
+	work              *analyticsWorkGate
+	cancel            context.CancelFunc
+	backgroundInitial bool
+	ready             <-chan struct{}
 
 	cache        atomic.Value // holds interface{} — the latest snapshot
 	stop         chan struct{}
@@ -84,9 +114,15 @@ func newAnalyticsRecomputer(name string, interval time.Duration, compute func() 
 	}
 }
 
-// Start runs the initial compute synchronously (so the first Load
-// after Start returns a populated snapshot, never nil), then launches
-// a background goroutine to periodically recompute.
+func newCancellableAnalyticsRecomputer(name string, interval time.Duration, compute func(context.Context) interface{}) *analyticsRecomputer {
+	ctx, cancel := context.WithCancel(context.Background())
+	r := newAnalyticsRecomputer(name, interval, func() interface{} { return compute(ctx) })
+	r.cancel = cancel
+	return r
+}
+
+// Start warms the initial snapshot and launches periodic recomputation.
+// A worker with backgroundInitial set first runs on the post-load pass.
 //
 // Calling Start multiple times is a no-op after the first call.
 func (r *analyticsRecomputer) Start() {
@@ -98,7 +134,9 @@ func (r *analyticsRecomputer) Start() {
 		r.noteWarmupStart_1659()
 		// Initial synchronous compute — first read must NOT see empty
 		// or uninitialized data (acceptance criterion #1240).
-		r.runOnce()
+		if !r.backgroundInitial {
+			r.runOnce()
+		}
 		go r.loop()
 	})
 }
@@ -133,6 +171,20 @@ func (r *analyticsRecomputer) loop() {
 func (r *analyticsRecomputer) runOnce() {
 	if r.compute == nil {
 		return
+	}
+	// Startup-dependent work waits before holding the shared slot.
+	if r.ready != nil {
+		select {
+		case <-r.ready:
+		case <-r.stop:
+			return
+		}
+	}
+	if r.work != nil {
+		if !r.work.acquire(r.stop) {
+			return
+		}
+		defer r.work.release()
 	}
 	defer func() {
 		// Don't let a compute panic kill the background goroutine.
@@ -246,15 +298,22 @@ func (r *analyticsRecomputer) Load() interface{} {
 // Stop signals the background goroutine to exit and waits for it.
 // Safe to call multiple times. Safe to call before Start (no-op).
 func (r *analyticsRecomputer) Stop() {
-	r.stopOnce.Do(func() {
-		close(r.stop)
-	})
+	r.signalStop()
 	// Only wait if the goroutine was actually started.
 	select {
 	case <-r.done:
 	case <-time.After(5 * time.Second):
 		// Defensive timeout: shouldn't happen in practice.
 	}
+}
+
+func (r *analyticsRecomputer) signalStop() {
+	r.stopOnce.Do(func() {
+		close(r.stop)
+		if r.cancel != nil {
+			r.cancel()
+		}
+	})
 }
 
 // LastComputeDuration returns the duration of the most recent compute.
@@ -282,7 +341,8 @@ type AnalyticsRecomputeIntervals struct {
 	NodesClockSkew     time.Duration
 
 	// PauseWhenIdle is applied to every recomputer (AnalyticsConfig.PauseWhenIdle).
-	PauseWhenIdle bool
+	PauseWhenIdle     bool
+	retainedWorkReady <-chan struct{}
 }
 
 func pickInterval(override, def time.Duration) time.Duration {
@@ -332,6 +392,7 @@ func (s *PacketStore) StartAnalyticsRecomputers(defaultInterval time.Duration, o
 		ov = overrides[0]
 	}
 
+	retainedHistory := s.packetHistoryRequired()
 	s.analyticsRecomputerMu.Lock()
 	if s.recompTopology != nil {
 		// Already started; return a no-op so the caller's defer is harmless.
@@ -388,17 +449,27 @@ func (s *PacketStore) StartAnalyticsRecomputers(defaultInterval time.Duration, o
 	// but it has the same shape: one full pass over the store that no
 	// request can afford, served from an atomic snapshot. See
 	// direct_heard.go.
-	s.recompDirectHeard = newAnalyticsRecomputer(
+	s.recompDirectHeard = newCancellableAnalyticsRecomputer(
 		"direct-heard", defaultInterval,
-		func() interface{} {
-			idx := s.computeDirectHeard()
+		func(ctx context.Context) interface{} {
+			idx := s.computeDirectHeard(ctx)
+			if idx == nil {
+				return nil
+			}
 			s.publishDirectHeard(idx)
 			return idx
 		},
 	)
+	// The post-load pass reads full retained data when the cache is bounded.
+	// Keep that scan out of the synchronous listener setup.
+	s.recompDirectHeard.backgroundInitial = retainedHistory
+	if retainedHistory {
+		s.recompDirectHeard.ready = ov.retainedWorkReady
+	}
 	all := s.analyticsRecomputersLocked()
 	for _, rc := range all {
 		rc.pauseWhenIdle = ov.PauseWhenIdle
+		rc.work = &s.analyticsWork
 	}
 	s.analyticsRecomputerMu.Unlock()
 
@@ -440,6 +511,9 @@ func (s *PacketStore) StartAnalyticsRecomputers(defaultInterval time.Duration, o
 	return func() {
 		stopOnce.Do(func() {
 			close(stopPostLoad)
+			for _, rc := range all {
+				rc.signalStop()
+			}
 			for _, rc := range all {
 				rc.Stop()
 			}

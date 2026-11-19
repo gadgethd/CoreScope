@@ -35,7 +35,7 @@ func subpathFixture(numTx int, seed int64) []*StoreTx {
 			at = neighbours[at][rng.Intn(len(neighbours[at]))]
 		}
 		pj, _ := json.Marshal(hops)
-		txs[i] = &StoreTx{ID: i + 1, PathJSON: string(pj)}
+		txs[i] = &StoreTx{selectedObservation: &StoreObs{PathJSON: string(pj)}, ID: i + 1}
 	}
 	return txs
 }

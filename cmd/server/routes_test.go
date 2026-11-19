@@ -827,7 +827,7 @@ func TestNodeHealthPartialFromPackets(t *testing.T) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	snr := 5.0
 	srv.store.mu.Lock()
-	srv.store.indexByNode(&StoreTx{ID: 999999, Hash: "abc123", FirstSeen: now, SNR: &snr, ObservationCount: 1,
+	srv.store.indexByNode(&StoreTx{selectedObservation: &StoreObs{SNR: &snr}, ID: 999999, Hash: "abc123", FirstSeen: now, ObservationCount: 1,
 		DecodedJSON: `{"srcPubKey":"` + ghostPubkey + `"}`})
 	srv.store.mu.Unlock()
 
@@ -2783,13 +2783,13 @@ func TestAnalyticsHashSizeSameNameDifferentPubkey(t *testing.T) {
 
 	for i, decoded := range []string{decoded1, decoded2} {
 		tx := &StoreTx{
-			ID:          6100 + i,
-			RawHex:      raw2byte,
-			Hash:        "samename" + strconv.Itoa(i),
-			FirstSeen:   time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
-			PayloadType: &payloadType,
-			DecodedJSON: decoded,
-			PathJSON:    `["AABB"]`,
+			selectedObservation: &StoreObs{PathJSON: `["AABB"]`},
+			ID:                  6100 + i,
+			RawHex:              raw2byte,
+			Hash:                "samename" + strconv.Itoa(i),
+			FirstSeen:           time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+			PayloadType:         &payloadType,
+			DecodedJSON:         decoded,
 		}
 		store.packets = append(store.packets, tx)
 		store.byPayloadType[4] = append(store.byPayloadType[4], tx)
@@ -4037,8 +4037,8 @@ func TestPathHopIndexIncrementalUpdate(t *testing.T) {
 	idx := make(map[string][]*StoreTx)
 
 	tx1 := &StoreTx{
-		ID:       1,
-		PathJSON: `["ab","cd"]`,
+		selectedObservation: &StoreObs{PathJSON: `["ab","cd"]`},
+		ID:                  1,
 	}
 
 	addTxToPathHopIndex(idx, tx1)
@@ -4053,8 +4053,8 @@ func TestPathHopIndexIncrementalUpdate(t *testing.T) {
 
 	// Add another tx with overlapping hop
 	tx2 := &StoreTx{
-		ID:       2,
-		PathJSON: `["ab","ef"]`,
+		selectedObservation: &StoreObs{PathJSON: `["ab","ef"]`},
+		ID:                  2,
 	}
 	addTxToPathHopIndex(idx, tx2)
 

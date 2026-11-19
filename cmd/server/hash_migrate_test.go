@@ -5,6 +5,22 @@ import (
 	"time"
 )
 
+func TestContentHashReusesCanonicalResult(t *testing.T) {
+	const frame = "0A00D69FD7A5A7475DB07337749AE61FA53A4788E976"
+	const expected = "b1f07307cbc01ce5"
+	if got := ComputeContentHash(frame); got != expected {
+		t.Fatalf("content hash %q, want %q", got, expected)
+	}
+	allocations := testing.AllocsPerRun(100, func() {
+		if got := contentHash(frame, expected); got != expected {
+			t.Fatalf("startup hash %q, want %q", got, expected)
+		}
+	})
+	if allocations != 0 {
+		t.Fatalf("checking a canonical store hash allocated %.2f times", allocations)
+	}
+}
+
 func TestMigrateContentHashesAsync(t *testing.T) {
 	db := setupTestDBv2(t)
 	store := NewPacketStore(db, nil)

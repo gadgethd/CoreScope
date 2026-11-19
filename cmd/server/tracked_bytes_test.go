@@ -9,12 +9,13 @@ import (
 // returns reasonable values for different packet sizes.
 func TestEstimateStoreTxBytes_ReasonableValues(t *testing.T) {
 	tx := &StoreTx{
-		Hash:        "abcdef1234567890",
-		RawHex:      "deadbeef",
-		DecodedJSON: `{"type":"GRP_TXT"}`,
-		PathJSON:    `["hop1","hop2","hop3"]`,
-		parsedPath:  []string{"hop1", "hop2", "hop3"},
-		pathParsed:  true,
+		selectedObservation: &StoreObs{PathJSON: `["hop1","hop2","hop3"]`},
+		Hash:                "abcdef1234567890",
+		RawHex:              "deadbeef",
+		DecodedJSON:         `{"type":"GRP_TXT"}`,
+
+		parsedPath: []string{"hop1", "hop2", "hop3"},
+		pathParsed: true,
 	}
 	got := estimateStoreTxBytes(tx)
 
@@ -136,12 +137,13 @@ func TestEvictionTriggersWithImprovedEstimates(t *testing.T) {
 // BenchmarkEstimateStoreTxBytes verifies the estimate function is fast.
 func BenchmarkEstimateStoreTxBytes(b *testing.B) {
 	tx := &StoreTx{
-		Hash:        "abcdef1234567890",
-		RawHex:      "deadbeefdeadbeef",
-		DecodedJSON: `{"type":"GRP_TXT","payload":"hello"}`,
-		PathJSON:    `["hop1","hop2","hop3","hop4","hop5"]`,
-		parsedPath:  []string{"hop1", "hop2", "hop3", "hop4", "hop5"},
-		pathParsed:  true,
+		selectedObservation: &StoreObs{PathJSON: `["hop1","hop2","hop3","hop4","hop5"]`},
+		Hash:                "abcdef1234567890",
+		RawHex:              "deadbeefdeadbeef",
+		DecodedJSON:         `{"type":"GRP_TXT","payload":"hello"}`,
+
+		parsedPath: []string{"hop1", "hop2", "hop3", "hop4", "hop5"},
+		pathParsed: true,
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
