@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,6 +14,11 @@ import (
 func TestRetainedPacketFiltersAndPageParity(t *testing.T) {
 	srv, router := setupTestServer(t)
 	seedRadioHistory(t, srv)
+	_, err := srv.db.conn.Exec(`INSERT INTO transmissions (id, raw_hex, hash, first_seen)
+		VALUES (100, 'AA', '', '2026-01-01T00:00:00Z'), (101, 'AA', '1000000000000001', '')`)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	const firstHash = "abc123def4567890"
 	cases := []struct {
@@ -49,6 +55,24 @@ func TestRetainedPacketFiltersAndPageParity(t *testing.T) {
 				t.Fatalf("page shape or data diverged\nresident: %s\nretained: %s", a, b)
 			}
 		})
+	}
+}
+
+func TestRetainedUnfilteredCountSkipsEmptyAndNull(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	_, err = db.Exec(`CREATE TABLE transmissions (id INTEGER PRIMARY KEY, hash TEXT, first_seen TEXT);
+		INSERT INTO transmissions (hash, first_seen) VALUES ('valid', 'stamp'), ('also-valid', 'stamp'),
+			('', ''), (NULL, ''), ('', NULL), (NULL, NULL), ('hash', NULL), ('hash', ''), ('', 'stamp'), (NULL, 'stamp')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var total int
+	if err = db.QueryRow(retainedUnfilteredPacketCountSQL).Scan(&total); err != nil || total != 2 {
+		t.Fatalf("exact total = %d, error = %v; want 2 valid transmissions", total, err)
 	}
 }
 

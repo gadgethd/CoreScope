@@ -13,6 +13,15 @@ import (
 
 const retainedPacketBatch = 384
 
+// Use SQLite's compact total count and index probes for the two validity
+// predicates in retainedPacketFilter. UNION counts a doubly invalid row once.
+const retainedUnfilteredPacketCountSQL = `SELECT (SELECT COUNT(*) FROM transmissions) - (SELECT COUNT(*) FROM (
+ SELECT id FROM transmissions WHERE hash = ''
+ UNION SELECT id FROM transmissions WHERE hash IS NULL
+ UNION SELECT id FROM transmissions WHERE first_seen = ''
+ UNION SELECT id FROM transmissions WHERE first_seen IS NULL
+))`
+
 // packetHistoryRequired selects SQLite whenever the store may omit committed
 // transmissions. A timestamp alone can't prove coverage: an old transmission
 // can receive a new observation after startup or eviction.
@@ -330,7 +339,11 @@ func (s *PacketStore) queryRetainedPackets(ctx context.Context, q PacketQuery, g
 	defer read.Rollback()
 	result := &PacketResult{Packets: make([]packetFields, 0)}
 	if !complex {
-		if err := read.QueryRowContext(ctx, "SELECT COUNT(*)"+where, args...).Scan(&result.Total); err != nil {
+		countSQL := "SELECT COUNT(*)" + where
+		if q.unfilteredFlatPage() {
+			countSQL = retainedUnfilteredPacketCountSQL
+		}
+		if err := read.QueryRowContext(ctx, countSQL, args...).Scan(&result.Total); err != nil {
 			return nil, err
 		}
 		sqlIDs += " LIMIT ? OFFSET ?"
