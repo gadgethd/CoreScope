@@ -11,6 +11,49 @@ import (
 
 func numGoroutinesForTest() int { return runtime.NumGoroutine() }
 
+func TestAnalyticsRecomputerReleasesItsSharedWorkSlot(t *testing.T) {
+	var store PacketStore
+	recomputer := newAnalyticsRecomputer("test analytics", time.Hour, func() interface{} {
+		if len(store.analyticsWork.slot) != 1 {
+			t.Fatal("analytics compute did not hold the store work slot")
+		}
+		return "complete"
+	})
+	recomputer.work = &store.analyticsWork
+	recomputer.runOnce()
+	if len(store.analyticsWork.slot) != 0 {
+		t.Fatal("analytics compute left the store work slot held")
+	}
+	if snapshot := recomputer.cache.Load(); snapshot != "complete" {
+		t.Fatalf("analytics snapshot = %v", snapshot)
+	}
+}
+
+func TestAnalyticsRecomputerCancelsWorkWait(t *testing.T) {
+	var gate analyticsWorkGate
+	gate.acquire(nil)
+	recomputer := newAnalyticsRecomputer("test analytics", time.Hour, func() interface{} {
+		return "compute should not start"
+	})
+	recomputer.work = &gate
+	done := make(chan struct{})
+	go func() {
+		recomputer.runOnce()
+		close(done)
+	}()
+	recomputer.signalStop()
+	select {
+	case <-done:
+		gate.release()
+	case <-time.After(time.Second):
+		gate.release()
+		t.Fatal("stopped analytics kept waiting on the store work slot")
+	}
+	if recomputer.ComputeRuns() != 0 {
+		t.Fatal("stopped analytics started a queued computation")
+	}
+}
+
 // TestAnalyticsRecomputerSteadyStateLatency asserts that issue #1240's
 // steady-state background recompute is in place: reads of the common
 // analytics endpoints (region="") return from cache in <50ms p99 even

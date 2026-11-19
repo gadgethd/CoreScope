@@ -76,7 +76,7 @@ func (s *PacketStore) StartRepeaterEnrichmentRecomputer(windowHours float64, int
 	// for the entire `interval` window. The next ticker fire will pick
 	// up the populated index.
 	if s.WaitIndexesReady(repeaterEnrichmentPrewarmWait) {
-		recomputeRepeaterEnrichmentSafe(s, windowHours)
+		recomputeRepeaterEnrichmentSafe(s, windowHours, stop)
 	}
 
 	var stopOnce sync.Once
@@ -87,7 +87,7 @@ func (s *PacketStore) StartRepeaterEnrichmentRecomputer(windowHours float64, int
 		for {
 			select {
 			case <-t.C:
-				recomputeRepeaterEnrichmentSafe(s, windowHours)
+				recomputeRepeaterEnrichmentSafe(s, windowHours, stop)
 			case <-stop:
 				return
 			}
@@ -108,7 +108,11 @@ func (s *PacketStore) StartRepeaterEnrichmentRecomputer(windowHours float64, int
 // recomputeRepeaterEnrichmentSafe runs both bulk-cache compute paths
 // behind a panic recover — a panic in compute must not kill the
 // background goroutine (the previous snapshot remains valid).
-func recomputeRepeaterEnrichmentSafe(s *PacketStore, windowHours float64) {
+func recomputeRepeaterEnrichmentSafe(s *PacketStore, windowHours float64, stop <-chan struct{}) {
+	if !s.analyticsWork.acquire(stop) {
+		return
+	}
+	defer s.analyticsWork.release()
 	defer func() { _ = recover() }()
 	// Write directly to the cache fields under mutex rather than going
 	// through the public Get* helpers — those return the existing

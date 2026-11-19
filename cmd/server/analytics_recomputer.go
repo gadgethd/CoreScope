@@ -18,6 +18,31 @@ import (
 	"time"
 )
 
+// analyticsWorkGate admits one scratch-heavy recompute per packet store.
+// Waiting work can leave immediately when its recomputer stops.
+type analyticsWorkGate struct {
+	init sync.Once
+	slot chan struct{}
+}
+
+func (g *analyticsWorkGate) acquire(stop <-chan struct{}) bool {
+	g.init.Do(func() { g.slot = make(chan struct{}, 1) })
+	select {
+	case g.slot <- struct{}{}:
+	case <-stop:
+		return false
+	}
+	select {
+	case <-stop:
+		g.release()
+		return false
+	default:
+		return true
+	}
+}
+
+func (g *analyticsWorkGate) release() { <-g.slot }
+
 // analyticsRecomputer holds the latest snapshot of an analytics result
 // in an atomic.Value, refreshed periodically by a background goroutine.
 //
@@ -36,6 +61,7 @@ type analyticsRecomputer struct {
 	name     string
 	interval time.Duration
 	compute  func() interface{}
+	work     *analyticsWorkGate
 
 	cache        atomic.Value // holds interface{} — the latest snapshot
 	stop         chan struct{}
@@ -133,6 +159,12 @@ func (r *analyticsRecomputer) loop() {
 func (r *analyticsRecomputer) runOnce() {
 	if r.compute == nil {
 		return
+	}
+	if r.work != nil {
+		if !r.work.acquire(r.stop) {
+			return
+		}
+		defer r.work.release()
 	}
 	defer func() {
 		// Don't let a compute panic kill the background goroutine.
@@ -246,15 +278,17 @@ func (r *analyticsRecomputer) Load() interface{} {
 // Stop signals the background goroutine to exit and waits for it.
 // Safe to call multiple times. Safe to call before Start (no-op).
 func (r *analyticsRecomputer) Stop() {
-	r.stopOnce.Do(func() {
-		close(r.stop)
-	})
+	r.signalStop()
 	// Only wait if the goroutine was actually started.
 	select {
 	case <-r.done:
 	case <-time.After(5 * time.Second):
 		// Defensive timeout: shouldn't happen in practice.
 	}
+}
+
+func (r *analyticsRecomputer) signalStop() {
+	r.stopOnce.Do(func() { close(r.stop) })
 }
 
 // LastComputeDuration returns the duration of the most recent compute.
@@ -399,6 +433,7 @@ func (s *PacketStore) StartAnalyticsRecomputers(defaultInterval time.Duration, o
 	all := s.analyticsRecomputersLocked()
 	for _, rc := range all {
 		rc.pauseWhenIdle = ov.PauseWhenIdle
+		rc.work = &s.analyticsWork
 	}
 	s.analyticsRecomputerMu.Unlock()
 
@@ -440,6 +475,9 @@ func (s *PacketStore) StartAnalyticsRecomputers(defaultInterval time.Duration, o
 	return func() {
 		stopOnce.Do(func() {
 			close(stopPostLoad)
+			for _, rc := range all {
+				rc.signalStop()
+			}
 			for _, rc := range all {
 				rc.Stop()
 			}

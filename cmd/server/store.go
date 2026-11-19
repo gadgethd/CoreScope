@@ -304,6 +304,9 @@ type PacketStore struct {
 	// GetAnalytics* function serves from Load() instead of running the
 	// on-request compute path. Region/window variants still go through
 	// the legacy TTL cache (compute-on-miss).
+	// Scratch-heavy analytics and repeater enrichment share the work
+	// slot. Acquire it before reading packet data or any result cache.
+	analyticsWork            analyticsWorkGate
 	analyticsRecomputerMu    sync.RWMutex
 	recompTopology           *analyticsRecomputer
 	recompRF                 *analyticsRecomputer
@@ -2421,18 +2424,22 @@ func distinctObserverIatas(headerIATA string, observations []*StoreObs) []string
 	return out
 }
 
-// GetStoreStats returns aggregate counts (packet data from memory, node/observer from DB).
+// GetStoreStats returns aggregate counts for the complete packet history.
 func (s *PacketStore) GetStoreStats() (*Stats, error) {
-	s.mu.RLock()
-	txCount := len(s.packets)
-	obsCount := s.totalObs
-	s.mu.RUnlock()
-
-	st := &Stats{
-		TotalTransmissions: txCount,
-		TotalPackets:       txCount,
-		TotalObservations:  obsCount,
+	st := &Stats{}
+	if s.packetHistoryRequired() {
+		var err error
+		st.TotalTransmissions, st.TotalObservations, err = s.db.retainedPacketCounts()
+		if err != nil {
+			return st, err
+		}
+	} else {
+		s.mu.RLock()
+		st.TotalTransmissions = len(s.packets)
+		st.TotalObservations = s.totalObs
+		s.mu.RUnlock()
 	}
+	st.TotalPackets = st.TotalTransmissions
 
 	sevenDaysAgo := time.Now().Add(-7 * 24 * time.Hour).Format(time.RFC3339)
 	oneHourAgo := time.Now().Add(-1 * time.Hour).Unix()
