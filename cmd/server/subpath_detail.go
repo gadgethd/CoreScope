@@ -71,20 +71,20 @@ func (a *subpathDetailAccum) add(tx *StoreTx, count int) {
 			a.hours[stamp.Hour()] += count
 		}
 	}
-	if tx.SNR != nil {
+	if tx.displayObservation().SNR != nil {
 		a.snrCount += count
 		for range count {
-			a.snrSum += *tx.SNR
+			a.snrSum += *tx.displayObservation().SNR
 		}
 	}
-	if tx.RSSI != nil {
+	if tx.displayObservation().RSSI != nil {
 		a.rssiCount += count
 		for range count {
-			a.rssiSum += *tx.RSSI
+			a.rssiSum += *tx.displayObservation().RSSI
 		}
 	}
-	if tx.ObserverName != "" {
-		a.observers[tx.ObserverName] += count
+	if tx.displayObservation().ObserverName != "" {
+		a.observers[tx.displayObservation().ObserverName] += count
 	}
 
 	pm := a.pm

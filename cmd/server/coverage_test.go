@@ -948,7 +948,7 @@ func TestPickBestObservation(t *testing.T) {
 	t.Run("empty observations", func(t *testing.T) {
 		tx := &StoreTx{}
 		pickBestObservation(tx)
-		if tx.ObserverID != "" {
+		if tx.displayObservation().ObserverID != "" {
 			t.Error("expected empty observer for no observations")
 		}
 	})
@@ -961,8 +961,8 @@ func TestPickBestObservation(t *testing.T) {
 			},
 		}
 		pickBestObservation(tx)
-		if tx.ObserverID != "obs1" {
-			t.Errorf("expected obs1, got %s", tx.ObserverID)
+		if tx.displayObservation().ObserverID != "obs1" {
+			t.Errorf("expected obs1, got %s", tx.displayObservation().ObserverID)
 		}
 	})
 
@@ -975,8 +975,8 @@ func TestPickBestObservation(t *testing.T) {
 			},
 		}
 		pickBestObservation(tx)
-		if tx.ObserverID != "obs2" {
-			t.Errorf("expected obs2 (longest path), got %s", tx.ObserverID)
+		if tx.displayObservation().ObserverID != "obs2" {
+			t.Errorf("expected obs2 (longest path), got %s", tx.displayObservation().ObserverID)
 		}
 	})
 }
@@ -2066,20 +2066,15 @@ func TestTxToMap(t *testing.T) {
 	pt := 4
 	rt := 1
 	tx := &StoreTx{
-		ID:               1,
-		RawHex:           "AABB",
-		Hash:             "abc123",
-		FirstSeen:        "2025-01-01",
-		RouteType:        &rt,
-		PayloadType:      &pt,
-		DecodedJSON:      `{"type":"ADVERT"}`,
-		ObservationCount: 2,
-		ObserverID:       "obs1",
-		ObserverName:     "Obs One",
-		SNR:              &snr,
-		RSSI:             &rssi,
-		PathJSON:         `["aa"]`,
-		Direction:        "RX",
+		selectedObservation: &StoreObs{ObserverID: "obs1", ObserverName: "Obs One", SNR: &snr, RSSI: &rssi, PathJSON: `["aa"]`, Direction: "RX"},
+		ID:                  1,
+		RawHex:              "AABB",
+		Hash:                "abc123",
+		FirstSeen:           "2025-01-01",
+		RouteType:           &rt,
+		PayloadType:         &pt,
+		DecodedJSON:         `{"type":"ADVERT"}`,
+		ObservationCount:    2,
 	}
 	m := txToMap(tx)
 	if m["id"] != 1 {
@@ -3982,8 +3977,8 @@ func TestIngestNewObservations(t *testing.T) {
 	}
 
 	// Best observation should have been re-picked (new obs has longer path)
-	if initialTx.PathJSON != `["aa","bb","cc"]` {
-		t.Errorf("expected best path to be updated to longer path, got %s", initialTx.PathJSON)
+	if initialTx.displayObservation().PathJSON != `["aa","bb","cc"]` {
+		t.Errorf("expected best path to be updated to longer path, got %s", initialTx.displayObservation().PathJSON)
 	}
 
 	t.Run("no new observations", func(t *testing.T) {

@@ -143,7 +143,7 @@ func (a *nodePathAggregate) addRetained(packet *retainedPacket) {
 func (a *nodePathAggregate) add(tx *StoreTx, canonical []*string, preconfirmed bool) {
 	hops := tx.parsedPath
 	if !tx.pathParsed {
-		hops = parsePathJSON(tx.PathJSON)
+		hops = parsePathJSON(tx.displayObservation().PathJSON)
 	}
 	keys := make([]string, len(hops))
 	containsTarget := false

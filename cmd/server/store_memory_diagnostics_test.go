@@ -25,13 +25,13 @@ func TestStoreMemoryBreakdown(t *testing.T) {
 	bigJSON := strings.Repeat("x", decodedJSONFixtureBytes)
 	s := &PacketStore{}
 	s.packets = []*StoreTx{
-		{RouteType: &rt0, RawHex: "aabbccdd", DecodedJSON: bigJSON, PathJSON: "[]",
+		{selectedObservation: &StoreObs{PathJSON: "[]"}, RouteType: &rt0, RawHex: "aabbccdd", DecodedJSON: bigJSON,
 			Observations: []*StoreObs{obs("a", "[1]"), obs("b", "[2]"), obs("c", "[3]")}},
-		{RouteType: &rt1, RawHex: "ee", PathJSON: "[]",
+		{selectedObservation: &StoreObs{PathJSON: "[]"}, RouteType: &rt1, RawHex: "ee",
 			Observations: []*StoreObs{obs("a", "[1]")}},
-		{RouteType: &rt2, RawHex: "ff0011", PathJSON: "[]",
+		{selectedObservation: &StoreObs{PathJSON: "[]"}, RouteType: &rt2, RawHex: "ff0011",
 			Observations: []*StoreObs{obs("a", "[1]"), obs("b", "[2]")}},
-		{RouteType: nil, RawHex: "22", PathJSON: "[]"}, // unknown route_type, no obs
+		{selectedObservation: &StoreObs{PathJSON: "[]"}, RouteType: nil, RawHex: "22"}, // unknown route_type, no obs
 	}
 
 	b := s.GetStoreMemoryBreakdown()

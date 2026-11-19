@@ -44,6 +44,7 @@ func newNodeAnalyticsAccum(pubkey string, pm *prefixMap) *nodeAnalyticsAccum {
 
 func (a *nodeAnalyticsAccum) add(p *StoreTx) {
 	a.total++
+	display := p.displayObservation()
 	if len(p.FirstSeen) >= 13 {
 		bucket := p.FirstSeen[:13] + ":00:00Z"
 		a.timeline[bucket]++
@@ -51,27 +52,27 @@ func (a *nodeAnalyticsAccum) add(p *StoreTx) {
 			a.certain[bucket]++
 		}
 	}
-	if p.SNR != nil {
+	if display.SNR != nil {
 		a.snrTrend = append(a.snrTrend, SnrTrendEntry{Timestamp: p.FirstSeen,
-			SNR: floatPtrOrNil(p.SNR), RSSI: floatPtrOrNil(p.RSSI),
-			ObserverID: strOrNil(p.ObserverID), ObserverName: strOrNil(p.ObserverName)})
+			SNR: floatPtrOrNil(display.SNR), RSSI: floatPtrOrNil(display.RSSI),
+			ObserverID: strOrNil(display.ObserverID), ObserverName: strOrNil(display.ObserverName)})
 	}
 	if p.PayloadType != nil {
 		a.types[*p.PayloadType]++
 	}
-	if p.ObserverID != "" {
-		o := a.observers[p.ObserverID]
+	if display.ObserverID != "" {
+		o := a.observers[display.ObserverID]
 		if o == nil {
-			o = &nodeObserverAccum{name: p.ObserverName, first: p.FirstSeen, last: p.FirstSeen}
-			a.observers[p.ObserverID] = o
+			o = &nodeObserverAccum{name: display.ObserverName, first: p.FirstSeen, last: p.FirstSeen}
+			a.observers[display.ObserverID] = o
 		}
 		o.count++
-		if p.SNR != nil {
-			o.snrSum += *p.SNR
+		if display.SNR != nil {
+			o.snrSum += *display.SNR
 			o.snrCount++
 		}
-		if p.RSSI != nil {
-			o.rssiSum += *p.RSSI
+		if display.RSSI != nil {
+			o.rssiSum += *display.RSSI
 			o.rssiCount++
 		}
 		if p.FirstSeen < o.first {

@@ -49,14 +49,8 @@ type StoreTx struct {
 	ScopeName        *string
 	Observations     []*StoreObs
 	ObservationCount int
-	// Display fields from longest-path observation
-	ObserverID          string
-	ObserverName        string
-	ObserverIATA        string
-	SNR                 *float64
-	RSSI                *float64
-	PathJSON            string
-	Direction           string
+	// Display metadata belongs to the longest-path observation.
+	selectedObservation *StoreObs
 	LatestSeen          string // max observation timestamp (or FirstSeen if no observations)
 	UniqueObserverCount int    // cached count of distinct observer IDs
 	// Cached parsed fields (set once, read many)
@@ -1872,39 +1866,41 @@ func pickBestObservation(tx *StoreTx) {
 }
 
 func pickBestObservationWithPaths(tx *StoreTx, paths loadParsedPaths) {
-	if len(tx.Observations) == 0 {
-		setTxPath(tx, tx.PathJSON, paths)
-		return
-	}
-	best := tx.Observations[0]
-	bestLen := pathLen(best.PathJSON)
-	for _, obs := range tx.Observations[1:] {
-		l := pathLen(obs.PathJSON)
-		if l > bestLen {
-			best = obs
-			bestLen = l
+	best := tx.selectedObservation
+	if len(tx.Observations) != 0 {
+		best = tx.Observations[0]
+		bestLen := pathLen(best.PathJSON)
+		for _, obs := range tx.Observations[1:] {
+			if length := pathLen(obs.PathJSON); length > bestLen {
+				best = obs
+				bestLen = length
+			}
 		}
 	}
-	tx.ObserverID = best.ObserverID
-	tx.ObserverName = best.ObserverName
-	tx.ObserverIATA = best.ObserverIATA
-	tx.SNR = best.SNR
-	tx.RSSI = best.RSSI
-	tx.Direction = best.Direction
-	setTxPath(tx, best.PathJSON, paths)
+	setDisplayObservation(tx, best, paths)
 }
 
-// setTxPath sets tx's display path and fills its parsed-path cache. It runs
-// where tx is written (s.mu held for writing, or tx not yet in the store),
-// so readers calling txGetParsedPath under s.mu.RLock find the cache full
-// instead of filling it concurrently (#2237).
-func setTxPath(tx *StoreTx, pathJSON string, paths loadParsedPaths) {
-	if tx.pathParsed && tx.PathJSON == pathJSON {
-		return
+var emptyDisplayObservation StoreObs
+
+// displayObservation returns read-only display metadata. The caller owns tx
+// or holds the store lock, which also protects changes to the selection.
+func (tx *StoreTx) displayObservation() *StoreObs {
+	if tx.selectedObservation == nil {
+		return &emptyDisplayObservation
 	}
-	tx.PathJSON = pathJSON
-	tx.parsedPath = paths.parse(pathJSON)
-	tx.pathParsed = true
+	return tx.selectedObservation
+}
+
+// setDisplayObservation runs before publication or under the store write
+// lock, so readers never need to fill the parsed-path cache concurrently.
+func setDisplayObservation(tx *StoreTx, selected *StoreObs, paths loadParsedPaths) {
+	previousPath := tx.displayObservation().PathJSON
+	tx.selectedObservation = selected
+	path := tx.displayObservation().PathJSON
+	if !tx.pathParsed || previousPath != path {
+		tx.parsedPath = paths.parse(path)
+		tx.pathParsed = true
+	}
 }
 
 // rechargeTx re-estimates tx and returns the change since it was last charged,
@@ -2350,22 +2346,23 @@ func (s *PacketStore) groupedPage(txs []groupedEntry, total, offset, limit int) 
 // owns tx. Of tx.Observations only the slice header is copied: ingest
 // appends to it, which never changes the elements the header covers.
 func snapshotGroupedRow(tx *StoreTx) groupedRow {
+	display := tx.displayObservation()
 	return groupedRow{
 		hash:             tx.Hash,
 		firstSeen:        tx.FirstSeen,
 		latest:           tx.LatestSeen,
-		observerID:       tx.ObserverID,
-		observerName:     tx.ObserverName,
-		observerIATA:     tx.ObserverIATA,
-		pathJSON:         tx.PathJSON,
+		observerID:       display.ObserverID,
+		observerName:     display.ObserverName,
+		observerIATA:     display.ObserverIATA,
+		pathJSON:         display.PathJSON,
 		rawHex:           tx.RawHex,
 		decodedJSON:      tx.DecodedJSON,
 		observationCount: tx.ObservationCount,
 		observerCount:    tx.UniqueObserverCount,
 		payloadType:      tx.PayloadType,
 		routeType:        tx.RouteType,
-		snr:              tx.SNR,
-		rssi:             tx.RSSI,
+		snr:              display.SNR,
+		rssi:             display.RSSI,
 		scopeName:        tx.ScopeName,
 		radio:            txRadio(tx),
 		observations:     tx.Observations,
@@ -2848,7 +2845,7 @@ func (s *PacketStore) GetStoreMemoryBreakdown() *StoreMemoryBreakdown {
 		}
 		txRawHex += int64(len(tx.RawHex) + strHdr)
 		txDecodedJSON += int64(len(tx.DecodedJSON) + strHdr)
-		txPathJSON += int64(len(tx.PathJSON) + strHdr)
+		txPathJSON += int64(len(tx.displayObservation().PathJSON) + strHdr)
 		b := estimateStoreTxBytes(tx)
 		totalTxBytes += b
 		if isFlood {
@@ -3408,7 +3405,7 @@ func (s *PacketStore) ingestNewTransmissions(sinceID, limit int) ([]packetFields
 			if tx.PayloadType != nil && *tx.PayloadType == 5 {
 				inv.hasChannelData = true
 			}
-			if tx.PathJSON != "" {
+			if tx.displayObservation().PathJSON != "" {
 				inv.hasNewPaths = true
 			}
 			if inv.hasNewObservations && inv.hasChannelData && inv.hasNewPaths {
@@ -3615,10 +3612,10 @@ func (s *PacketStore) ingestLateObservations(sinceObsID, limit int, delivered ob
 
 	var changedTxs []*StoreTx
 	for _, tx := range updatedTxs {
-		oldPath := tx.PathJSON
+		oldPath := tx.displayObservation().PathJSON
 		pickBestObservation(tx)
 		s.trackedBytes += rechargeTx(tx)
-		if tx.PathJSON == oldPath {
+		if tx.displayObservation().PathJSON == oldPath {
 			continue
 		}
 		// Resolved pubkeys are indexed independently of the best raw path.
@@ -4225,6 +4222,7 @@ func enrichObsFields(obs *StoreObs, tx *StoreTx) map[string]interface{} {
 
 // txToMap converts a StoreTx to the map shape matching scanTransmissionRow output.
 func txToMap(tx *StoreTx, includeObservations ...bool) map[string]interface{} {
+	display := tx.displayObservation()
 	m := map[string]interface{}{
 		"id":                tx.ID,
 		"raw_hex":           strOrNil(tx.RawHex),
@@ -4235,13 +4233,13 @@ func txToMap(tx *StoreTx, includeObservations ...bool) map[string]interface{} {
 		"payload_type":      intPtrOrNil(tx.PayloadType),
 		"decoded_json":      strOrNil(tx.DecodedJSON),
 		"observation_count": tx.ObservationCount,
-		"observer_id":       strOrNil(tx.ObserverID),
-		"observer_name":     strOrNil(tx.ObserverName),
-		"observer_iata":     strOrNil(tx.ObserverIATA),
-		"snr":               floatPtrOrNil(tx.SNR),
-		"rssi":              floatPtrOrNil(tx.RSSI),
-		"path_json":         strOrNil(tx.PathJSON),
-		"direction":         strOrNil(tx.Direction),
+		"observer_id":       strOrNil(display.ObserverID),
+		"observer_name":     strOrNil(display.ObserverName),
+		"observer_iata":     strOrNil(display.ObserverIATA),
+		"snr":               floatPtrOrNil(display.SNR),
+		"rssi":              floatPtrOrNil(display.RSSI),
+		"path_json":         strOrNil(display.PathJSON),
+		"direction":         strOrNil(display.Direction),
 		"scope_name":        strPtrOrNil(tx.ScopeName),
 		"radio":             strOrNil(txRadio(tx)),
 	}
@@ -4362,12 +4360,12 @@ func resolvePayloadTypeName(pt *int) string {
 // txGetParsedPath returns cached parsed path hops, parsing on first call.
 // Readers must not be the first caller (#2237): a tx's cache is filled under
 // the write lock where it is created (rechargeTx, via estimateStoreTxBytes)
-// and where its path changes (pickBestObservation, via setTxPath).
+// and where its displayed observation changes (setDisplayObservation).
 func txGetParsedPath(tx *StoreTx) []string {
 	if tx.pathParsed {
 		return tx.parsedPath
 	}
-	tx.parsedPath = parsePathJSON(tx.PathJSON)
+	tx.parsedPath = parsePathJSON(tx.displayObservation().PathJSON)
 	tx.pathParsed = true
 	return tx.parsedPath
 }
@@ -4885,7 +4883,7 @@ const (
 // Includes byPathHop entries.
 func estimateStoreTxBytes(tx *StoreTx) int64 {
 	base := int64(storeTxBaseBytes)
-	base += int64(len(tx.RawHex) + len(tx.Hash) + len(tx.DecodedJSON) + len(tx.PathJSON))
+	base += int64(len(tx.RawHex) + len(tx.Hash) + len(tx.DecodedJSON) + len(tx.displayObservation().PathJSON))
 	base += int64(numIndexesPerTx * indexEntryBytes)
 	base += int64(decodedCacheFactor * len(tx.DecodedJSON))
 
@@ -5404,7 +5402,7 @@ func appendHopContextPubkeys(out []string, tx *StoreTx, pm *prefixMap) []string 
 	// prefix. The full prefix-map lookup would also be acceptable, but the
 	// hex+length check is O(len) and avoids one map probe per tx on a hot
 	// path. See #1197 (adversarial r1 #4).
-	if obs := tx.ObserverID; obs != "" && len(obs) >= 4 && isHexAnyCase(obs) {
+	if obs := tx.displayObservation().ObserverID; obs != "" && len(obs) >= 4 && isHexAnyCase(obs) {
 		add(obs)
 	}
 
@@ -5609,7 +5607,7 @@ func computeDistancesForTx(tx *StoreTx, nodeByPk map[string]*nodeInfo, repeaterS
 			FromName: a.Name, FromPk: a.PublicKey,
 			ToName: b.Name, ToPk: b.PublicKey,
 			Dist: roundedDist, Type: hopType,
-			SNR: tx.SNR, Hash: tx.Hash, Timestamp: tx.FirstSeen,
+			SNR: tx.displayObservation().SNR, Hash: tx.Hash, Timestamp: tx.FirstSeen,
 			HourBucket: hourBucket, tx: tx,
 		})
 		hopDetails = append(hopDetails, distHopDetail{
@@ -5992,9 +5990,9 @@ func (s *PacketStore) GetChannelMessages(channelHash string, limit, offset int, 
 			existing.Repeats++
 			existing.Data["repeats"] = existing.Repeats
 			// Add observer if new
-			obsName := tx.ObserverName
+			obsName := tx.displayObservation().ObserverName
 			if obsName == "" {
-				obsName = tx.ObserverID
+				obsName = tx.displayObservation().ObserverID
 			}
 			if obsName != "" {
 				found := false
@@ -6020,11 +6018,11 @@ func (s *PacketStore) GetChannelMessages(channelHash string, limit, offset int, 
 				}
 			}
 
-			hops := pathLen(tx.PathJSON)
+			hops := pathLen(tx.displayObservation().PathJSON)
 
 			var snrVal interface{}
-			if tx.SNR != nil {
-				snrVal = *tx.SNR
+			if tx.displayObservation().SNR != nil {
+				snrVal = *tx.displayObservation().SNR
 			}
 
 			senderTs := decoded.SenderTimestamp
@@ -6043,9 +6041,9 @@ func (s *PacketStore) GetChannelMessages(channelHash string, limit, offset int, 
 			}
 
 			observers := []string{}
-			obsName := tx.ObserverName
+			obsName := tx.displayObservation().ObserverName
 			if obsName == "" {
-				obsName = tx.ObserverID
+				obsName = tx.displayObservation().ObserverID
 			}
 			if obsName != "" {
 				observers = []string{obsName}
@@ -6682,11 +6680,11 @@ func aggregateRF(estCap, txCap int, regional bool, areaNodes map[string]bool, wi
 		if len(tx.Observations) == 0 {
 			// Legacy transmissions can have signal and a timestamp without observations.
 			totalObs++
-			if tx.SNR != nil {
-				snrVals = append(snrVals, *tx.SNR)
+			if tx.displayObservation().SNR != nil {
+				snrVals = append(snrVals, *tx.displayObservation().SNR)
 			}
-			if tx.RSSI != nil {
-				rssiVals = append(rssiVals, *tx.RSSI)
+			if tx.displayObservation().RSSI != nil {
+				rssiVals = append(rssiVals, *tx.displayObservation().RSSI)
 			}
 			updateTimeSpan(tx.FirstSeen)
 			if len(tx.FirstSeen) >= 13 {
@@ -7778,10 +7776,10 @@ func (s *PacketStore) aggregateTopology(uniqueNodes int, pm *prefixMap, areaNode
 		totalPaths++
 		totalHops += n
 		maxHops = max(maxHops, n)
-		if tx.SNR != nil {
+		if tx.displayObservation().SNR != nil {
 			signal := hopSnr[n]
 			signal.count++
-			signal.sum += *tx.SNR
+			signal.sum += *tx.displayObservation().SNR
 			hopSnr[n] = signal
 		}
 		for _, h := range hops {
@@ -7810,9 +7808,9 @@ func (s *PacketStore) aggregateTopology(uniqueNodes int, pm *prefixMap, areaNode
 			pairFreq[a+"|"+b]++
 		}
 
-		obsID := tx.ObserverID
+		obsID := tx.displayObservation().ObserverID
 		if obsID != "" {
-			observerMap[obsID] = tx.ObserverName
+			observerMap[obsID] = tx.displayObservation().ObserverName
 		}
 		if _, ok := perObserver[obsID]; !ok {
 			perObserver[obsID] = map[string]*struct{ minDist, maxDist, count int }{}
@@ -9875,6 +9873,7 @@ func (s *PacketStore) GetBulkHealth(limit int, region, area string) []map[string
 		totalObservations := 0
 
 		for _, pkt := range packets {
+			display := pkt.displayObservation()
 			totalObservations += pkt.ObservationCount
 			if totalObservations == 0 {
 				totalObservations = 1
@@ -9882,12 +9881,12 @@ func (s *PacketStore) GetBulkHealth(limit int, region, area string) []map[string
 			if pkt.FirstSeen > todayStart {
 				packetsToday++
 			}
-			if pkt.SNR != nil {
-				snrSum += *pkt.SNR
+			if display.SNR != nil {
+				snrSum += *display.SNR
 				snrCount++
 			}
-			if pkt.ObserverID != "" {
-				relayObservers[pkt.ObserverID] = struct{}{}
+			if display.ObserverID != "" {
+				relayObservers[display.ObserverID] = struct{}{}
 			}
 		}
 
@@ -9978,12 +9977,13 @@ func (s *PacketStore) GetNodeHealth(pubkey string) (map[string]interface{}, erro
 	relayObservers := map[string]struct{}{}
 
 	for _, pkt := range packets {
+		display := pkt.displayObservation()
 		totalObservations += pkt.ObservationCount
 		if pkt.FirstSeen > todayStart {
 			packetsToday++
 		}
-		if pkt.SNR != nil {
-			snrSum += *pkt.SNR
+		if display.SNR != nil {
+			snrSum += *display.SNR
 			snrCount++
 		}
 		// Hop counting
@@ -9992,8 +9992,8 @@ func (s *PacketStore) GetNodeHealth(pubkey string) (map[string]interface{}, erro
 			totalHops += len(hops)
 			hopCount++
 		}
-		if pkt.ObserverID != "" {
-			relayObservers[pkt.ObserverID] = struct{}{}
+		if display.ObserverID != "" {
+			relayObservers[display.ObserverID] = struct{}{}
 		}
 	}
 

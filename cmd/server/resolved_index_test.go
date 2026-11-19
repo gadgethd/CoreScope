@@ -444,7 +444,7 @@ func TestPathsThroughNode_NilResolvedPathFallback(t *testing.T) {
 	store.initResolvedPathIndex()
 
 	// tx with no resolved path data at all
-	tx := &StoreTx{ID: 1, PathJSON: `["aa"]`}
+	tx := &StoreTx{selectedObservation: &StoreObs{PathJSON: `["aa"]`}, ID: 1}
 	store.byPathHop["aa"] = []*StoreTx{tx}
 
 	// Should match because no resolved_path data = can't disambiguate
@@ -621,7 +621,7 @@ func TestDecodeWindow_LockHoldTimeBounded(t *testing.T) {
 	// Simulate decode-window for 100 observations with 5 hops each
 	start := time.Now()
 	for i := 0; i < 100; i++ {
-		tx := &StoreTx{ID: i, Hash: "h", PathJSON: `["a","b","c","d","e"]`}
+		tx := &StoreTx{selectedObservation: &StoreObs{PathJSON: `["a","b","c","d","e"]`}, ID: i, Hash: "h"}
 		pks := []string{"pk1", "pk2", "pk3", "pk4", "pk5"}
 		for _, pk := range pks {
 			store.addToByNode(tx, pk)
@@ -692,9 +692,9 @@ func BenchmarkLoad_BeforeAfter(b *testing.B) {
 
 		for i := 0; i < numTx; i++ {
 			tx := &StoreTx{
-				ID:       i,
-				Hash:     string(rune(i)),
-				PathJSON: `["aa","bb","cc"]`,
+				selectedObservation: &StoreObs{PathJSON: `["aa","bb","cc"]`},
+				ID:                  i,
+				Hash:                string(rune(i)),
 			}
 			store.packets = append(store.packets, tx)
 			store.byHash[tx.Hash] = tx
@@ -749,9 +749,9 @@ func BenchmarkLoad_OldFieldStorage(b *testing.B) {
 
 		for i := 0; i < numTx; i++ {
 			tx := &StoreTx{
-				ID:       i,
-				Hash:     string(rune(i)),
-				PathJSON: `["aa","bb","cc"]`,
+				selectedObservation: &StoreObs{PathJSON: `["aa","bb","cc"]`},
+				ID:                  i,
+				Hash:                string(rune(i)),
 			}
 			packets = append(packets, tx)
 			byHash[tx.Hash] = tx

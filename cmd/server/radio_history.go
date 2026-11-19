@@ -314,10 +314,10 @@ func txRadio(tx *StoreTx) string {
 	h := radioHistory.Load()
 	var fallback *StoreObs
 	for _, o := range tx.Observations {
-		if o.ObserverID != tx.ObserverID {
+		if o.ObserverID != tx.displayObservation().ObserverID {
 			continue
 		}
-		if o.PathJSON == tx.PathJSON {
+		if o.PathJSON == tx.displayObservation().PathJSON {
 			return h.radioForObservation(o)
 		}
 		if fallback == nil {
@@ -327,7 +327,7 @@ func txRadio(tx *StoreTx) string {
 	if fallback != nil {
 		return h.radioForObservation(fallback)
 	}
-	return h.radioAt(tx.ObserverID, "", tx.FirstSeen)
+	return h.radioAt(tx.displayObservation().ObserverID, "", tx.FirstSeen)
 }
 
 // txMatchesRadio reports whether some observation of tx was heard on radio

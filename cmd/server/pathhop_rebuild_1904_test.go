@@ -28,7 +28,7 @@ const (
 
 // pathHopTx builds a transmission whose wire path is a single raw hop.
 func pathHopTx(id int, path string) *StoreTx {
-	return &StoreTx{ID: id, Hash: "pathhop-tx-" + path, PathJSON: `["` + hop1904Raw + `"]`}
+	return &StoreTx{selectedObservation: &StoreObs{PathJSON: `["` + hop1904Raw + `"]`}, ID: id, Hash: "pathhop-tx-" + path}
 }
 
 func newPathHopStore(packets []*StoreTx, idx map[string][]*StoreTx) *PacketStore {

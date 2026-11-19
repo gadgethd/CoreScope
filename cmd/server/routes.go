@@ -3245,8 +3245,8 @@ func (s *Server) handleAudioLabBuckets(w http.ResponseWriter, r *http.Request) {
 					DecodedJSON:      strOrNil(tx.DecodedJSON),
 					ObservationCount: max(tx.ObservationCount, 1),
 					PayloadType:      pt,
-					PathJSON:         strOrNil(tx.PathJSON),
-					ObserverID:       strOrNil(tx.ObserverID),
+					PathJSON:         strOrNil(tx.displayObservation().PathJSON),
+					ObserverID:       strOrNil(tx.displayObservation().ObserverID),
 					Timestamp:        strOrNil(tx.FirstSeen),
 				})
 			}

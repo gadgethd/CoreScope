@@ -167,8 +167,8 @@ func TestComputeDistancesForTx_CompanionNeverInResolvedChain(t *testing.T) {
 	pathJSON, _ := json.Marshal([]string{"7a", "bb"})
 	decoded, _ := json.Marshal(map[string]interface{}{"pubKey": senderPK})
 
-	tx := &StoreTx{
-		PathJSON:    string(pathJSON),
+	tx := &StoreTx{selectedObservation: &StoreObs{PathJSON: string(pathJSON)},
+
 		DecodedJSON: string(decoded),
 		FirstSeen:   "2026-04-30T12:00",
 	}
@@ -243,10 +243,9 @@ func TestBuildHopContextPubkeys_IncludesSenderAndUnambiguousAnchors(t *testing.T
 	observerPK := "dd5555555555"
 	pathJSON, _ := json.Marshal([]string{"ab", "bb"})
 	decoded, _ := json.Marshal(map[string]interface{}{"pubKey": senderPK})
-	tx := &StoreTx{
-		PathJSON:    string(pathJSON),
+	tx := &StoreTx{selectedObservation: &StoreObs{PathJSON: string(pathJSON), ObserverID: observerPK},
+
 		DecodedJSON: string(decoded),
-		ObserverID:  observerPK,
 	}
 
 	got := buildHopContextPubkeys(tx, pm)

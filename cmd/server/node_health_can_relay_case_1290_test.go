@@ -51,15 +51,15 @@ func TestNodeHealth_CanRelayCaseInsensitive_Issue1290(t *testing.T) {
 	routeFlood := RouteFlood
 	payloadAdvert := PayloadADVERT
 	tx := &StoreTx{
-		Hash:             "1290casebadge00",
-		FirstSeen:        now,
-		RouteType:        &routeFlood,
-		PayloadType:      &payloadAdvert,
-		DecodedJSON:      `{"type":"ADVERT","pubKey":"` + nodePubkey + `"}`,
-		SNR:              &snr,
+		selectedObservation: &StoreObs{SNR: &snr, ObserverID: obsIDMixed, ObserverName: "ListenerOnly"},
+		Hash:                "1290casebadge00",
+		FirstSeen:           now,
+		RouteType:           &routeFlood,
+		PayloadType:         &payloadAdvert,
+		DecodedJSON:         `{"type":"ADVERT","pubKey":"` + nodePubkey + `"}`,
+
 		ObservationCount: 1,
-		ObserverID:       obsIDMixed,
-		ObserverName:     "ListenerOnly",
+
 		Observations: []*StoreObs{{
 			ObserverID:   obsIDMixed,
 			ObserverName: "ListenerOnly",

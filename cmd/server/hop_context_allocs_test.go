@@ -13,9 +13,8 @@ func hopContextFixture() (*StoreTx, *prefixMap) {
 		{PublicKey: "bb33000000000000000000000000000000000000000000000000000000000003", Role: "repeater"},
 	})
 	tx := &StoreTx{
-		DecodedJSON: `{"pubKey":"cc44000000000000000000000000000000000000000000000000000000000004"}`,
-		ObserverID:  "DD55000000000000000000000000000000000000000000000000000000000005",
-		PathJSON:    `["AA","BB","aa","AA11"]`,
+		selectedObservation: &StoreObs{ObserverID: "DD55000000000000000000000000000000000000000000000000000000000005", PathJSON: `["AA","BB","aa","AA11"]`},
+		DecodedJSON:         `{"pubKey":"cc44000000000000000000000000000000000000000000000000000000000004"}`,
 	}
 	tx.ParsedDecoded()
 	txGetParsedPath(tx)
@@ -94,7 +93,7 @@ func TestBulkDisplayPathsShareReadOnlyPaths(t *testing.T) {
 
 func TestAggregateHopContextReusesScratch(t *testing.T) {
 	tx, pm := hopContextFixture()
-	tx.ObserverID = strings.ToLower(tx.ObserverID)
+	tx.displayObservation().ObserverID = strings.ToLower(tx.displayObservation().ObserverID)
 	want := buildHopContextPubkeys(tx, pm)
 	scratch := make([]string, 0, 8)
 	if n := testing.AllocsPerRun(200, func() {
@@ -108,7 +107,7 @@ func TestAggregateHopContextReusesScratch(t *testing.T) {
 }
 
 func TestDistanceIndexKeepsAckHopWithoutDecodingUnrelatedFields(t *testing.T) {
-	tx := &StoreTx{DecodedJSON: `{"ackHash":"aabb","sequence":24}`, PathJSON: `["a1","b2"]`}
+	tx := &StoreTx{selectedObservation: &StoreObs{PathJSON: `["a1","b2"]`}, DecodedJSON: `{"ackHash":"aabb","sequence":24}`}
 	a := &nodeInfo{PublicKey: "a1", HasGPS: true, Lat: 51.4, Lon: -0.1}
 	b := &nodeInfo{PublicKey: "b2", HasGPS: true, Lat: 51.5, Lon: -0.1}
 	nodes := map[string]*nodeInfo{"a1": a, "b2": b}

@@ -28,10 +28,11 @@ func phdBenchStore(n int) (store *PacketStore, resolve func(j int) []string) {
 		r1, r2 := relays(i)
 		pt := 2
 		tx := &StoreTx{
-			ID:          i + 1,
-			Hash:        fmt.Sprintf("late%07d", i),
-			FirstSeen:   start.Add(time.Duration(i) * time.Second).Format(time.RFC3339),
-			PathJSON:    fmt.Sprintf(`["%02x","%02x","%02x"]`, r1%256, r2%256, (i*13+5)%256),
+			selectedObservation: &StoreObs{PathJSON: fmt.Sprintf(`["%02x","%02x","%02x"]`, r1%256, r2%256, (i*13+5)%256)},
+			ID:                  i + 1,
+			Hash:                fmt.Sprintf("late%07d", i),
+			FirstSeen:           start.Add(time.Duration(i) * time.Second).Format(time.RFC3339),
+
 			PayloadType: &pt,
 		}
 		store.packets = append(store.packets, tx)

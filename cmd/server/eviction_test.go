@@ -39,12 +39,12 @@ func makeTestStore(count int, startTime time.Time, intervalMin int) *PacketStore
 		decodedJSON := fmt.Sprintf(`{"pubKey":"pk%04d"}`, i)
 
 		tx := &StoreTx{
-			ID:          txID,
-			Hash:        hash,
-			FirstSeen:   ts.UTC().Format(time.RFC3339),
-			PayloadType: &pt,
-			DecodedJSON: decodedJSON,
-			PathJSON:    `["aa","bb","cc"]`,
+			selectedObservation: &StoreObs{PathJSON: `["aa","bb","cc"]`},
+			ID:                  txID,
+			Hash:                hash,
+			FirstSeen:           ts.UTC().Format(time.RFC3339),
+			PayloadType:         &pt,
+			DecodedJSON:         decodedJSON,
 		}
 
 		// Add 2 observations per tx
@@ -554,16 +554,16 @@ func TestMultiplePassesConverge(t *testing.T) {
 
 func TestEstimateStoreTxBytes(t *testing.T) {
 	tx := &StoreTx{
-		RawHex:      "aabbcc",
-		Hash:        "hash1234",
-		DecodedJSON: `{"pubKey":"pk1"}`,
-		PathJSON:    `["aa","bb"]`,
+		selectedObservation: &StoreObs{PathJSON: `["aa","bb"]`},
+		RawHex:              "aabbcc",
+		Hash:                "hash1234",
+		DecodedJSON:         `{"pubKey":"pk1"}`,
 	}
 	est := estimateStoreTxBytes(tx)
 	// Manual calculation: base + string lengths + index entries + perTxMaps + path hops
 	// (subpaths are counted per request, so they cost the store nothing)
 	hops := int64(len(txGetParsedPath(tx)))
-	manualCalc := int64(storeTxBaseBytes) + int64(len(tx.RawHex)+len(tx.Hash)+len(tx.DecodedJSON)+len(tx.PathJSON)) + int64(numIndexesPerTx*indexEntryBytes)
+	manualCalc := int64(storeTxBaseBytes) + int64(len(tx.RawHex)+len(tx.Hash)+len(tx.DecodedJSON)+len(tx.displayObservation().PathJSON)) + int64(numIndexesPerTx*indexEntryBytes)
 	manualCalc += int64(decodedCacheFactor * len(tx.DecodedJSON))
 	manualCalc += hops * perPathHopBytes
 	if est != manualCalc {

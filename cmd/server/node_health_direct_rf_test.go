@@ -31,15 +31,14 @@ func TestNodeHealth_RelayedObserverIsNotHeardBy(t *testing.T) {
 	// A long flood path that merely passes through the node. The observer
 	// at the far end saw the packet; it never heard this node.
 	relayed := &StoreTx{
-		Hash:             "directrf-relayed",
-		FirstSeen:        now,
-		RouteType:        &routeFlood,
-		PayloadType:      &payload,
-		SNR:              &snr,
-		RSSI:             &rssi,
+		selectedObservation: &StoreObs{SNR: &snr, RSSI: &rssi, ObserverID: "farawayobserver", ObserverName: "FarAway"},
+		Hash:                "directrf-relayed",
+		FirstSeen:           now,
+		RouteType:           &routeFlood,
+		PayloadType:         &payload,
+
 		ObservationCount: 1,
-		ObserverID:       "farawayobserver",
-		ObserverName:     "FarAway",
+
 		Observations: []*StoreObs{{
 			ObserverID:   "farawayobserver",
 			ObserverName: "FarAway",
