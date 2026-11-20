@@ -177,7 +177,7 @@ func (p *retainedPacket) spansNode(keys map[string]bool, pm *prefixMap) bool {
 	for _, obs := range p.tx.Observations {
 		path := p.paths[obs.ID]
 		if len(path) == 0 && pm != nil && obs.PathJSON != "" && obs.PathJSON != "[]" {
-			path = resolvePathForObsColdLoad(obs.PathJSON, obs.ObserverID, p.tx, pm, &skipped)
+			path = resolvePathForObsColdLoad(obs.PathJSON, obs.ObserverID, p.tx, pm, &skipped, nil, nil)
 		}
 		for _, relay := range path {
 			if relay != nil && keys[*relay] {

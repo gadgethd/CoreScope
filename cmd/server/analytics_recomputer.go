@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,14 +36,42 @@ func (g *analyticsWorkGate) acquire(stop <-chan struct{}) bool {
 	}
 	select {
 	case <-stop:
-		g.release()
+		// No compute ran, so there is no scratch to reclaim: free the slot
+		// without a forced GC, keeping shutdown inside Stop's timeout.
+		g.releaseSlot()
 		return false
 	default:
 		return true
 	}
 }
 
-func (g *analyticsWorkGate) release() { <-g.slot }
+// release reclaims the finished compute's scratch, then frees the slot
+// (lean-runtime Stage 1). The gate serializes scratch-heavy recomputes, yet
+// serialization alone does not bound the SEQUENTIAL peak: each analytics
+// compute allocates ~5-27 MiB of transient maps/slices (aggregateRF's
+// snr/rssi/size buffers, hash-sizes' adopter map, topology's filtered slice),
+// and with GOMEMLIMIT below the retained live heap the GC cannot reclaim them
+// fast enough between back-to-back passes. Across the startup / 5-minute
+// pass (11 analytics computes; the neighbor-graph and repeater-enrich
+// refreshes share the gate) that scratch accumulated on top of the ~440 MiB
+// live baseline and breached the 512 MiB container cap (measured OOM at the
+// first periodic pass, t≈310 s). Reclaiming BEFORE the slot is freed bounds
+// the peak to the live baseline plus a SINGLE compute's scratch instead of
+// the sum; together with the aggregateRF signal-slice pre-size the measured
+// working peak is 488-496 MiB under the 512 MiB cap. The reclaim runs while
+// the slot is still held, so the next compute cannot start allocating until
+// it finishes. Only background work acquires the gate (requests read the
+// atomic cache, never the gate); the forced GC is process-wide, but with
+// GOMEMLIMIT below the live heap the pacer is already saturated, so it adds
+// no meaningful request-path stall.
+func (g *analyticsWorkGate) release() {
+	runtime.GC()
+	g.releaseSlot()
+}
+
+// releaseSlot frees the slot without a forced GC. Used by acquire's
+// stop-abort path, where no compute ran and there is nothing to reclaim.
+func (g *analyticsWorkGate) releaseSlot() { <-g.slot }
 
 // analyticsRecomputer holds the latest snapshot of an analytics result
 // in an atomic.Value, refreshed periodically by a background goroutine.

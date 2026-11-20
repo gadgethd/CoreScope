@@ -1049,6 +1049,8 @@ func (s *PacketStore) Load() error {
 	scanArgs = append(scanArgs, &radioID)
 
 	paths := make(loadPathStrings)
+	pathPool := make(loadParsedPaths)
+	lowerCache := make(map[string]string, 64)
 	var timestamps loadTimestamps
 	for rows.Next() {
 		if err := rows.Scan(scanArgs...); err != nil {
@@ -1131,7 +1133,7 @@ func (s *PacketStore) Load() error {
 				// what the node-analytics activity timeline reads.
 				// PR #1643 R1 munger #1: gate on unique_prefix only — ambiguous
 				// hops are silently dropped (skipped counter logged at end).
-				rp := resolvePathForObsColdLoad(obsPJ, obsIDStr, tx, relayPM, &coldLoadAmbiguousHopsSkipped)
+				rp := resolvePathForObsColdLoad(obsPJ, obsIDStr, tx, relayPM, &coldLoadAmbiguousHopsSkipped, pathPool, lowerCache)
 				s.indexColdLoadRelayHops(tx, extractResolvedPubkeys(rp), relayPM, obs)
 			}
 
@@ -1350,6 +1352,8 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 	localByObsID := make(map[int]*StoreObs)
 	localByObserver := make(map[string][]*StoreObs)
 	paths := make(loadPathStrings)
+	pathPool := make(loadParsedPaths)
+	lowerCache := make(map[string]string, 64)
 	var timestamps loadTimestamps
 	// Issue #1558: accumulate the union of resolved_path relay-hop
 	// pubkeys per tx outside the lock. We unmarshal + dedupe here so the
@@ -1486,7 +1490,7 @@ func (s *PacketStore) loadChunk(from, to time.Time) error {
 				// handleNodePaths cross-checks against the NULL resolved_path
 				// column (#1352).
 				// PR #1643 R1 munger #1: unique_prefix-only gate.
-				rp := resolvePathForObsColdLoad(obsPJ, obsIDStr, tx, relayPM, &coldLoadAmbiguousHopsSkipped)
+				rp := resolvePathForObsColdLoad(obsPJ, obsIDStr, tx, relayPM, &coldLoadAmbiguousHopsSkipped, pathPool, lowerCache)
 				pks := extractResolvedPubkeys(rp)
 				accumulateDedup(localByNodePKsByTx, localByNodeSeenByTx, txID, pks)
 			}
@@ -3346,7 +3350,7 @@ func (s *PacketStore) ingestNewTransmissions(sinceID, limit int) ([]packetFields
 
 	// Incrementally update the path-hop index with new transmissions.
 	for _, tx := range broadcastTxs {
-		addTxToPathHopIndex(s.byPathHop, tx)
+		addTxToPathHopIndex(s.byPathHop, tx, nil)
 	}
 	if len(broadcastTxs) > 0 {
 		s.invalidateRelayStatsCache()
@@ -3625,7 +3629,7 @@ func (s *PacketStore) ingestLateObservations(sinceObsID, limit int, delivered ob
 			removeTxFromPathHopIndex(s.byPathHop, tx)
 			tx.parsedPath, tx.pathParsed = saved, savedFlag
 		}
-		addTxToPathHopIndex(s.byPathHop, tx)
+		addTxToPathHopIndex(s.byPathHop, tx, nil)
 		changedTxs = append(changedTxs, tx)
 	}
 	if len(changedTxs) > 0 {
@@ -4377,8 +4381,9 @@ func txGetParsedPath(tx *StoreTx) []string {
 func (s *PacketStore) buildPathHopIndex() {
 	prev := s.byPathHop
 	s.byPathHop = make(map[string][]*StoreTx, max(4096, len(prev)))
+	lowerCache := make(map[string]string, 256)
 	for _, tx := range s.packets {
-		addTxToPathHopIndex(s.byPathHop, tx)
+		addTxToPathHopIndex(s.byPathHop, tx, lowerCache)
 	}
 	retained := s.retainResolvedPathHops(prev)
 	log.Printf("[store] Built path-hop index: %d unique keys (%d resolved-hop entries retained)",
@@ -4462,14 +4467,39 @@ func (s *PacketStore) retainResolvedPathHops(prev map[string][]*StoreTx) int {
 
 // addTxToPathHopIndex indexes a transmission under each unique raw hop key.
 // Resolved pubkey keys are handled by the decode-window via feedDecodeWindowConsumers.
-func addTxToPathHopIndex(idx map[string][]*StoreTx, tx *StoreTx) {
+// lowerCache may be nil (one-off callers); bulk passes share one cache so a
+// repeating hop does not re-allocate its lowercase key per transmission.
+func addTxToPathHopIndex(idx map[string][]*StoreTx, tx *StoreTx, lowerCache map[string]string) {
 	hops := txGetParsedPath(tx)
 	if len(hops) == 0 {
 		return
 	}
+	if len(hops) <= 8 {
+		// Short paths are the common case: linear dedup over a stack array
+		// avoids a per-transmission map allocation (hundreds of thousands
+		// of maps on a cold load).
+		var seen [8]string
+		n := 0
+		for _, hop := range hops {
+			key := cachedToLower(lowerCache, hop)
+			dup := false
+			for i := 0; i < n; i++ {
+				if seen[i] == key {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				seen[n] = key
+				n++
+				idx[key] = append(idx[key], tx)
+			}
+		}
+		return
+	}
 	seen := make(map[string]bool, len(hops))
 	for _, hop := range hops {
-		key := strings.ToLower(hop)
+		key := cachedToLower(lowerCache, hop)
 		if !seen[key] {
 			seen[key] = true
 			idx[key] = append(idx[key], tx)
@@ -6545,14 +6575,28 @@ type rfPacketCounts struct {
 
 func aggregateRF(estCap, txCap int, regional bool, areaNodes map[string]bool, window TimeWindow,
 	scan func(addTransmission func(*StoreTx, *rfPacketCounts), addRegional func(*StoreObs, *StoreTx)) error) (packetFields, error) {
-	snrVals := make([]float64, 0, estCap/2)
-	rssiVals := make([]float64, 0, estCap/2)
+	// Pre-size the signal accumulators to estCap (the total-observation upper
+	// bound), NOT estCap/2 or estCap/4. Nearly every retained observation carries
+	// SNR/RSSI, so the half/quarter estimates were too small: the slices grew via
+	// Go's 1.25x large-slice reallocation, and the cumulative backing-array
+	// garbage profiled at ~68 MiB per RF pass (rssi 14.7 + snr 14.7 + scatter
+	// 38.8 MiB) on the 533k-observation fixture. On top of the ~440 MiB
+	// populated-cache baseline that breached the 512 MiB cap at the periodic
+	// recompute (lean-runtime Stage 1). Sizing to estCap lets the resident
+	// periodic scan (retained=false, ≤2M obs) append without growth: identical
+	// values/output, ~17 MiB live instead of ~68 MiB of churn. This is a
+	// capacity hint, not a hard bound: legacy transmissions without
+	// observations, retained-mode request scans larger than the resident
+	// cache, and >2M-observation stores can still exceed estCap, and append
+	// grows them correctly (as it did before).
+	snrVals := make([]float64, 0, estCap)
+	rssiVals := make([]float64, 0, estCap)
 	packetSizes := make([]int, 0, txCap)
 	typeBuckets := map[int]int{}
 	hourBuckets := map[string]int{}
 	snrByType := map[string]rfSignal{}
 	sigTime := map[string]rfSignal{}
-	scatterAll := make([]struct{ snr, rssi float64 }, 0, estCap/4)
+	scatterAll := make([]struct{ snr, rssi float64 }, 0, estCap)
 	totalObs, totalTransmissions := 0, 0
 	var minTimestamp, maxTimestamp string
 

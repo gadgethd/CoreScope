@@ -167,8 +167,12 @@ func resolvePathForObs(pathJSON, observerID string, tx *StoreTx, pm *prefixMap, 
 // summary log line at the end of Load surfaces the total).
 //
 // Under-attribute > mis-attribute (reviewer consensus on PR #1643).
-func resolvePathForObsColdLoad(pathJSON, observerID string, tx *StoreTx, pm *prefixMap, skipped *int) []*string {
-	hops := parsePathJSON(pathJSON)
+//
+// pool and lowerCache are per-load-pass shares (both nil-safe): repeated
+// path_json parses once, and repeated hop/pubkey lowercase keys allocate
+// once, instead of once per observation. One-off read paths pass nil.
+func resolvePathForObsColdLoad(pathJSON, observerID string, tx *StoreTx, pm *prefixMap, skipped *int, pool loadParsedPaths, lowerCache map[string]string) []*string {
+	hops := pool.parse(pathJSON)
 	if len(hops) == 0 {
 		return nil
 	}
@@ -183,9 +187,11 @@ func resolvePathForObsColdLoad(pathJSON, observerID string, tx *StoreTx, pm *pre
 		// observation_count_fallback would still pick a winner for
 		// ambiguous prefixes, which is exactly what we must NOT do.
 		// Hence the explicit candidate-count check here.
-		candidates := pm.relayCandidates(hop)
+		// Pre-lowercasing through the cache keeps relayCandidates'
+		// internal ToLower allocation-free on the repeat path.
+		candidates := pm.relayCandidates(cachedToLower(lowerCache, hop))
 		if len(candidates) == 1 {
-			pk := strings.ToLower(candidates[0].PublicKey)
+			pk := cachedToLower(lowerCache, candidates[0].PublicKey)
 			resolved[i] = &pk
 			continue
 		}

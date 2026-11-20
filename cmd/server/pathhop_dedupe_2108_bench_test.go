@@ -39,7 +39,7 @@ func phdBenchStore(n int) (store *PacketStore, resolve func(j int) []string) {
 		store.byHash[tx.Hash] = tx
 		store.byTxID[tx.ID] = tx
 		store.byPayloadType[pt] = append(store.byPayloadType[pt], tx)
-		addTxToPathHopIndex(store.byPathHop, tx)
+		addTxToPathHopIndex(store.byPathHop, tx, nil)
 		store.indexResolvedPathHops(tx, resolve(i), hopsSeen, nil, nil)
 	}
 	return store, resolve

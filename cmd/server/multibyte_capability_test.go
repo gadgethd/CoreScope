@@ -54,7 +54,7 @@ func addTestPacket(store *PacketStore, tx *StoreTx) {
 	if tx.PayloadType != nil {
 		store.byPayloadType[*tx.PayloadType] = append(store.byPayloadType[*tx.PayloadType], tx)
 	}
-	addTxToPathHopIndex(store.byPathHop, tx)
+	addTxToPathHopIndex(store.byPathHop, tx, nil)
 }
 
 // buildPathByte returns a 2-char hex string for the path byte with given

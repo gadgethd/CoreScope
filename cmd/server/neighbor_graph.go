@@ -250,14 +250,28 @@ type BuildOptions struct {
 // plausible terrestrial LoRa hop (including satellite-relayed cases).
 const DefaultMaxEdgeKm = 500.0
 
+// maxLowerCacheEntries bounds the shared lowercase caches (AGENTS.md: every
+// map needs a size limit). The cache is a pure allocation optimization — a
+// miss just recomputes strings.ToLower — so capping inserts cannot change
+// results. Distinct hop/pubkey strings in a mesh are far below this bound;
+// the cap only guards pathological inputs with unbounded distinct keys.
+const maxLowerCacheEntries = 4096
+
 // cachedToLower returns strings.ToLower(s), caching results to avoid
-// repeated allocations for the same pubkey string.
+// repeated allocations for the same pubkey string. A nil cache disables
+// sharing (one-off read paths); bulk passes pass a per-pass map. Inserts
+// stop once the cache reaches maxLowerCacheEntries (reads still hit).
 func cachedToLower(cache map[string]string, s string) string {
+	if cache == nil {
+		return strings.ToLower(s)
+	}
 	if v, ok := cache[s]; ok {
 		return v
 	}
 	v := strings.ToLower(s)
-	cache[s] = v
+	if len(cache) < maxLowerCacheEntries {
+		cache[s] = v
+	}
 	return v
 }
 
@@ -308,6 +322,10 @@ func BuildFromStoreWithOptions(store *PacketStore, opts BuildOptions) *NeighborG
 	// Local cache for strings.ToLower — pubkeys are immutable and repeat
 	// across hundreds of thousands of observations.
 	lowerCache := make(map[string]string, 256)
+	// Bounded parsed-path pool: observations repeat the same path_json far
+	// more often than they introduce new ones (a flood route is shared by
+	// every observer that heard it). Discarded with the build.
+	pathPool := make(loadParsedPaths)
 
 	// Phase 1: Extract edges from every transmission + observation.
 	for _, p := range packets {
@@ -330,14 +348,18 @@ func BuildFromStoreWithOptions(store *PacketStore, opts BuildOptions) *NeighborG
 			if obs.isOwnTransmission() {
 				continue
 			}
-			path := parsePathJSON(obs.PathJSON)
+			path := pathPool.parse(obs.PathJSON)
 			observerPK := cachedToLower(lowerCache, obs.ObserverID)
+			// ParsedTime caches the instant in 8 bytes; its format chain
+			// covers parseTimestamp's, and edge times serialize through
+			// UTC RFC3339, so equal instants keep equal payloads.
+			obsTime, _ := obs.ParsedTime()
 
 			if len(path) == 0 {
 				// Zero-hop
 				if fromLower != "" {
 					if fromLower != observerPK { // self-edge guard
-						g.upsertEdge(fromLower, observerPK, "", observerPK, obs.SNR, parseTimestamp(obs.Timestamp))
+						g.upsertEdge(fromLower, observerPK, "", observerPK, obs.SNR, obsTime)
 					}
 				}
 				continue
@@ -349,7 +371,7 @@ func BuildFromStoreWithOptions(store *PacketStore, opts BuildOptions) *NeighborG
 				if fromLower != firstHop { // self-edge guard (shouldn't happen but spec says check)
 					if packetpath.MeetsPathTrust(len(path[0])/2, opts.PathTrust) {
 						candidates := pm.m[firstHop]
-						g.upsertEdgeWithCandidates(fromLower, firstHop, candidates, observerPK, obs.SNR, parseTimestamp(obs.Timestamp), lowerCache)
+						g.upsertEdgeWithCandidates(fromLower, firstHop, candidates, observerPK, obs.SNR, obsTime, lowerCache)
 					}
 				}
 			}
@@ -359,7 +381,7 @@ func BuildFromStoreWithOptions(store *PacketStore, opts BuildOptions) *NeighborG
 			if observerPK != lastHop { // self-edge guard
 				if packetpath.MeetsPathTrust(len(path[len(path)-1])/2, opts.PathTrust) {
 					candidates := pm.m[lastHop]
-					g.upsertEdgeWithCandidates(observerPK, lastHop, candidates, observerPK, obs.SNR, parseTimestamp(obs.Timestamp), lowerCache)
+					g.upsertEdgeWithCandidates(observerPK, lastHop, candidates, observerPK, obs.SNR, obsTime, lowerCache)
 				}
 			}
 		}
