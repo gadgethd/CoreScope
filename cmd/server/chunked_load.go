@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -224,6 +225,22 @@ func (s *PacketStore) RunStartupLoad(chunkSize int) error {
 		s.backgroundLoadDone.Store(true)
 		return err
 	}
+	// Phase-boundary heap reclaim (lean-runtime Stage 1). The id-ordered
+	// chunk walk allocates heavily (per-chunk SQL text, scan buffers,
+	// resolver scratch) and, with GOMEMLIMIT below the retained live heap,
+	// the GC runs in continuous-assist mode but cannot always keep pace
+	// with the load's allocation rate. On the 533k-row fixture the faster
+	// bounded load finishes with ~60 MiB of load garbage still uncollected
+	// (working set ~470 MiB vs ~410 MiB live). The post-load analytics
+	// recompute then layers its scratch on top of that inflated baseline
+	// and the combined peak breaches the 512 MiB container cap. One forced
+	// GC here returns the heap to the live baseline BEFORE the post-load
+	// recompute (gated on StartupLoadDone, signalled by the deferred
+	// signalStartupLoadDone below) begins, so analytics starts from ~410
+	// MiB rather than ~470 MiB. This is a single bounded reclaim at a
+	// startup phase boundary — not a steady-state intervention — and does
+	// not change any stored data or API output.
+	runtime.GC()
 	if s.hotStartupHours <= 0 {
 		// No bg work required → terminal steady state is done=true,
 		// failed=false. Without this the healthz probe would see
@@ -371,6 +388,26 @@ func (s *PacketStore) LoadChunked(chunkSize int) error {
 		}
 	}
 
+	// Pre-size the startup indexes to the filtered row count, clamped by
+	// the same memory budget as the walk, so a large cold load does not
+	// pay map/slice doubling churn (old+new buckets coexisting until GC
+	// catches up) on top of the retained rows. Only while the store is
+	// empty: a reload into a live store keeps its existing capacity.
+	if totalInDB > 0 {
+		s.mu.Lock()
+		if len(s.packets) == 0 && len(s.byHash) == 0 && len(s.byTxID) == 0 && len(s.byObsID) == 0 {
+			n := totalInDB
+			if maxPackets > 0 && int64(n) > maxPackets {
+				n = int(maxPackets)
+			}
+			s.byHash = make(map[string]*StoreTx, n)
+			s.byTxID = make(map[int]*StoreTx, n)
+			s.byObsID = make(map[int]*StoreObs, n)
+			s.packets = make([]*StoreTx, 0, n)
+		}
+		s.mu.Unlock()
+	}
+
 	chunkIdx := 0
 	totalLoaded := 0
 	capped := false // the memory cap stopped the walk with rows left (#748)
@@ -448,7 +485,7 @@ func (s *PacketStore) LoadChunked(chunkSize int) error {
 			return fmt.Errorf("chunk %d: query: %w", chunkIdx, err)
 		}
 
-		chunkTxCount, lastID, err := s.scanAndMergeChunk(rows, relayPM, &coldLoadAmbiguousHopsSkipped)
+		chunkTxCount, lastID, err := s.scanAndMergeChunk(rows, relayPM, &coldLoadAmbiguousHopsSkipped, chunkSize)
 		rows.Close()
 		s.advertEvidenceMu.Unlock()
 		if err != nil {
@@ -537,14 +574,23 @@ func (s *PacketStore) LoadChunked(chunkSize int) error {
 
 // scanAndMergeChunk consumes one chunk's rows under s.mu.Lock and
 // returns the number of distinct transmissions seen + the max
-// transmission id (cursor for the next chunk).
-func (s *PacketStore) scanAndMergeChunk(rows *sql.Rows, relayPM *prefixMap, coldLoadAmbiguousHopsSkipped *int) (int, int64, error) {
+// transmission id (cursor for the next chunk). txCap bounds the chunk's
+// transmission count (the loader's chunkSize) for the per-chunk tx list.
+func (s *PacketStore) scanAndMergeChunk(rows *sql.Rows, relayPM *prefixMap, coldLoadAmbiguousHopsSkipped *int, txCap int) (int, int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	hopsSeen := make(map[string]bool)
-	seenTxIDs := make(map[int]bool)
+	// The chunk SQL orders by t.id ASC, so equal ids are adjacent: a
+	// last-id comparison dedups without a per-chunk map (id=0 is a real
+	// row, hence the -1 sentinel). chunkTxs keeps first-seen order; the
+	// advert-evidence consumers below treat it as an unordered set.
+	lastTxID := -1
+	txCount := 0
+	chunkTxs := make([]*StoreTx, 0, txCap)
 	paths := make(loadPathStrings)
+	pathPool := make(loadParsedPaths)
+	lowerCache := make(map[string]string, 64)
 	var timestamps loadTimestamps
 	var maxID int64
 
@@ -585,7 +631,6 @@ func (s *PacketStore) scanAndMergeChunk(rows *sql.Rows, relayPM *prefixMap, cold
 		if int64(txID) > maxID {
 			maxID = int64(txID)
 		}
-		seenTxIDs[txID] = true
 
 		hashStr := nullStrVal(hash)
 		tx := s.byHash[hashStr]
@@ -615,6 +660,11 @@ func (s *PacketStore) scanAndMergeChunk(rows *sql.Rows, relayPM *prefixMap, cold
 			}
 			s.trackAdvertPubkey(tx)
 			s.trackedBytes += rechargeTx(tx)
+		}
+		if txID != lastTxID {
+			lastTxID = txID
+			txCount++
+			chunkTxs = append(chunkTxs, tx)
 		}
 
 		if obsID.Valid {
@@ -659,7 +709,7 @@ func (s *PacketStore) scanAndMergeChunk(rows *sql.Rows, relayPM *prefixMap, cold
 				// byNode ONLY — see the Load() counterpart for why the
 				// resolved_path/path-hop indexes must NOT be populated here.
 				// PR #1643 R1 munger #1: unique_prefix-only gate.
-				rp := resolvePathForObsColdLoad(obsPJ, obsIDStr, tx, relayPM, coldLoadAmbiguousHopsSkipped)
+				rp := resolvePathForObsColdLoad(obsPJ, obsIDStr, tx, relayPM, coldLoadAmbiguousHopsSkipped, pathPool, lowerCache)
 				s.indexColdLoadRelayHops(tx, extractResolvedPubkeys(rp), relayPM, obs)
 			}
 
@@ -680,22 +730,18 @@ func (s *PacketStore) scanAndMergeChunk(rows *sql.Rows, relayPM *prefixMap, cold
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return len(seenTxIDs), maxID, err
+		return txCount, maxID, err
 	}
 	rows.Close()
-	txs := make([]*StoreTx, 0, len(seenTxIDs))
-	for id := range seenTxIDs {
-		txs = append(txs, s.byTxID[id])
-	}
-	ids := advertTxIDs(txs)
+	ids := advertTxIDs(chunkTxs)
 	s.mu.Unlock()
 	masks, err := s.db.advertEvidenceForIDs(ids)
 	s.mu.Lock()
 	if err != nil {
-		return len(seenTxIDs), maxID, err
+		return txCount, maxID, err
 	}
 	s.mergeAdvertEvidence(masks)
-	return len(seenTxIDs), maxID, nil
+	return txCount, maxID, nil
 }
 
 // loadStatusMiddleware sets X-CoreScope-Load-Status on every response.

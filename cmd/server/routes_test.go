@@ -4041,7 +4041,7 @@ func TestPathHopIndexIncrementalUpdate(t *testing.T) {
 		ID:                  1,
 	}
 
-	addTxToPathHopIndex(idx, tx1)
+	addTxToPathHopIndex(idx, tx1, nil)
 
 	// Should be indexed under "ab" and "cd" only (no resolved pubkey)
 	if len(idx["ab"]) != 1 {
@@ -4056,7 +4056,7 @@ func TestPathHopIndexIncrementalUpdate(t *testing.T) {
 		selectedObservation: &StoreObs{PathJSON: `["ab","ef"]`},
 		ID:                  2,
 	}
-	addTxToPathHopIndex(idx, tx2)
+	addTxToPathHopIndex(idx, tx2, nil)
 
 	if len(idx["ab"]) != 2 {
 		t.Errorf("expected 2 entries for 'ab', got %d", len(idx["ab"]))

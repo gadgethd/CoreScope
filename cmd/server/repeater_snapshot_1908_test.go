@@ -33,7 +33,7 @@ func relaySnapshotStore1908(count, nodes, expired int) *PacketStore {
 			tx.parsedPath[hop] = resolved[hop][:2]
 		}
 		store.packets[i] = tx
-		addTxToPathHopIndex(store.byPathHop, tx)
+		addTxToPathHopIndex(store.byPathHop, tx, nil)
 		store.addResolvedPubkeysToPathHopIndex(tx, resolved, hopsSeen)
 	}
 	return store

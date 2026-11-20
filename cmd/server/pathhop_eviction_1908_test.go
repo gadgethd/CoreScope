@@ -41,7 +41,7 @@ func TestPathHopEviction1908(t *testing.T) {
 					pk = expiredOnly
 					tx.ScopeName = &expiredScope
 				}
-				addTxToPathHopIndex(store.byPathHop, tx)
+				addTxToPathHopIndex(store.byPathHop, tx, nil)
 				store.indexResolvedPathHops(tx, []string{shared, pk}, hopsSeen, nil, nil)
 			}
 			// Repeated observations no longer append the same resolved
@@ -49,7 +49,7 @@ func TestPathHopEviction1908(t *testing.T) {
 			// occurrence from a bucket that holds one, so seed duplicates directly.
 			store.byPathHop[shared] = append(store.byPathHop[shared], store.packets[0], store.packets[7])
 			store.byPathHop[expiredOnly] = append(store.byPathHop[expiredOnly], store.packets[0])
-			addTxToPathHopIndex(store.byPathHop, store.packets[0])
+			addTxToPathHopIndex(store.byPathHop, store.packets[0], nil)
 
 			// Keep the original backing arrays observable: a shortened slice must
 			// not hide pointers that keep evicted transmissions alive for the GC.
@@ -167,7 +167,7 @@ func BenchmarkPathHopEviction1908(b *testing.B) {
 							tx.parsedPath[k] = resolved[k][:2]
 						}
 						store.packets[j] = tx
-						addTxToPathHopIndex(store.byPathHop, tx)
+						addTxToPathHopIndex(store.byPathHop, tx, nil)
 						store.addResolvedPubkeysToPathHopIndex(tx, resolved, hopsSeen)
 					}
 					b.StartTimer()

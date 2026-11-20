@@ -76,7 +76,7 @@ func phdRecordStore(count int) (store *PacketStore, old, young []*StoreTx) {
 		} else {
 			young = append(young, tx)
 		}
-		addTxToPathHopIndex(store.byPathHop, tx)
+		addTxToPathHopIndex(store.byPathHop, tx, nil)
 		store.indexResolvedPathHops(tx, phdFreshKeys(), hopsSeen, nil, nil)
 	}
 	return store, old, young

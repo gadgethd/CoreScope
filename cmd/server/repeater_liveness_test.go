@@ -252,7 +252,7 @@ func TestRepeaterRelayActivity_PrefixHop(t *testing.T) {
 	store.packets = append(store.packets, tx)
 	store.byHash[tx.Hash] = tx
 	store.byTxID[tx.ID] = tx
-	addTxToPathHopIndex(store.byPathHop, tx)
+	addTxToPathHopIndex(store.byPathHop, tx, nil)
 	store.mu.Unlock()
 
 	info := store.GetRepeaterRelayInfo(pubkey, 24)
