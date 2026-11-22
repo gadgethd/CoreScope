@@ -69,7 +69,8 @@ func phdRecordStore(count int) (store *PacketStore, old, young []*StoreTx) {
 	store.retentionHours = 1
 	hopsSeen := make(map[string]bool)
 	for i, tx := range store.packets {
-		*tx.PayloadType = 5
+		payload := 5
+		tx.PayloadType = &payload
 		if i < count/2 {
 			tx.FirstSeen = now.Add(-2 * time.Hour).Format(time.RFC3339)
 			old = append(old, tx)

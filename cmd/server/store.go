@@ -4343,7 +4343,7 @@ var (
 	sharedIntMu   sync.Mutex
 	sharedInts    = map[int]*int{}
 	sharedFloatMu sync.Mutex
-	sharedFloats  = map[float64]*float64{}
+	sharedFloats  = map[uint64]*float64{}
 	sharedStrMu   sync.Mutex
 	sharedStrs    = map[string]*string{}
 )
@@ -4367,8 +4367,13 @@ func sharedInt(v int) *int {
 }
 
 func sharedFloat(v float64) *float64 {
+	if v != v { // NaN never hits a map key and would consume a slot per call.
+		x := v
+		return &x
+	}
+	key := math.Float64bits(v) // keep -0.0 and +0.0 distinct
 	sharedFloatMu.Lock()
-	p, ok := sharedFloats[v]
+	p, ok := sharedFloats[key]
 	if !ok {
 		if len(sharedFloats) >= sharedIntMax {
 			sharedFloatMu.Unlock()
@@ -4377,7 +4382,7 @@ func sharedFloat(v float64) *float64 {
 		}
 		x := v
 		p = &x
-		sharedFloats[v] = p
+		sharedFloats[key] = p
 	}
 	sharedFloatMu.Unlock()
 	return p
