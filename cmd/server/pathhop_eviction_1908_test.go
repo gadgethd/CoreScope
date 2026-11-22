@@ -34,7 +34,8 @@ func TestPathHopEviction1908(t *testing.T) {
 			expiredScope, retainedScope := "expired-scope", "retained-scope"
 			hopsSeen := make(map[string]bool)
 			for i, tx := range store.packets {
-				*tx.PayloadType = 5 // Non-advert traffic contributes to relay stats.
+				payload := 5 // Non-advert traffic contributes to relay stats.
+				tx.PayloadType = &payload
 				pk := retainedOnly
 				tx.ScopeName = &retainedScope
 				if i < 2 {

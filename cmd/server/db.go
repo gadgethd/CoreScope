@@ -2785,8 +2785,7 @@ func nullStrPtr(ns sql.NullString) *string {
 	if !ns.Valid {
 		return nil
 	}
-	s := ns.String
-	return &s
+	return sharedStr(ns.String)
 }
 
 func nilIfEmpty(s string) interface{} {

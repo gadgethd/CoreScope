@@ -4335,17 +4335,82 @@ func floatPtrOrNil(p *float64) interface{} {
 	return *p
 }
 
+// Shared immutable pointers keep the nullable RouteType/PayloadType/Score/SNR/
+// RSSI/ScopeName fields at their current *T types without one heap object per
+// packet. The values are never mutated through these pointers by production
+// code; callers that need a private pointer allocate their own.
+var (
+	sharedIntMu   sync.Mutex
+	sharedInts    = map[int]*int{}
+	sharedFloatMu sync.Mutex
+	sharedFloats  = map[float64]*float64{}
+	sharedStrMu   sync.Mutex
+	sharedStrs    = map[string]*string{}
+)
+
+const sharedIntMax = 1 << 14
+
+func sharedInt(v int) *int {
+	if v < 0 || v >= sharedIntMax {
+		x := v
+		return &x
+	}
+	sharedIntMu.Lock()
+	p, ok := sharedInts[v]
+	if !ok {
+		x := v
+		p = &x
+		sharedInts[v] = p
+	}
+	sharedIntMu.Unlock()
+	return p
+}
+
+func sharedFloat(v float64) *float64 {
+	sharedFloatMu.Lock()
+	p, ok := sharedFloats[v]
+	if !ok {
+		if len(sharedFloats) >= sharedIntMax {
+			sharedFloatMu.Unlock()
+			x := v
+			return &x
+		}
+		x := v
+		p = &x
+		sharedFloats[v] = p
+	}
+	sharedFloatMu.Unlock()
+	return p
+}
+
+func sharedStr(s string) *string {
+	s = internStr(s)
+	sharedStrMu.Lock()
+	p, ok := sharedStrs[s]
+	if !ok {
+		if len(sharedStrs) >= sharedIntMax {
+			sharedStrMu.Unlock()
+			x := s
+			return &x
+		}
+		x := s
+		p = &x
+		sharedStrs[s] = p
+	}
+	sharedStrMu.Unlock()
+	return p
+}
+
 func nullIntPtr(ni sql.NullInt64) *int {
 	if ni.Valid {
-		v := int(ni.Int64)
-		return &v
+		return sharedInt(int(ni.Int64))
 	}
 	return nil
 }
 
 func nullFloatPtr(nf sql.NullFloat64) *float64 {
 	if nf.Valid {
-		return &nf.Float64
+		return sharedFloat(nf.Float64)
 	}
 	return nil
 }
