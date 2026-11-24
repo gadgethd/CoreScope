@@ -70,7 +70,9 @@
   // Region filter (#1045): observer_id → IATA code, populated from /api/observers
   let observerIataMap = {};
   let regionFilterChangeHandler = null;
+  let areaFilterChangeHandler = null;
   let stopUKMeshRfCoverage;
+  let ukmeshLiveView;
 
   /**
    * Returns true if the packet group matches the selected regions.
@@ -993,6 +995,7 @@
   // === Timeline ===
 
   async function fetchTimelineTimestamps() {
+    if (ukmeshLiveView?.region) return;
     const scopeMs = VCR.timelineScope;
     if (scopeMs === VCR.timelineFetchedScope) return;
     const since = new Date(Date.now() - scopeMs).toISOString();
@@ -1248,13 +1251,14 @@
   async function init(app) {
     const legacy = CoreScopeDeployment.ukmeshApp
       ? URLState.readUKMeshMapLink(location.search, location.hash) : null;
-    if (legacy?.region) {
-      // UKMesh's named mesh scope is not CoreScope's IATA observer filter.
-      const notice = document.createElement('p');
-      notice.setAttribute('role', 'status');
-      notice.textContent = `UK Mesh region ${legacy.region} is unavailable on this map.`;
-      app.replaceChildren(notice);
-      return;
+    const ukmeshView = CoreScopeDeployment.ukmeshApp ? {
+      region: legacy?.region ?? null,
+      lifetime: new AbortController(),
+    } : null;
+    ukmeshLiveView = ukmeshView;
+    if (ukmeshView) {
+      window.addEventListener('ukmesh:privacy-unavailable', () => ukmeshView.lifetime.abort(),
+        { signal: ukmeshView.lifetime.signal });
     }
     if (legacy?.layers) heatEnabled = legacy.layers.has('heatmap');
 
@@ -1405,6 +1409,7 @@
           <div id="vcrPrompt" class="vcr-prompt hidden"></div>
         </div>
       </div>`;
+    if (ukmeshView?.region) app.querySelector('.live-page').classList.add('ukmesh-named-region');
 
     // Controls are wired BEFORE any await below -- see wireLiveControls().
     wireLiveControls();
@@ -1417,6 +1422,7 @@
       if (Array.isArray(mapCfg.center) && mapCfg.center.length === 2) mapCenter = mapCfg.center;
       if (typeof mapCfg.zoom === 'number') mapZoom = mapCfg.zoom;
     } catch { }
+    if (ukmeshView?.lifetime.signal.aborted) return;
 
     // #1709: URL hash lat/lon/zoom is the highest-precedence viewport source.
     // Applied here so the very first setView() lands at the requested viewport
@@ -1683,9 +1689,12 @@
     clickablePathsLayer = L.layerGroup().addTo(map);
 
     injectSVGFilters();
-    AreaFilter.init(document.getElementById('liveAreaFilter'));
-    AreaFilter.onChange(function () { loadNodes(); });
+    if (!ukmeshView?.region) {
+      AreaFilter.init(document.getElementById('liveAreaFilter'));
+      areaFilterChangeHandler = AreaFilter.onChange(function () { loadNodes(); });
+    }
     await loadNodes();
+    if (ukmeshView?.lifetime.signal.aborted) return;
     if (legacy?.node) {
       const key = Object.keys(nodeData).find(key => key.toLowerCase() === legacy.node.toLowerCase());
       if (key) void showNodeDetail(key);
@@ -1697,14 +1706,14 @@
     // preference. Matrix-forced hiding is deliberately not repeated here --
     // that interlock lives in syncHeatToggleToMatrix() and only there.
     if (heatEnabled) showHeatMap();
-    connectWS();
+    if (!ukmeshView?.region) connectWS();
     initResizeHandler();
     initVCRHeightTracker();
     startRateCounter();
 
     // Check for packet replay from packets page (single or array of observations)
     const replayData = sessionStorage.getItem('replay-packet');
-    if (replayData) {
+    if (replayData && !ukmeshView?.region) {
       sessionStorage.removeItem('replay-packet');
       try {
         const parsed = JSON.parse(replayData);
@@ -1727,6 +1736,7 @@
 
     // Region filter (#1045): dropdown of observer IATA regions
     (function initLiveRegionFilter() {
+      if (ukmeshView) return;
       var rfEl = document.getElementById('liveRegionFilter');
       if (!rfEl || !window.RegionFilter) return;
       // Fetch observer roster to build observer_id → IATA map.
@@ -2033,13 +2043,17 @@
       feedEl.classList.add('hidden');
       feedShowBtn.classList.remove('hidden');
     }
+    const syncScopedFeed = ukmeshView?.region && CoreScopeDeployment.regionScoping()
+      ? UKMeshMapData.scopedFeed(ukmeshView, feedEl) : null;
     feedHideBtn.addEventListener('click', () => {
       feedEl.classList.add('hidden'); feedShowBtn.classList.remove('hidden');
       localStorage.setItem('live-feed-hidden', 'true');
+      syncScopedFeed?.();
     });
     feedShowBtn.addEventListener('click', () => {
       feedEl.classList.remove('hidden'); feedShowBtn.classList.add('hidden');
       localStorage.setItem('live-feed-hidden', 'false');
+      syncScopedFeed?.();
     });
 
     // Legend toggle for mobile (#60)
@@ -2359,7 +2373,10 @@
         }
       });
       tools.append(copy, status);
-      const pending = [...legacy?.layers || []].filter(layer => !['feed', 'heatmap', 'coverage'].includes(layer));
+      if (CoreScopeDeployment.regionScoping() || ukmeshView.region) {
+        mountUKMeshRegionControl(tools, ukmeshView);
+      }
+      const pending = [...legacy?.layers || []].filter(layer => !['feed', 'heatmap', 'coverage', 'observers', 'paths', 'links', 'terrain'].includes(layer));
       if (pending.length) {
         const notice = document.createElement('p');
         notice.textContent = 'Some layers in this link are unavailable on this map.';
@@ -2371,6 +2388,7 @@
         tools.append(note);
       }
       app.querySelector('.live-page')?.append(tools);
+      ukmeshView.updateLinks = UKMeshMapLayers.start(map, tools, ukmeshView, legacy, () => nodeData);
       stopUKMeshRfCoverage = UKMeshRfCoverage.start(map, tools, legacy?.layers);
       window.addEventListener('ukmesh:privacy-unavailable', stopUKMeshRfCoverage, { once: true });
     }
@@ -2538,17 +2556,18 @@
       scrubRelease();
     });
 
-    // Fetch historical timestamps for timeline, then start refresh
-    fetchTimelineTimestamps().then(() => updateTimeline());
-    _timelineRefreshInterval = setInterval(() => {
-      VCR.timelineFetchedScope = 0; // force refetch
+    // The CoreScope replay APIs are network-wide. Named UKMesh regions use
+    // the native scoped recent feed.
+    if (!ukmeshView?.region) {
       fetchTimelineTimestamps().then(() => updateTimeline());
-    }, 30000);
-
-    // Live clock tick — update LCD every second when in LIVE mode
-    _lcdClockInterval = setInterval(() => {
-      if (VCR.mode === 'LIVE') updateVCRClock(Date.now());
-    }, 1000);
+      _timelineRefreshInterval = setInterval(() => {
+        VCR.timelineFetchedScope = 0; // force refetch
+        fetchTimelineTimestamps().then(() => updateTimeline());
+      }, 30000);
+      _lcdClockInterval = setInterval(() => {
+        if (VCR.mode === 'LIVE') updateVCRClock(Date.now());
+      }, 1000);
+    }
 
     // Prune stale nodes every 60 seconds
     _pruneInterval = setInterval(pruneStaleNodes, 60000);
@@ -2637,6 +2656,10 @@
   }
 
   async function showNodeDetail(pubkey) {
+    if (ukmeshLiveView) {
+      ukmeshLiveView.selectedNode = pubkey;
+      ukmeshLiveView.updateLinks?.();
+    }
     activeNodeDetailKey = pubkey;
     const panel = document.getElementById('liveNodeDetail');
     const content = document.getElementById('nodeDetailContent');
@@ -2791,6 +2814,8 @@
   }
 
   async function loadNodes(beforeTs) {
+    const view = ukmeshLiveView;
+    if (beforeTs && view?.region) return;
     try {
       const aqs = AreaFilter.areaQueryString();
       // #1108 — honor region selector for visible map nodes unless
@@ -2811,9 +2836,12 @@
       // so the live map isn't truncated to the top-N by advert. LIVE_MAP_MAX_NODES
       // is passed as safetyCap, which fetchAllNodes enforces as a hard ceiling on
       // returned nodes — so the live map never renders more than the configured max.
-      const { nodes: list } = await fetchAllNodes(`${beforeQs}${aqs}${rqs}`, {
-        safetyCap: window.LIVE_MAP_MAX_NODES || 10000,
-      });
+      const safetyCap = window.LIVE_MAP_MAX_NODES || 10000;
+      const list = view?.region
+        ? await UKMeshMapData.regionNodes(view.region, safetyCap, view.lifetime.signal)
+        : (await fetchAllNodes(`${beforeQs}${aqs}${view ? '' : rqs}`, { safetyCap })).nodes;
+      if (view?.lifetime.signal.aborted) return;
+      if (view) view.regionNodesFailed = false;
       var now = Date.now();
       // Time-scoped reload (VCR scrub/replay): reconcile against the existing
       // markers instead of tearing the layer down. addNodeMarker() already
@@ -2861,7 +2889,39 @@
       // Fetch affinity data for hop disambiguation
       fetchAffinityData();
       startAffinityRefresh();
-    } catch (e) { console.error('Failed to load nodes:', e); }
+    } catch (e) {
+      if (view?.lifetime.signal.aborted) return;
+      if (view) view.regionNodesFailed = true;
+      console.error('Failed to load nodes:', e);
+    }
+  }
+
+  function mountUKMeshRegionControl(tools, view) {
+    const label = document.createElement('label');
+    label.className = 'ukmesh-region-control';
+    label.append('Region ');
+    const select = document.createElement('select');
+    select.add(new Option('All regions', ''));
+    if (view.region) select.add(new Option('#' + view.region, view.region, true, true));
+    label.append(select);
+    const status = document.createElement('p');
+    status.setAttribute('role', 'status');
+    tools.append(label, status);
+    status.textContent = view.regionNodesFailed && view.region ? 'Region nodes unavailable' : '';
+    select.addEventListener('change', () => {
+      const center = map.getCenter();
+      history.replaceState(null, '', URLState.ukmeshViewLink(location.href, {
+        lat: center.lat, lon: center.lng, zoom: map.getZoom(),
+      }));
+      location.hash = URLState.ukmeshRegionHash(location.hash, select.value);
+    });
+    if (!CoreScopeDeployment.regionScoping()) return;
+    void UKMeshMapData.regions(view.lifetime.signal).then(names => {
+      if (view.lifetime.signal.aborted) return;
+      for (const name of names) if (name !== view.region) select.add(new Option('#' + name, name));
+    }).catch(() => {
+      if (!view.lifetime.signal.aborted && !status.textContent) status.textContent = 'Region list unavailable';
+    });
   }
 
   let _affinityInterval = null;
@@ -3420,6 +3480,7 @@
   // ONE function for all rendering: WS arrival, DB load, replay button, VCR playback.
   // Takes an array of observations (same hash) and renders the complete path tree.
   function renderPacketTree(packets, isReplay) {
+    if (ukmeshLiveView?.region) return;
     if (!packets || !packets.length) return;
     // "Multibyte only" filter: drop single-byte / unresolvable packets from the
     // entire live view (feed, map, rain, counter — live AND replay). Placed
@@ -4702,11 +4763,17 @@
       RegionFilter.offChange(regionFilterChangeHandler);
       regionFilterChangeHandler = null;
     }
+    if (areaFilterChangeHandler) {
+      AreaFilter.offChange(areaFilterChangeHandler);
+      areaFilterChangeHandler = null;
+    }
     if (stopUKMeshRfCoverage) {
       window.removeEventListener('ukmesh:privacy-unavailable', stopUKMeshRfCoverage);
       stopUKMeshRfCoverage();
       stopUKMeshRfCoverage = undefined;
     }
+    ukmeshLiveView?.lifetime.abort();
+    ukmeshLiveView = undefined;
     if (map) { map.remove(); map = null; }
     if (_onResize) {
       window.removeEventListener('resize', _onResize);

@@ -143,6 +143,13 @@
     return url;
   }
 
+  function ukmeshRegionHash(fragment, region) {
+    const params = new URLSearchParams(fragment.startsWith('#/') ? '' : fragment.replace(/^#\??/, ''));
+    params.delete('region');
+    if (region) params.set('region', region);
+    return params.size ? '#' + params.toString() : '';
+  }
+
   var api = {
     parseSort: parseSort,
     serializeSort: serializeSort,
@@ -151,6 +158,7 @@
     updateHashParams: updateHashParams,
     readUKMeshMapLink: readUKMeshMapLink,
     ukmeshViewLink: ukmeshViewLink,
+    ukmeshRegionHash: ukmeshRegionHash,
   };
 
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

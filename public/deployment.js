@@ -12,6 +12,7 @@ const CoreScopeDeployment = (() => {
   const privacyUrl = localPath(supplied?.privacyUrl, '');
   const configured = !ukmeshApp || Boolean(apiBase && wsPath && privacyUrl);
   let generation = null;
+  let regionScoping = false;
   let retired = false;
   let checking;
   let visibilityRevision = 0;
@@ -39,8 +40,12 @@ const CoreScopeDeployment = (() => {
           signal: AbortSignal.timeout(2500),
         });
         if (response.ok) {
-          const value = (await response.json()).privacyGeneration;
-          if (Number.isSafeInteger(value) && value > 0) next = value;
+          const config = await response.json();
+          const value = config.privacyGeneration;
+          if (Number.isSafeInteger(value) && value > 0) {
+            next = value;
+            regionScoping = config.regionScoping === true;
+          }
         }
       } catch { /* keep public data hidden when the authority is unavailable */ }
       if (retired) {
@@ -92,6 +97,23 @@ const CoreScopeDeployment = (() => {
     return response;
   }
 
+  async function fetchUKMeshJson(path, { signal, timeout = 15000 } = {}) {
+    // These reads go to the UKMesh owner through its same-origin edge.
+    if (!ukmeshApp || !path.startsWith('/api/')) throw new Error('UKMesh data unavailable');
+    const visibility = visibilityRevision;
+    const canRead = () => !retired && !document.hidden && visibility === visibilityRevision && !signal?.aborted;
+    const expected = await refresh();
+    if (!expected || !canRead()) throw new Error('UKMesh data unavailable');
+    const response = await request(path, {
+      cache: 'no-store', credentials: 'omit', redirect: 'error',
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeout)]) : AbortSignal.timeout(timeout),
+    });
+    if (!response.ok) throw new Error('UKMesh data unavailable');
+    const payload = await response.json();
+    if (!canRead() || await refresh() !== expected || !canRead()) throw new Error('UKMesh data unavailable');
+    return payload;
+  }
+
   function socketUrl() {
     if (!ukmeshApp && wsPath === '/') {
       const address = globalThis.location ?? window.location;
@@ -126,6 +148,22 @@ const CoreScopeDeployment = (() => {
         void refresh();
       });
     }
+    if (supplied?.ukmeshPwa === true) {
+      const manifest = document.createElement('link');
+      manifest.rel = 'manifest';
+      manifest.href = '/manifest.json';
+      document.head.append(manifest);
+      const workers = globalThis.navigator?.serviceWorker;
+      if (workers) {
+        // Preserve the workspace's root worker and its shared install state.
+        void workers.getRegistration('/').then(existing => {
+          if (!existing) return workers.register('/sw.js', { type: 'module', scope: '/', updateViaCache: 'none' });
+        }).catch(() => { /* Browser policy or offline startup can disable installation. */ });
+      }
+    }
   }
-  return { ukmeshApp, apiPath, fetch: fetchResource, socketUrl, refresh };
+  return {
+    ukmeshApp, apiPath, fetch: fetchResource, fetchUKMeshJson, socketUrl, refresh,
+    regionScoping: () => regionScoping,
+  };
 })();

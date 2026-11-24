@@ -70,6 +70,24 @@ async function verify() {
   assert.equal(fixture.seen.reloads, 1);
   assert.deepEqual(fixture.seen.events, ['ukmesh:privacy-ready', 'ukmesh:privacy-unavailable']);
 
+  let nativeGeneration = 7;
+  const native = browser({
+    load: async url => ({
+      ok: true,
+      json: async () => {
+        if (url === '/api/runtime-config') return { privacyGeneration: nativeGeneration, regionScoping: true };
+        if (url === '/api/nodes/map') nativeGeneration++;
+        return { regions: [] };
+      },
+    }),
+  });
+  assert.deepEqual(await native.app.fetchUKMeshJson('/api/regions/summary'), { regions: [] });
+  assert.equal(native.app.regionScoping(), true);
+  assert.equal(native.seen.calls.find(call => call.url === '/api/regions/summary').options.credentials, 'omit');
+  await assert.rejects(native.app.fetchUKMeshJson('/api/nodes/map'), /unavailable/);
+  assert.equal(native.seen.hidden, true);
+  assert.equal(native.app.socketUrl(), null);
+
   const missing = browser({ configured: false, load: () => assert.fail('candidate must fail closed') });
   await assert.rejects(missing.app.fetch('/api/nodes'), /temporarily unavailable/);
   assert.equal(missing.app.socketUrl(), null);

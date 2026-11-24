@@ -1544,3 +1544,26 @@ input.live-node-filter-input:focus {
   align-items: center;
   gap: .35rem;
 }
+.ukmesh-region-control,
+.ukmesh-map-layers label {
+  display: flex;
+  align-items: center;
+  gap: .4rem;
+  min-height: 44px;
+}
+.ukmesh-region-control select {
+  max-width: 14rem;
+  min-height: 44px;
+}
+.ukmesh-map-layers summary {
+  min-height: 44px;
+  align-content: center;
+  cursor: pointer;
+}
+.ukmesh-map-layers span:empty,
+.ukmesh-map-tools p:empty {
+  display: none;
+}
+.ukmesh-named-region .vcr-bar {
+  display: none;
+}

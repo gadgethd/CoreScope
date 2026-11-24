@@ -18,6 +18,8 @@ async function main() {
     const unexpected = [];
     const socketPaths = [];
     const networkPaths = [];
+    const nativeMapReads = [];
+    const nativeLayerReads = [];
     const rasterPaths = [];
     let generation = 1;
     let privateReady = true;
@@ -25,6 +27,18 @@ async function main() {
     let authorityHold;
     const origin = 'https://candidate.example.test';
     const sampleRaster = path.join(publicDir, 'vendor/leaflet-1.9.4/images/layers.png');
+    const terrainTile = Buffer.from(await page.evaluate(() => {
+      const canvas = document.createElement('canvas');
+      canvas.width = canvas.height = 256;
+      const context = canvas.getContext('2d');
+      const sample = context.createImageData(256, 256);
+      for (let pixel = 0; pixel < 256 * 256; pixel++) {
+        sample.data[pixel * 4] = 128 + Math.floor(pixel % 256 / 8);
+        sample.data[pixel * 4 + 3] = 255;
+      }
+      context.putImageData(sample, 0, 0);
+      return canvas.toDataURL().split(',')[1];
+    }), 'base64');
     const rasterTier = tier => ({
       tiles: [
         { image: `tiles/${tier}/0-0.png`, bounds: { South: 51, North: 54, West: -3, East: 1 } },
@@ -38,6 +52,7 @@ async function main() {
       '/api/config/map': { center: [54.5, -3.2], zoom: 7 },
       '/api/nodes': nodes,
       ['/api/nodes/' + nodes[0].public_key]: { node: nodes[0] },
+      ['/api/nodes/' + 'b'.repeat(64)]: { node: { ...nodes[0], public_key: 'b'.repeat(64), name: 'North relay' } },
       '/api/observers': [],
       '/api/packets': { packets: [] },
       '/api/packets/timestamps': [],
@@ -46,6 +61,21 @@ async function main() {
     })[pathname] ?? {};
 
     page.on('pageerror', error => unexpected.push(error.message));
+    await page.addInitScript(() => {
+      window.fixtureWorkerCalls = [];
+      Object.defineProperty(navigator, 'serviceWorker', {
+        configurable: true,
+        value: {
+          async getRegistration(scope) {
+            window.fixtureWorkerCalls.push(['lookup', scope]);
+            return new URLSearchParams(location.search).has('source') ? { scope } : undefined;
+          },
+          async register(url, options) {
+            window.fixtureWorkerCalls.push(['register', url, options.scope]);
+          },
+        },
+      });
+    });
     await page.routeWebSocket('**/*', socket => {
       socketPaths.push(new URL(socket.url()).pathname + new URL(socket.url()).search);
     });
@@ -57,12 +87,58 @@ async function main() {
       if (file === '/standalone') return route.fulfill({ contentType: 'text/html', body: index });
       if (file === '/corescope/config.js') {
         return route.fulfill({ contentType: 'application/javascript', body: `window.CORE_SCOPE_DEPLOYMENT = {
-          ukmeshApp: true, apiBase: '/corescope/api', wsPath: '/corescope/ws', privacyUrl: '/api/runtime-config'
+          ukmeshApp: true, ukmeshPwa: true, apiBase: '/corescope/api', wsPath: '/corescope/ws', privacyUrl: '/api/runtime-config'
         }` });
       }
       if (file === '/api/runtime-config') {
         if (authorityHold) await authorityHold();
-        return route.fulfill({ status: privateReady ? 200 : 503, json: { privacyGeneration: generation } });
+        return route.fulfill({ status: privateReady ? 200 : 503, json: { privacyGeneration: generation, regionScoping: true } });
+      }
+      if (file === '/api/regions/summary') {
+        assert.equal(url.searchParams.get('network'), 'ukmesh');
+        return route.fulfill({ json: { regions: [{ name: 'UKNorth' }, { name: 'UKSouth' }] } });
+      }
+      if (file === '/api/nodes/map') {
+        nativeMapReads.push(url.searchParams);
+        const north = url.searchParams.get('region') === 'UKNorth';
+        const cursor = url.searchParams.get('cursor');
+        const nodeId = north ? (cursor ? 'c' : 'b') : 'd';
+        const complete = !north || !!cursor;
+        return route.fulfill({ json: {
+          nodes: [{ node_id: nodeId.repeat(64), role: 2, lat: cursor ? 52.33 : 52.3, lon: cursor ? -1.25 : -1.3, name: nodeId }],
+          page: { complete, nextCursor: complete ? null : 'page2', snapshot: 'fixture-snapshot' },
+        } });
+      }
+      if (file === '/api/observers/health') {
+        nativeLayerReads.push(url);
+        return route.fulfill({ json: [
+          { node_id: 'b'.repeat(64), lat: 52.3, lon: -1.3, name: 'North observer', uptime_pct: 99 },
+          { node_id: 'd'.repeat(64), lat: 52.2, lon: -1.1, name: 'South observer', uptime_pct: 90 },
+        ] });
+      }
+      if (file === '/api/path-beta/multibyte-paths') {
+        nativeLayerReads.push(url);
+        return route.fulfill({ json: { segments: [{ positions: [[52.3, -1.31], [52.33, -1.27]], count: 3 }] } });
+      }
+      if (file === '/api/packets/recent') {
+        nativeLayerReads.push(url);
+        const packet = {
+          packet_hash: 'c'.repeat(16), time: '2026-11-24T11:00:00.000Z',
+          summary: url.searchParams.get('region') + ' traffic',
+        };
+        return route.fulfill({ json: [packet, packet] });
+      }
+      if (file === '/api/nodes/' + 'b'.repeat(64) + '/links') {
+        nativeLayerReads.push(url);
+        return route.fulfill({ json: [{ peer_id: 'c'.repeat(64), observed_count: 3, itm_path_loss_db: 121 }] });
+      }
+      if (file.startsWith('/api/links/') && file.endsWith('/history')) {
+        nativeLayerReads.push(url);
+        return route.fulfill({ json: { points: [{ snr: 8.5, path_loss: 121 }] } });
+      }
+      if (file.startsWith('/terrain-tiles/')) {
+        nativeLayerReads.push(url);
+        return route.fulfill({ body: terrainTile, contentType: 'image/png' });
       }
       if (file === '/rf-coverage/meta.json') {
         const progress = { state: 'computing', completed_tiles: readyTiles, total_tiles: 2 };
@@ -160,19 +236,55 @@ async function main() {
     await page.locator('#liveMap.leaflet-container').waitFor({ state: 'visible' });
     assert.ok(socketPaths.includes('/corescope/ws?privacyGeneration=2'));
 
-    await page.goto(origin + '/?map=52.30000,-1.30000,10.25#region=UKNorth');
-    await page.getByText('UK Mesh region UKNorth is unavailable on this map.').waitFor();
-    assert.equal(await page.locator('#liveMap').count(), 0);
+    await page.setViewportSize({ width: 1024, height: 844 });
+    await page.goto(origin + '/?map=52.30000,-1.30000,10.25&layers=feed,observers,paths,links,terrain&node=' + 'b'.repeat(64) + '#region=UKNorth');
+    const region = page.getByRole('combobox', { name: 'Region', exact: true });
+    await region.waitFor();
+    assert.equal(await region.inputValue(), 'UKNorth');
+    assert.deepEqual(await page.evaluate(() => Object.keys(window._liveNodeData()).sort()), ['b'.repeat(64), 'c'.repeat(64)]);
+    assert.equal(nativeMapReads[1].get('snapshot'), 'fixture-snapshot');
+    assert.equal(nativeMapReads[1].get('cursor'), 'page2');
+    await page.getByText('UKNorth traffic', { exact: false }).waitFor();
+    assert.equal(await page.locator('#liveFeed .live-feed-item').count(), 1);
+    assert.equal(await page.locator('#vcrBar').isVisible(), false);
+    await page.locator('#nodeDetailClose').click();
+    await page.getByText('Map layers', { exact: true }).click();
+    await page.getByText('1 observer', { exact: true }).waitFor();
+    await page.getByText('1 observed path', { exact: true }).waitFor();
+    await page.getByText('1 observed link', { exact: true }).waitFor();
+    const link = page.getByRole('button', { name: 'Observed link to c' });
+    await link.focus();
+    await link.press('Enter');
+    await page.getByRole('button', { name: 'Load 72-hour link history' }).click();
+    await page.getByText(/Last SNR 8.5 dB/).waitFor();
+    await page.waitForFunction(() => [...document.querySelectorAll('.ukmesh-terrain-tile.leaflet-tile-loaded')]
+      .some(canvas => canvas.getContext('2d').getImageData(0, 0, 256, 256).data.some((value, i) => i % 4 === 3 && value)));
+    assert.ok(nativeLayerReads.some(url => url.pathname.endsWith('/links') && url.searchParams.get('region') === 'UKNorth'));
+    assert.ok(nativeLayerReads.some(url => url.pathname.endsWith('/multibyte-paths') && url.searchParams.get('region') === 'UKNorth'));
+    await region.selectOption('UKSouth');
+    await page.waitForFunction(() => Object.keys(window._liveNodeData()).join() === 'd'.repeat(64));
+    assert.equal(new URL(page.url()).hash, '#region=UKSouth');
+    assert.equal(nativeMapReads.at(-1).get('network'), 'ukmesh');
+    assert.equal(nativeMapReads.at(-1).get('region'), 'UKSouth');
+    await page.getByText('UKSouth traffic', { exact: false }).waitFor();
+    assert.equal(await page.getByText('UKNorth traffic', { exact: false }).count(), 0);
+    assert.ok(nativeLayerReads.some(url => url.pathname.endsWith('/packets/recent') && url.searchParams.get('region') === 'UKSouth'));
 
     await page.goto(origin + '/#/live');
     await page.getByRole('checkbox', { name: 'RF coverage' }).waitFor();
+    assert.equal(await page.locator('link[rel="manifest"]').getAttribute('href'), '/manifest.json');
+    assert.deepEqual(await page.evaluate(() => window.fixtureWorkerCalls), [['lookup', '/'], ['register', '/sw.js', '/']]);
+    await page.goto(origin + '/?source=pwa');
+    await page.locator('#liveMap.leaflet-container').waitFor();
+    assert.deepEqual(await page.evaluate(() => window.fixtureWorkerCalls), [['lookup', '/']]);
 
     await page.goto(origin + '/standalone#/live');
     await page.locator('#liveMap.leaflet-container').waitFor();
     assert.ok(networkPaths.some(value => value.startsWith('/api/')));
     assert.ok(socketPaths.includes('/'));
+    assert.equal(await page.locator('link[rel="manifest"]').count(), 0);
     assert.deepEqual(unexpected, []);
-    console.log('UKMesh shell, legacy map state, RF progress and tiers, hidden-tab privacy, generation recovery and standalone routes passed');
+    console.log('UKMesh shell, named region data and activity, terrain, observations, links and paths, PWA bootstrap, RF progress, privacy recovery and standalone routes passed');
   } finally {
     await browser.close();
   }
