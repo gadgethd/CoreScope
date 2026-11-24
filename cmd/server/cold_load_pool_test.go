@@ -336,6 +336,10 @@ func TestLoadChunkedSharedHashDedup(t *testing.T) {
 		VALUES (4, 4, 'obs1', 'Obs1', 'RX', -10, -80, 5, '["aa","bb"]', '2026-01-01T00:04:00Z')`); err != nil {
 		t.Fatalf("insert shared-hash obs: %v", err)
 	}
+	if _, err := conn.Exec(`CREATE TABLE advert_route_evidence(id INTEGER PRIMARY KEY, tx_id INTEGER, bit INTEGER);
+		INSERT INTO advert_route_evidence(tx_id, bit) VALUES (1, 1), (4, 2)`); err != nil {
+		t.Fatalf("insert distinct route evidence: %v", err)
+	}
 	conn.Close()
 
 	db, err := OpenDB(dbPath)
@@ -344,9 +348,10 @@ func TestLoadChunkedSharedHashDedup(t *testing.T) {
 	}
 	defer db.conn.Close()
 	store := NewPacketStore(db, &PacketStoreConfig{})
-	var txCount int
+	var txCount, maskReads int
+	db.advertEvidenceReadHook = func() { maskReads++ }
 	store.OnChunkLoaded(func(rowsThisChunk, totalRows int) { txCount += rowsThisChunk })
-	if err := store.LoadChunked(10); err != nil {
+	if err := store.LoadChunked(3); err != nil {
 		t.Fatalf("LoadChunked: %v", err)
 	}
 	if len(store.packets) != 3 {
@@ -354,6 +359,10 @@ func TestLoadChunkedSharedHashDedup(t *testing.T) {
 	}
 	if got := store.byHash["h0001"]; got == nil || got.ID != 1 {
 		t.Fatalf("first-seen tx must win the shared hash: byHash[h0001]=%v", got)
+	}
+	if maskReads != 1 || store.byHash["h0001"].AdvertRouteEvidence != 1 {
+		t.Fatalf("expected one canonical mask read and no duplicate evidence, reads=%d mask=%d",
+			maskReads, store.byHash["h0001"].AdvertRouteEvidence)
 	}
 	if txCount != 4 {
 		t.Fatalf("chunk callback must count all distinct ids incl. the shared-hash id: txCount=%d, want 4", txCount)
@@ -422,15 +431,7 @@ func TestCachedToLowerBounded(t *testing.T) {
 
 // --- aggregateRF: signal accumulators pre-sized to avoid growth churn -------
 
-// TestAggregateRFSignalSlicesPreSized pins the lean-runtime Stage 1 fix that
-// sizes snrVals/rssiVals/scatterAll to estCap (the total-observation upper
-// bound) rather than estCap/2 and estCap/4. Nearly every retained observation
-// carries signal, so the smaller estimates forced Go's 1.25x large-slice
-// growth reallocations, profiled at ~68 MiB of cumulative backing-array
-// garbage per RF pass on the 533k fixture — enough to breach the 512 MiB cap
-// at the periodic recompute. This is a perf-characteristic assertion: a steady
-// pass must allocate only the pre-sized backing arrays (~40 B/obs), not the
-// growth-era churn (~140 B/obs).
+// The signal scratch owns two float arrays and one observation flag byte.
 func TestAggregateRFSignalSlicesPreSized(t *testing.T) {
 	const n = 100000
 	// Pre-build the transmissions OUTSIDE the measured region so the scan feeds
@@ -472,13 +473,10 @@ func TestAggregateRFSignalSlicesPreSized(t *testing.T) {
 		t.Errorf("totalAllPackets = %v, want %d: observation counter mismatch", got, n)
 	}
 	allocated := after.TotalAlloc - before.TotalAlloc
-	// Lower bound proves the pre-sized backing arrays were allocated (snr+
-	// rssi+scatter = 32 B/obs minimum); upper bound proves they did not grow.
-	// The pre-sized pass lands at ~40 B/obs (plus packetSizes and tiny
-	// hour/type maps); the growth era landed near ~140 B/obs.
-	if lo, hi := uint64(n)*32, uint64(n)*64; allocated < lo || allocated > hi {
-		t.Errorf("aggregateRF allocated %d bytes, want in [%d, %d]: signal slices must be pre-sized to estCap (no growth) and actually exercised", allocated, lo, hi)
+	if limit := uint64(n) * 35; allocated > limit {
+		t.Errorf("aggregateRF allocated %d bytes, want at most %d without a second signal copy", allocated, limit)
 	}
+
 }
 
 // --- analyticsWorkGate: release reclaims before freeing the slot ------------

@@ -4340,12 +4340,11 @@ func floatPtrOrNil(p *float64) interface{} {
 // packet. The values are never mutated through these pointers by production
 // code; callers that need a private pointer allocate their own.
 var (
-	sharedIntMu   sync.Mutex
-	sharedInts    = map[int]*int{}
-	sharedFloatMu sync.Mutex
-	sharedFloats  = map[uint64]*float64{}
-	sharedStrMu   sync.Mutex
-	sharedStrs    = map[string]*string{}
+	sharedIntMu      sync.Mutex
+	sharedInts       = map[int]*int{}
+	sharedFloatMu    sync.Mutex
+	sharedFloats     = map[uint64]*float64{}
+	sharedScopeNames = scopeNamePool{values: make(map[string]*string)}
 )
 
 const sharedIntMax = 1 << 14
@@ -4388,22 +4387,27 @@ func sharedFloat(v float64) *float64 {
 	return p
 }
 
-func sharedStr(s string) *string {
-	s = internStr(s)
-	sharedStrMu.Lock()
-	p, ok := sharedStrs[s]
-	if !ok {
-		if len(sharedStrs) >= sharedIntMax {
-			sharedStrMu.Unlock()
-			x := s
-			return &x
-		}
-		x := s
-		p = &x
-		sharedStrs[s] = p
+const sharedScopeBytes = 1 << 20
+
+type scopeNamePool struct {
+	mu     sync.Mutex
+	values map[string]*string
+	bytes  int
+}
+
+func (p *scopeNamePool) share(value string) *string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if shared := p.values[value]; shared != nil {
+		return shared
 	}
-	sharedStrMu.Unlock()
-	return p
+	if len(p.values) >= sharedIntMax || len(value) > sharedScopeBytes-p.bytes {
+		return &value
+	}
+	owned := strings.Clone(value)
+	p.values[owned] = &owned
+	p.bytes += len(owned)
+	return &owned
 }
 
 func nullIntPtr(ni sql.NullInt64) *int {
@@ -6563,10 +6567,13 @@ func (s *PacketStore) computeRF(ctx context.Context, region, area string, window
 		regionObs = s.resolveRegionObservers(region)
 	}
 
-	s.mu.RLock()
-	estCap := min(s.totalObs, 2000000)
-	txCap := len(s.packets)
-	s.mu.RUnlock()
+	var estCap, txCap int
+	if !retained && region == "" && area == "" && window.IsZero() {
+		s.mu.RLock()
+		estCap = min(s.totalObs, 2000000)
+		txCap = len(s.packets)
+		s.mu.RUnlock()
+	}
 	if !retained {
 		return aggregateRF(estCap, txCap, regionObs != nil, areaNodes, window, func(addTransmission func(*StoreTx, *rfPacketCounts), addRegional func(*StoreObs, *StoreTx)) error {
 			s.mu.RLock()
@@ -6645,28 +6652,12 @@ type rfPacketCounts struct {
 
 func aggregateRF(estCap, txCap int, regional bool, areaNodes map[string]bool, window TimeWindow,
 	scan func(addTransmission func(*StoreTx, *rfPacketCounts), addRegional func(*StoreObs, *StoreTx)) error) (packetFields, error) {
-	// Pre-size the signal accumulators to estCap (the total-observation upper
-	// bound), NOT estCap/2 or estCap/4. Nearly every retained observation carries
-	// SNR/RSSI, so the half/quarter estimates were too small: the slices grew via
-	// Go's 1.25x large-slice reallocation, and the cumulative backing-array
-	// garbage profiled at ~68 MiB per RF pass (rssi 14.7 + snr 14.7 + scatter
-	// 38.8 MiB) on the 533k-observation fixture. On top of the ~440 MiB
-	// populated-cache baseline that breached the 512 MiB cap at the periodic
-	// recompute (lean-runtime Stage 1). Sizing to estCap lets the resident
-	// periodic scan (retained=false, ≤2M obs) append without growth: identical
-	// values/output, ~17 MiB live instead of ~68 MiB of churn. This is a
-	// capacity hint, not a hard bound: legacy transmissions without
-	// observations, retained-mode request scans larger than the resident
-	// cache, and >2M-observation stores can still exceed estCap, and append
-	// grows them correctly (as it did before).
-	snrVals := make([]float64, 0, estCap)
-	rssiVals := make([]float64, 0, estCap)
+	samples := newRFSignalSamples(estCap)
 	packetSizes := make([]int, 0, txCap)
 	typeBuckets := map[int]int{}
 	hourBuckets := map[string]int{}
 	snrByType := map[string]rfSignal{}
 	sigTime := map[string]rfSignal{}
-	scatterAll := make([]struct{ snr, rssi float64 }, 0, estCap)
 	totalObs, totalTransmissions := 0, 0
 	var minTimestamp, maxTimestamp string
 
@@ -6706,18 +6697,12 @@ func aggregateRF(estCap, txCap int, regional bool, areaNodes map[string]bool, wi
 	}
 	observe := func(obs *StoreObs, typeName string) {
 		updateTimeSpan(obs.Timestamp)
-		if obs.RSSI != nil {
-			rssiVals = append(rssiVals, *obs.RSSI)
-		}
+		samples.add(obs.SNR, obs.RSSI, true)
 		if obs.SNR == nil {
 			return
 		}
 		snr := *obs.SNR
-		snrVals = append(snrVals, snr)
 		snrByType[typeName] = snrByType[typeName].add(snr)
-		if obs.RSSI != nil {
-			scatterAll = append(scatterAll, struct{ snr, rssi float64 }{snr, *obs.RSSI})
-		}
 		if len(obs.Timestamp) >= 13 {
 			hour := obs.Timestamp[:13]
 			sigTime[hour] = sigTime[hour].add(snr)
@@ -6794,12 +6779,8 @@ func aggregateRF(estCap, txCap int, regional bool, areaNodes map[string]bool, wi
 		if len(tx.Observations) == 0 {
 			// Legacy transmissions can have signal and a timestamp without observations.
 			totalObs++
-			if tx.displayObservation().SNR != nil {
-				snrVals = append(snrVals, *tx.displayObservation().SNR)
-			}
-			if tx.displayObservation().RSSI != nil {
-				rssiVals = append(rssiVals, *tx.displayObservation().RSSI)
-			}
+			display := tx.displayObservation()
+			samples.add(display.SNR, display.RSSI, false)
 			updateTimeSpan(tx.FirstSeen)
 			if len(tx.FirstSeen) >= 13 {
 				hourBuckets[tx.FirstSeen[:13]]++
@@ -6904,6 +6885,9 @@ func aggregateRF(estCap, txCap int, regional bool, areaNodes map[string]bool, wi
 		return m
 	}
 
+	scatterData := samples.scatter()
+	snrVals, rssiVals := samples.snr, samples.rssi
+
 	// Sort snrVals and rssiVals once; reuse sorted order for min/max/median
 	// instead of copying+sorting per stat call (#366).
 	sort.Float64s(snrVals)
@@ -6987,22 +6971,6 @@ func aggregateRF(estCap, txCap int, regional bool, areaNodes map[string]bool, wi
 	for i, k := range sigKeys {
 		d := sigTime[k]
 		signalOverTime[i] = sigTimeEntry{Hour: k, Count: d.count, AvgSnr: d.sum / float64(d.count)}
-	}
-
-	// Scatter (downsample to 500)
-	type scatterPoint struct {
-		SNR  float64 `json:"snr"`
-		RSSI float64 `json:"rssi"`
-	}
-	scatterStep := 1
-	if len(scatterAll) > 500 {
-		scatterStep = len(scatterAll) / 500
-	}
-	scatterData := make([]scatterPoint, 0, 500)
-	for i, p := range scatterAll {
-		if i%scatterStep == 0 {
-			scatterData = append(scatterData, scatterPoint{SNR: p.snr, RSSI: p.rssi})
-		}
 	}
 
 	// Histograms

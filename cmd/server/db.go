@@ -2785,7 +2785,7 @@ func nullStrPtr(ns sql.NullString) *string {
 	if !ns.Valid {
 		return nil
 	}
-	return sharedStr(ns.String)
+	return sharedScopeNames.share(ns.String)
 }
 
 func nilIfEmpty(s string) interface{} {

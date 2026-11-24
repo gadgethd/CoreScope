@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -61,5 +62,19 @@ func TestSharedNullablePools(t *testing.T) {
 	}
 	if nullStrPtr(sql.NullString{String: "region-a", Valid: true}) != scoped {
 		t.Fatal("equal scope values must share one pooled pointer")
+	}
+}
+
+func TestScopeNamePoolBoundsOwnedBytes(t *testing.T) {
+	pool := scopeNamePool{values: make(map[string]*string)}
+	first := strings.Repeat("x", sharedScopeBytes)
+	if pool.share(first) != pool.share(first) {
+		t.Fatal("pooled value lost identity at the byte limit")
+	}
+	if a, b := pool.share("other"), pool.share("other"); a == b || *a != "other" || *b != "other" {
+		t.Fatal("value beyond byte limit should stay exact without retention")
+	}
+	if pool.bytes != sharedScopeBytes || len(pool.values) != 1 {
+		t.Fatalf("unexpected retained scope budget: %d bytes, %d values", pool.bytes, len(pool.values))
 	}
 }
