@@ -1555,10 +1555,14 @@ input.live-node-filter-input:focus {
   max-width: 14rem;
   min-height: 44px;
 }
-.ukmesh-map-layers summary {
+.ukmesh-map-layers summary,
+.ukmesh-activity-replay summary {
   min-height: 44px;
   align-content: center;
   cursor: pointer;
+}
+.ukmesh-activity-replay input {
+  width: 100%;
 }
 .ukmesh-map-layers span:empty,
 .ukmesh-map-tools p:empty {
@@ -1566,4 +1570,8 @@ input.live-node-filter-input:focus {
 }
 .ukmesh-named-region .vcr-bar {
   display: none;
+}
+.ukmesh-named-region .ukmesh-map-tools {
+  max-height: calc(100% - 2rem);
+  overflow: auto;
 }

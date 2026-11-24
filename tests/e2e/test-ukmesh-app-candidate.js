@@ -20,6 +20,11 @@ async function main() {
     const networkPaths = [];
     const nativeMapReads = [];
     const nativeLayerReads = [];
+    const timelineReads = [];
+    const historicalBucket = '2026-11-24 10:45:00+00';
+    let heldSouthTimeline;
+    let heldNorthTimeline;
+    let northTimelineEmpty = false;
     const rasterPaths = [];
     let generation = 1;
     let privateReady = true;
@@ -133,6 +138,22 @@ async function main() {
           summary: url.searchParams.get('region') + ' traffic',
         };
         return route.fulfill({ json: [packet, packet] });
+      }
+      if (file === '/api/activity/timeline') {
+        timelineReads.push(url.searchParams);
+        const region = url.searchParams.get('region');
+        const held = region === 'UKSouth' ? heldSouthTimeline : heldNorthTimeline;
+        if (held) await held;
+        const delivery = route.fulfill({ json: {
+          windowMinutes: 360, bucketMinutes: 15,
+          // Simulate a network-only response from an older or misrouted backend.
+          ...(region === 'UKNorth' ? { region } : {}),
+          buckets: region === 'UKNorth' && northTimelineEmpty ? [] : [{
+            time: historicalBucket, packetCount: 87, observerCount: 2,
+            activeNodeIds: ['B'.repeat(64), 'b'.repeat(64), 'd'.repeat(64)],
+          }],
+        } });
+        return held ? delivery.catch(() => { /* The old region cancelled its request. */ }) : delivery;
       }
       if (file === '/api/nodes/' + 'b'.repeat(64) + '/links') {
         nativeLayerReads.push(url);
@@ -278,6 +299,31 @@ async function main() {
       .some(canvas => canvas.getContext('2d').getImageData(0, 0, 256, 256).data.some((value, i) => i % 4 === 3 && value)));
     assert.ok(nativeLayerReads.some(url => url.pathname.endsWith('/links') && url.searchParams.get('region') === 'UKNorth'));
     assert.ok(nativeLayerReads.some(url => url.pathname.endsWith('/multibyte-paths') && url.searchParams.get('region') === 'UKNorth'));
+    assert.equal(timelineReads.length, 0);
+    const replayControl = page.locator('.ukmesh-activity-replay');
+    await replayControl.locator('summary').click();
+    const slider = page.getByRole('slider', { name: 'Region replay time' });
+    await slider.waitFor();
+    assert.deepEqual(Object.fromEntries(timelineReads[0]), {
+      network: 'ukmesh', region: 'UKNorth', minutes: '360', bucket: '15',
+    });
+    await slider.press('ArrowLeft');
+    await replayControl.getByText('87 packets · 2 observers · 1 node highlighted').waitFor();
+    assert.equal(new URL(page.url()).searchParams.get('replay'), historicalBucket);
+    await page.reload();
+    await replayControl.getByText('87 packets · 2 observers · 1 node highlighted').waitFor();
+    await replayControl.getByRole('button', { name: 'Return to live' }).click();
+    assert.equal(new URL(page.url()).searchParams.has('replay'), false);
+    await replayControl.getByText('Showing current live state').waitFor();
+    await replayControl.locator('summary').click();
+    northTimelineEmpty = true;
+    await replayControl.locator('summary').click();
+    await replayControl.getByText('No activity in this region over the past six hours').waitFor();
+    assert.equal(await slider.isVisible(), false);
+    await replayControl.locator('summary').click();
+    northTimelineEmpty = false;
+    await replayControl.locator('summary').click();
+    await slider.waitFor();
     await region.selectOption('UKSouth');
     await page.waitForFunction(() => Object.keys(window._liveNodeData()).join() === 'd'.repeat(64));
     assert.equal(new URL(page.url()).hash, '#region=UKSouth');
@@ -286,12 +332,55 @@ async function main() {
     await page.getByText('UKSouth traffic', { exact: false }).waitFor();
     assert.equal(await page.getByText('UKNorth traffic', { exact: false }).count(), 0);
     assert.ok(nativeLayerReads.some(url => url.pathname.endsWith('/packets/recent') && url.searchParams.get('region') === 'UKSouth'));
+    await replayControl.locator('summary').click();
+    await replayControl.getByText('Could not load history for this region').waitFor();
+    assert.equal(await slider.isVisible(), false);
+    assert.equal(await replayControl.getByText('87 packets', { exact: false }).count(), 0);
+    assert.equal(timelineReads.at(-1).get('region'), 'UKSouth');
+    await replayControl.locator('summary').click();
+    let releaseSouthTimeline;
+    heldSouthTimeline = new Promise(resolve => { releaseSouthTimeline = resolve; });
+    await Promise.all([
+      page.waitForRequest(request => {
+        const url = new URL(request.url());
+        return url.pathname === '/api/activity/timeline' && url.searchParams.get('region') === 'UKSouth';
+      }),
+      replayControl.locator('summary').click(),
+    ]);
+    await region.selectOption('UKNorth');
+    await page.waitForFunction(() => location.hash === '#region=UKNorth' &&
+      Object.keys(window._liveNodeData()).includes('b'.repeat(64)));
+    releaseSouthTimeline();
+    await replayControl.locator('summary').waitFor();
+    assert.equal(await replayControl.getByText('Could not load history for this region').count(), 0);
+    assert.equal(await slider.isVisible(), false);
+    await replayControl.locator('summary').click();
+    await slider.waitFor();
+    await slider.press('ArrowLeft');
+    await replayControl.getByText('87 packets · 2 observers · 1 node highlighted').waitFor();
     const namedReadsBeforeRevocation = nativeMapReads.length;
     regionScoping = false;
     await page.getByText('Region nodes unavailable', { exact: true }).waitFor();
     assert.equal(await page.getByText('UKSouth traffic', { exact: false }).count(), 0);
     assert.deepEqual(await page.evaluate(() => Object.keys(window._liveNodeData())), []);
     assert.equal(nativeMapReads.length, namedReadsBeforeRevocation);
+    assert.equal(await replayControl.count(), 0);
+
+    let releaseNorthTimeline;
+    heldNorthTimeline = new Promise(resolve => { releaseNorthTimeline = resolve; });
+    regionScoping = true;
+    await Promise.all([
+      page.waitForRequest(request => {
+        const url = new URL(request.url());
+        return url.pathname === '/api/activity/timeline' && url.searchParams.get('region') === 'UKNorth';
+      }),
+      page.reload(),
+    ]);
+    regionScoping = false;
+    await page.getByText('Region nodes unavailable', { exact: true }).waitFor();
+    releaseNorthTimeline();
+    assert.equal(await replayControl.count(), 0);
+    assert.equal(await page.getByText('87 packets', { exact: false }).count(), 0);
     regionScoping = true;
 
     await page.goto(origin + '/#/live');
@@ -313,7 +402,7 @@ async function main() {
     assert.ok(socketPaths.includes('/'));
     assert.equal(await page.locator('link[rel="manifest"]').count(), 0);
     assert.deepEqual(unexpected, []);
-    console.log('UKMesh shell, named region data and activity, terrain, observations, links and paths, PWA bootstrap, RF progress, privacy recovery and standalone routes passed');
+    console.log('UKMesh shell, named region data, activity and replay, terrain, observations, links and paths, PWA bootstrap, RF progress, privacy recovery and standalone routes passed');
   } finally {
     await browser.close();
   }

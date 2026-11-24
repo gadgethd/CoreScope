@@ -2376,6 +2376,9 @@
       if (CoreScopeDeployment.regionScoping() || ukmeshView.region) {
         mountUKMeshRegionControl(tools, ukmeshView);
       }
+      if (ukmeshView.region && CoreScopeDeployment.regionScoping() && !ukmeshView.regionNodesFailed) {
+        UKMeshMapHistory.start(map, tools, ukmeshView, () => nodeData);
+      }
       const pending = [...legacy?.layers || []].filter(layer => !['feed', 'heatmap', 'coverage', 'observers', 'paths', 'links', 'terrain'].includes(layer));
       if (pending.length) {
         const notice = document.createElement('p');
