@@ -32,7 +32,7 @@ assert.throws(() => checkInventory(['test-a.js'], { unit: unit(['test-a.js']), b
 assert.throws(() => checkInventory(['test-a.js'], { browser: { reason: '', files: ['test-a.js'] } }), /prerequisite\/reason/);
 
 const runner = fs.readFileSync(path.join(REPO_ROOT, 'test-all.sh'), 'utf8');
-const unitTests = Array.from(runner.matchAll(/^node (tests\/[^\s]+\.js)\s*$/gm), match => match[1]);
+const unitTests = Array.from(runner.matchAll(/^[ \t]*node (tests\/[^\s]+\.js)[ \t]*$/gm), match => match[1]);
 const groups = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'scripts', 'non-unit-tests.json'), 'utf8'));
 assert.ok(!Object.prototype.hasOwnProperty.call(groups, 'unit'), 'unit tests belong only in test-all.sh');
 const isTest = file => /^test-.*\.js$/.test(file);

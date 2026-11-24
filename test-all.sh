@@ -63,6 +63,11 @@ node tests/unit/test-hash-color.js
 node tests/unit/test-health-status.js
 node tests/unit/test-hop-path-detail.js
 node tests/unit/test-hop-path-inference.js
+# V8 coverage changes the runtime of the hop deadline workload.
+(
+  unset NODE_V8_COVERAGE
+  node tests/unit/test-hop-path-timing.js
+)
 node tests/unit/test-hop-resolver-affinity.js
 node tests/unit/test-issue-1065-gesture-hints-gates.js
 node tests/unit/test-issue-1107-live-layout.js

@@ -173,43 +173,5 @@ console.log('\nTest 10: edge cases and output shape');
   assert(HopResolver.inferPath(['78'], {})[0].unlisted, 'companions never appear as hops');
 }
 
-console.log('\nTest 11: performance — 64 hops × 16 candidates');
-{
-  // A vm sandbox routes every global lookup (Math, Infinity) through an
-  // interceptor a browser does not have, which inflates timings ~10×. Load
-  // a second copy into this context to time what a browser would run.
-  // (init() reads window, so the global stays for the rest of this test.)
-  global.window = {};
-  vm.runInThisContext(code, { filename: 'hop-resolver.js' });
-  const Fast = global.window.HopResolver;
-
-  // Deterministic pseudo-random layout in a ~300 km box.
-  let seed = 12345;
-  const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
-  const nodes = [];
-  for (let b = 0; b < 64; b++) {
-    for (let k = 0; k < 16; k++) {
-      const hex = b.toString(16).padStart(2, '0') + k.toString(16).padStart(2, '0');
-      nodes.push(rpt(hex + '0'.repeat(60), 'P' + hex, 30 + rnd() * 2.7, -98 + rnd() * 3));
-    }
-  }
-  Fast.init(nodes);
-  const hops = [];
-  for (let i = 0; i < 64; i++) hops.push(((i * 7) % 64).toString(16).padStart(2, '0'));
-  const opts = { observer: { lat: 31, lon: -97 } };
-  for (let w = 0; w < 3; w++) Fast.inferPath(hops, opts); // let the JIT settle
-  const times = [];
-  for (let r = 0; r < 5; r++) {
-    const t0 = process.hrtime.bigint();
-    Fast.inferPath(hops, opts);
-    times.push(Number(process.hrtime.bigint() - t0) / 1e6);
-  }
-  times.sort((a, b) => a - b);
-  const median = times[2];
-  console.log('    median ' + median.toFixed(1) + ' ms over 5 runs (target 20 ms)');
-  // Headroom over the target for slower CI runners.
-  assert(median < 40, 'median under 40 ms — ' + median.toFixed(1) + ' ms');
-}
-
 console.log('\n' + passed + ' passed, ' + failed + ' failed');
 if (failed) process.exit(1);
