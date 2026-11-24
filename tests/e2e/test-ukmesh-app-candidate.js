@@ -24,6 +24,7 @@ async function main() {
     let generation = 1;
     let privateReady = true;
     let regionScoping = true;
+    let runtimeVersion;
     let readyTiles = 1;
     let authorityHold;
     const origin = 'https://candidate.example.test';
@@ -93,7 +94,11 @@ async function main() {
       }
       if (file === '/api/runtime-config') {
         if (authorityHold) await authorityHold();
-        return route.fulfill({ status: privateReady ? 200 : 503, json: { privacyGeneration: generation, regionScoping } });
+        const runtime = runtimeVersion === undefined ? { privacyGeneration: generation } : {
+          privacyGeneration: generation, version: runtimeVersion, packetArcs: false,
+          heatmap: true, regionScoping, refreshAfterSeconds: 30,
+        };
+        return route.fulfill({ status: privateReady ? 200 : 503, json: runtime });
       }
       if (file === '/api/regions/summary') {
         assert.equal(url.searchParams.get('network'), 'ukmesh');
@@ -173,6 +178,9 @@ async function main() {
 
     const oldUrl = origin + '/?map=52.30000,-1.30000,10.25&layers=heatmap,coverage&note=Roof+trial&node=' + nodes[0].public_key;
     await page.goto(oldUrl);
+    await page.getByText('Public data is temporarily unavailable.').waitFor({ state: 'visible' });
+    assert.equal(await page.locator('#liveMap').count(), 0);
+    runtimeVersion = 1;
     await page.locator('#liveMap.leaflet-container').waitFor();
     await page.getByRole('button', { name: 'Copy view link' }).waitFor();
     await page.getByText('Roof trial').waitFor();
@@ -293,6 +301,11 @@ async function main() {
     await page.goto(origin + '/?source=pwa');
     await page.locator('#liveMap.leaflet-container').waitFor();
     assert.deepEqual(await page.evaluate(() => window.fixtureWorkerCalls), [['lookup', '/']]);
+    runtimeVersion = 2;
+    await page.getByText('Public data is temporarily unavailable.').waitFor({ state: 'visible' });
+    assert.equal(await page.locator('#liveMap').isVisible(), false);
+    runtimeVersion = 1;
+    await page.locator('#liveMap.leaflet-container').waitFor({ state: 'visible' });
 
     await page.goto(origin + '/standalone#/live');
     await page.locator('#liveMap.leaflet-container').waitFor();

@@ -5951,14 +5951,15 @@ body.embed #app.app-fixed {
 .reported-links .btn-primary { text-decoration: none; padding: 4px 10px; font-size: 12px; }
 .reported-table td { white-space: normal; }
 
-/* Keep previously rendered measurements and controls hidden until a public
-   projection generation is confirmed for this browser session. */
-html[data-ukmesh-data-unavailable] body > :not(#ukmesh-data-unavailable) {
-  display: none;
+/* Hide measurements and controls without collapsing a live map's canvas. */
+html[data-ukmesh-data-unavailable] body > :not(#ukmesh-data-unavailable),
+html[data-ukmesh-data-unavailable] body > :not(#ukmesh-data-unavailable) * {
+  visibility: hidden !important;
 }
 html[data-ukmesh-data-unavailable] #ukmesh-data-unavailable {
+  position: fixed;
+  inset: 2rem 1rem auto;
   display: block;
-  margin: 2rem auto;
-  padding-inline: 1rem;
+  margin: 0;
   text-align: center;
 }

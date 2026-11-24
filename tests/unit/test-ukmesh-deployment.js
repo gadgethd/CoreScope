@@ -4,6 +4,9 @@ const assert = require('node:assert/strict');
 const vm = require('node:vm');
 const loadDeployment = require('./load-deployment');
 const { readUKMeshMapLink, ukmeshViewLink } = require('../../public/url-state');
+const runtime = (privacyGeneration, overrides) => ({
+  version: 1, packetArcs: false, heatmap: false, refreshAfterSeconds: 30, privacyGeneration, ...overrides,
+});
 
 function browser({ candidate = true, configured = true, load }) {
   const seen = { calls: [], reloads: 0, hidden: false, events: [] };
@@ -44,7 +47,7 @@ async function verify() {
     load(url) {
       return url === '/api/runtime-config' ? {
         ok: !!generation,
-        json: async () => ({ privacyGeneration: generation }),
+        json: async () => runtime(generation),
       } : {
         ok: true,
         status: 200,
@@ -75,7 +78,7 @@ async function verify() {
     load: async url => ({
       ok: true,
       json: async () => {
-        if (url === '/api/runtime-config') return { privacyGeneration: nativeGeneration, regionScoping: true };
+        if (url === '/api/runtime-config') return runtime(nativeGeneration, { regionScoping: true });
         if (url === '/api/nodes/map') nativeGeneration++;
         return { regions: [] };
       },
@@ -91,7 +94,7 @@ async function verify() {
   let regionsEnabled = true;
   const revoked = browser({ load: async () => ({
     ok: true,
-    json: async () => ({ privacyGeneration: 8, regionScoping: regionsEnabled }),
+    json: async () => runtime(8, { regionScoping: regionsEnabled }),
   }) });
   assert.equal(await revoked.app.refresh(), 8);
   assert.equal(revoked.app.regionScoping(), true);
@@ -101,6 +104,25 @@ async function verify() {
   assert.equal(revoked.seen.hidden, true);
   assert.equal(revoked.seen.reloads, 1);
   assert.equal(revoked.app.socketUrl(), null);
+
+  for (const malformed of [
+    null, { privacyGeneration: 8 }, runtime(8, { version: 2 }),
+    runtime(8, { packetArcs: 'true' }), runtime(8, { heatmap: 1 }),
+    runtime(8, { refreshAfterSeconds: 4 }), runtime(8, { refreshAfterSeconds: 301 }),
+    runtime(0), runtime(8.5),
+  ]) {
+    const unavailable = browser({ load: async () => ({ ok: true, json: async () => malformed }) });
+    assert.equal(await unavailable.app.refresh(), null);
+    assert.equal(unavailable.app.socketUrl(), null);
+    assert.equal(unavailable.seen.hidden, true);
+  }
+  let renderedConfig = runtime(8);
+  const badUpdate = browser({ load: async () => ({ ok: true, json: async () => renderedConfig }) });
+  assert.equal(await badUpdate.app.refresh(), 8);
+  renderedConfig = runtime(8, { version: 2 });
+  assert.equal(await badUpdate.app.refresh(), null);
+  assert.deepEqual(badUpdate.seen.events, ['ukmesh:privacy-ready', 'ukmesh:privacy-unavailable']);
+  assert.equal(badUpdate.app.socketUrl(), null);
 
   const missing = browser({ configured: false, load: () => assert.fail('candidate must fail closed') });
   await assert.rejects(missing.app.fetch('/api/nodes'), /temporarily unavailable/);

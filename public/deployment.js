@@ -28,6 +28,16 @@ const CoreScopeDeployment = (() => {
     window.dispatchEvent(new Event('ukmesh:privacy-unavailable'));
   }
 
+  function usableRuntimeConfig(config) {
+    // Match UKMesh's v1 shape. Generation zero is valid upstream but does
+    // not authorize public measurements in either app.
+    return config && typeof config === 'object' && !Array.isArray(config) &&
+      config.version === 1 && typeof config.packetArcs === 'boolean' &&
+      typeof config.heatmap === 'boolean' && Number.isSafeInteger(config.privacyGeneration) &&
+      config.privacyGeneration > 0 && Number.isInteger(config.refreshAfterSeconds) &&
+      config.refreshAfterSeconds >= 5 && config.refreshAfterSeconds <= 300;
+  }
+
   function refresh() {
     if (!ukmeshApp || !configured) return Promise.resolve(null);
     if (checking) return checking;
@@ -42,9 +52,8 @@ const CoreScopeDeployment = (() => {
         });
         if (response.ok) {
           const config = await response.json();
-          const value = config.privacyGeneration;
-          if (Number.isSafeInteger(value) && value > 0) {
-            next = value;
+          if (usableRuntimeConfig(config)) {
+            next = config.privacyGeneration;
             nextRegionScoping = config.regionScoping === true;
           }
         }
