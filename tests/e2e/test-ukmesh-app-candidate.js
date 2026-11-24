@@ -23,6 +23,7 @@ async function main() {
     const rasterPaths = [];
     let generation = 1;
     let privateReady = true;
+    let regionScoping = true;
     let readyTiles = 1;
     let authorityHold;
     const origin = 'https://candidate.example.test';
@@ -92,7 +93,7 @@ async function main() {
       }
       if (file === '/api/runtime-config') {
         if (authorityHold) await authorityHold();
-        return route.fulfill({ status: privateReady ? 200 : 503, json: { privacyGeneration: generation, regionScoping: true } });
+        return route.fulfill({ status: privateReady ? 200 : 503, json: { privacyGeneration: generation, regionScoping } });
       }
       if (file === '/api/regions/summary') {
         assert.equal(url.searchParams.get('network'), 'ukmesh');
@@ -244,7 +245,15 @@ async function main() {
     assert.deepEqual(await page.evaluate(() => Object.keys(window._liveNodeData()).sort()), ['b'.repeat(64), 'c'.repeat(64)]);
     assert.equal(nativeMapReads[1].get('snapshot'), 'fixture-snapshot');
     assert.equal(nativeMapReads[1].get('cursor'), 'page2');
-    await page.getByText('UKNorth traffic', { exact: false }).waitFor();
+    await page.getByText('UKNorth traffic', { exact: false }).waitFor().catch(async error => {
+      console.error('Region feed state', await page.locator('#liveFeed').evaluate(feed => ({
+        text: feed.textContent,
+        className: feed.className,
+        display: getComputedStyle(feed).display,
+      })));
+      console.error('Region feed requests', nativeLayerReads.filter(url => url.pathname === '/api/packets/recent').map(url => url.search));
+      throw error;
+    });
     assert.equal(await page.locator('#liveFeed .live-feed-item').count(), 1);
     assert.equal(await page.locator('#vcrBar').isVisible(), false);
     await page.locator('#nodeDetailClose').click();
@@ -269,6 +278,13 @@ async function main() {
     await page.getByText('UKSouth traffic', { exact: false }).waitFor();
     assert.equal(await page.getByText('UKNorth traffic', { exact: false }).count(), 0);
     assert.ok(nativeLayerReads.some(url => url.pathname.endsWith('/packets/recent') && url.searchParams.get('region') === 'UKSouth'));
+    const namedReadsBeforeRevocation = nativeMapReads.length;
+    regionScoping = false;
+    await page.getByText('Region nodes unavailable', { exact: true }).waitFor();
+    assert.equal(await page.getByText('UKSouth traffic', { exact: false }).count(), 0);
+    assert.deepEqual(await page.evaluate(() => Object.keys(window._liveNodeData())), []);
+    assert.equal(nativeMapReads.length, namedReadsBeforeRevocation);
+    regionScoping = true;
 
     await page.goto(origin + '/#/live');
     await page.getByRole('checkbox', { name: 'RF coverage' }).waitFor();

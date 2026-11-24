@@ -34,6 +34,7 @@ const CoreScopeDeployment = (() => {
     const visibility = visibilityRevision;
     checking = (async () => {
       let next = null;
+      let nextRegionScoping = false;
       try {
         const response = await request(privacyUrl, {
           cache: 'no-store', credentials: 'omit', redirect: 'error',
@@ -44,7 +45,7 @@ const CoreScopeDeployment = (() => {
           const value = config.privacyGeneration;
           if (Number.isSafeInteger(value) && value > 0) {
             next = value;
-            regionScoping = config.regionScoping === true;
+            nextRegionScoping = config.regionScoping === true;
           }
         }
       } catch { /* keep public data hidden when the authority is unavailable */ }
@@ -52,7 +53,8 @@ const CoreScopeDeployment = (() => {
         if (next !== null) window.location.reload();
         return null;
       }
-      if (generation !== null && next !== generation) {
+      if (generation !== null && (next !== generation || (regionScoping && !nextRegionScoping))) {
+        regionScoping = nextRegionScoping;
         retire();
         if (next !== null) window.location.reload();
         return null;
@@ -60,6 +62,7 @@ const CoreScopeDeployment = (() => {
       if (next !== null) {
         const first = generation === null;
         generation = next;
+        regionScoping = nextRegionScoping;
         if (visibility === visibilityRevision && !document.hidden) setUnavailable(false);
         if (first) window.dispatchEvent(new Event('ukmesh:privacy-ready'));
       }

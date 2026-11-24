@@ -1697,7 +1697,7 @@
     if (ukmeshView?.lifetime.signal.aborted) return;
     if (legacy?.node) {
       const key = Object.keys(nodeData).find(key => key.toLowerCase() === legacy.node.toLowerCase());
-      if (key) void showNodeDetail(key);
+      if (key) void selectMapNode(key);
     }
     // Build the heat layer only when the user wants it. It used to be built
     // unconditionally and torn down ~270 lines later, which was invisible
@@ -2655,11 +2655,15 @@
     }, 2000);
   }
 
-  async function showNodeDetail(pubkey) {
+  function selectMapNode(pubkey) {
     if (ukmeshLiveView) {
       ukmeshLiveView.selectedNode = pubkey;
       ukmeshLiveView.updateLinks?.();
     }
+    return showNodeDetail(pubkey);
+  }
+
+  async function showNodeDetail(pubkey) {
     activeNodeDetailKey = pubkey;
     const panel = document.getElementById('liveNodeDetail');
     const content = document.getElementById('nodeDetailContent');
@@ -3198,7 +3202,7 @@
       permanent: false, direction: 'top', offset: [0, -sizePx / 2], className: 'live-tooltip'
     });
 
-    marker.on('click', () => showNodeDetail(n.public_key));
+    marker.on('click', () => selectMapNode(n.public_key));
 
     marker._baseColor = color;
     marker._baseSize = sizePx;

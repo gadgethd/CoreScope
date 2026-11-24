@@ -88,6 +88,20 @@ async function verify() {
   assert.equal(native.seen.hidden, true);
   assert.equal(native.app.socketUrl(), null);
 
+  let regionsEnabled = true;
+  const revoked = browser({ load: async () => ({
+    ok: true,
+    json: async () => ({ privacyGeneration: 8, regionScoping: regionsEnabled }),
+  }) });
+  assert.equal(await revoked.app.refresh(), 8);
+  assert.equal(revoked.app.regionScoping(), true);
+  regionsEnabled = false;
+  assert.equal(await revoked.app.refresh(), null);
+  assert.equal(revoked.app.regionScoping(), false);
+  assert.equal(revoked.seen.hidden, true);
+  assert.equal(revoked.seen.reloads, 1);
+  assert.equal(revoked.app.socketUrl(), null);
+
   const missing = browser({ configured: false, load: () => assert.fail('candidate must fail closed') });
   await assert.rejects(missing.app.fetch('/api/nodes'), /temporarily unavailable/);
   assert.equal(missing.app.socketUrl(), null);
