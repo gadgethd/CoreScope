@@ -175,7 +175,24 @@ func (p *publicProjectionReader) watchAuthority(interval time.Duration) {
 	}
 }
 
-const publicResponseMaxBytes = 8 * 1024 * 1024
+const (
+	publicResponseMaxBytes        = 8 * 1024 * 1024
+	publicProjectionReadinessPath = "/api/public-projection-ready"
+	publicGenerationHeader        = "X-CoreScope-Privacy-Generation"
+)
+
+// readiness is an authorization check for the app gateway. It uses the same
+// authority and durable epoch as data reads and doesn't instantiate a snapshot.
+func (p *publicProjectionReader) readiness(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	generation, err := p.epoch(r.Context())
+	if err != nil {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+	w.Header().Set(publicGenerationHeader, strconv.FormatInt(generation, 10))
+	w.WriteHeader(http.StatusNoContent)
+}
 
 type publicResponse struct {
 	header    http.Header
@@ -203,7 +220,8 @@ func (r *publicResponse) Write(value []byte) (int, error) {
 
 func (p *publicProjectionReader) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api/healthz" {
+		if !strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api/healthz" ||
+			r.URL.Path == publicProjectionReadinessPath {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -233,7 +251,7 @@ func (p *publicProjectionReader) middleware(next http.Handler) http.Handler {
 		if response.status == 0 {
 			response.status = http.StatusOK
 		}
-		w.Header().Set("X-CoreScope-Privacy-Generation", strconv.FormatInt(generation, 10))
+		w.Header().Set(publicGenerationHeader, strconv.FormatInt(generation, 10))
 		w.WriteHeader(response.status)
 		_, _ = w.Write(response.body.Bytes())
 	})

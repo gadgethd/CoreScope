@@ -62,14 +62,21 @@ func TestF01CopiedProjectionIsFencedAndCachesReplacedOnRevocation(t *testing.T) 
 		if response.Code != code {
 			t.Fatalf("%s: status=%d want=%d body=%s", path, response.Code, code, response.Body.String())
 		}
+		if path == publicProjectionReadinessPath && response.Header().Get("Cache-Control") != "no-store" {
+			t.Fatal("projection readiness must never be cached")
+		}
 		var expectedGeneration string
-		if code == http.StatusOK {
+		if code == http.StatusOK || code == http.StatusNoContent {
 			expectedGeneration = strconv.FormatInt(generation.Load(), 10)
 		}
 		if got := response.Header().Get("X-CoreScope-Privacy-Generation"); got != expectedGeneration {
 			t.Fatalf("%s: generation=%q want=%q", path, got, expectedGeneration)
 		}
 		return response.Body.String()
+	}
+	if body := request(publicProjectionReadinessPath, http.StatusNoContent); body != "" ||
+		srv.publicProjection.currentGeneration() != 0 {
+		t.Fatal("readiness must respond without building or returning a measurement snapshot")
 	}
 	if !strings.Contains(request("/api/nodes", 200), "TestRepeater") {
 		t.Fatal("fixture copy missing")
@@ -79,6 +86,7 @@ func TestF01CopiedProjectionIsFencedAndCachesReplacedOnRevocation(t *testing.T) 
 	request("/api/packets", 503)
 	request("/api/nodes", 503)
 	request("/api/stats", 503)
+	request(publicProjectionReadinessPath, http.StatusForbidden)
 	// Only the ingestor writes the measurement DB in production. This test's
 	// fixture connection stands in for its completed selective rebuild.
 	if _, err := db.conn.Exec(`DELETE FROM observations; DELETE FROM transmissions;
@@ -92,8 +100,31 @@ func TestF01CopiedProjectionIsFencedAndCachesReplacedOnRevocation(t *testing.T) 
 	if strings.Contains(request("/api/packets", 200), "abc123def4567890") {
 		t.Fatal("revoked packet survived in memory")
 	}
+	request(publicProjectionReadinessPath, http.StatusNoContent)
+	if _, err := db.conn.Exec(`UPDATE public_projection_state SET ready=0 WHERE singleton=1`); err != nil {
+		t.Fatal(err)
+	}
+	request(publicProjectionReadinessPath, http.StatusForbidden)
+	if _, err := db.conn.Exec(`UPDATE public_projection_state SET ready=1 WHERE singleton=1`); err != nil {
+		t.Fatal(err)
+	}
 	generation.Store(0)
+	request(publicProjectionReadinessPath, http.StatusForbidden)
 	request("/api/packets", 503)
+}
+
+func TestF01ProjectionReadinessIsAbsentForStandalone(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	router := mux.NewRouter()
+	NewServer(db, &Config{}, NewHub()).RegisterRoutes(router)
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(method, publicProjectionReadinessPath, nil))
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("standalone %s readiness status = %d, want 404", method, response.Code)
+		}
+	}
 }
 
 func TestF01PublicBroadcastUsesOneCurrentEpochAndRejectsStaleCapturedRows(t *testing.T) {

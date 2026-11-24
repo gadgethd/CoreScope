@@ -272,6 +272,7 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 				s.hub.publicProjection = s.publicProjection
 			}
 			r.Use(s.publicProjection.middleware)
+			r.HandleFunc(publicProjectionReadinessPath, s.publicProjection.readiness).Methods(http.MethodGet, http.MethodHead)
 		}
 	}
 	if !s.projectionChild {
