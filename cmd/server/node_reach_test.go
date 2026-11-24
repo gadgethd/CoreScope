@@ -297,10 +297,13 @@ func TestScanReachRows_DecodesRows(t *testing.T) {
 // database against 1.8-2.0 s when it starts from idx_observations_timestamp.
 func TestReachScanStartsFromObservationsTimeIndex(t *testing.T) {
 	db := newReachScanTestDB(t)
-	// The planner's choice depends on sqlite_stat1. These are the statistics
-	// ANALYZE produced on that database (18.3M observations, 1.5M
-	// transmissions), loaded so the test plans like production does.
+	defer db.conn.Close()
+	// Populate only the statistics measured on the large database. Analyzing
+	// the three fixture rows also produces STAT4 histogram samples in builds
+	// with that feature enabled, which describe a different dataset and can
+	// override the size and selectivity estimates below.
 	for _, s := range []string{
+		`DELETE FROM observations; DELETE FROM transmissions; DELETE FROM observers`,
 		`CREATE INDEX idx_observations_timestamp ON observations(timestamp)`,
 		`CREATE INDEX idx_observations_tx_ts ON observations(transmission_id, timestamp)`,
 		`ANALYZE`,
