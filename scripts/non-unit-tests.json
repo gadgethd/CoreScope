@@ -3,6 +3,7 @@
     "reason": "Requires Playwright and Chromium; most suites also require a running local fixture server via BASE_URL. Existing E2E workflow steps retain their separate setup and selection. Never point these tests at production.",
     "files": [
       "tests/e2e/test-1110-live-filter.js",
+      "tests/e2e/test-ukmesh-app-candidate.js",
       "tests/e2e/test-a11y-axe-1668.js",
       "tests/e2e/test-analytics-fluid-charts.js",
       "tests/e2e/test-audio-lab-1297-e2e.js",

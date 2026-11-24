@@ -70,6 +70,7 @@
   // Region filter (#1045): observer_id → IATA code, populated from /api/observers
   let observerIataMap = {};
   let regionFilterChangeHandler = null;
+  let stopUKMeshRfCoverage;
 
   /**
    * Returns true if the packet group matches the selected regions.
@@ -470,7 +471,7 @@
     loadNodes(targetTs);
 
     // Fetch packets from scrub point forward (ASC order, no limit clipping from the wrong end)
-    fetch(`/api/packets?limit=10000&grouped=false&expand=observations&since=${encodeURIComponent(fetchFrom)}&order=asc`)
+    CoreScopeDeployment.fetch(`/api/packets?limit=10000&grouped=false&expand=observations&since=${encodeURIComponent(fetchFrom)}&order=asc`)
       .then(r => r.json())
       .then(data => {
         const pkts = data.packets || [];
@@ -531,7 +532,7 @@
     // Fetch packets from DB for the time window
     const now = Date.now();
     const from = new Date(now - ms).toISOString();
-    fetch(`/api/packets?limit=${window.LIVE_MAP_MAX_NODES}&grouped=false&expand=observations&since=${encodeURIComponent(from)}`)
+    CoreScopeDeployment.fetch(`/api/packets?limit=${window.LIVE_MAP_MAX_NODES}&grouped=false&expand=observations&since=${encodeURIComponent(from)}`)
       .then(r => r.json())
       .then(data => {
         const pkts = (data.packets || []).reverse(); // oldest first
@@ -605,7 +606,7 @@
     if (!last) return Promise.resolve(false);
     var gen = VCR.replayGen;
     const since = new Date(last.ts + 1).toISOString(); // +1ms to avoid dupe
-    return fetch(`/api/packets?limit=10000&grouped=false&expand=observations&since=${encodeURIComponent(since)}&order=asc`)
+    return CoreScopeDeployment.fetch(`/api/packets?limit=10000&grouped=false&expand=observations&since=${encodeURIComponent(since)}&order=asc`)
       .then(r => r.json())
       .then(data => {
         const pkts = data.packets || [];
@@ -996,7 +997,7 @@
     if (scopeMs === VCR.timelineFetchedScope) return;
     const since = new Date(Date.now() - scopeMs).toISOString();
     try {
-      const resp = await fetch(`/api/packets/timestamps?since=${encodeURIComponent(since)}`);
+      const resp = await CoreScopeDeployment.fetch(`/api/packets/timestamps?since=${encodeURIComponent(since)}`);
       if (resp.ok) {
         const timestamps = await resp.json(); // array of ISO strings
         VCR.timelineTimestamps = timestamps.map(t => new Date(t).getTime());
@@ -1245,6 +1246,18 @@
   }
 
   async function init(app) {
+    const legacy = CoreScopeDeployment.ukmeshApp
+      ? URLState.readUKMeshMapLink(location.search, location.hash) : null;
+    if (legacy?.region) {
+      // UKMesh's named mesh scope is not CoreScope's IATA observer filter.
+      const notice = document.createElement('p');
+      notice.setAttribute('role', 'status');
+      notice.textContent = `UK Mesh region ${legacy.region} is unavailable on this map.`;
+      app.replaceChildren(notice);
+      return;
+    }
+    if (legacy?.layers) heatEnabled = legacy.layers.has('heatmap');
+
     app.innerHTML = `
       <div class="live-page">
         <div id="liveMap" style="width:100%;height:100%;position:absolute;top:0;left:0;z-index:1"></div>
@@ -1397,10 +1410,10 @@
     wireLiveControls();
 
     // Fetch configurable map defaults (#115)
-    let mapCenter = [37.45, -122.0];
-    let mapZoom = 9;
+    let mapCenter = legacy ? [54.5, -3.2] : [37.45, -122.0];
+    let mapZoom = legacy ? 6 : 9;
     try {
-      const mapCfg = await (await fetch('/api/config/map')).json();
+      const mapCfg = await (await CoreScopeDeployment.fetch('/api/config/map')).json();
       if (Array.isArray(mapCfg.center) && mapCfg.center.length === 2) mapCenter = mapCfg.center;
       if (typeof mapCfg.zoom === 'number') mapZoom = mapCfg.zoom;
     } catch { }
@@ -1408,8 +1421,8 @@
     // #1709: URL hash lat/lon/zoom is the highest-precedence viewport source.
     // Applied here so the very first setView() lands at the requested viewport
     // (avoids a visible recenter from default → URL after init).
-    const initVp = (typeof parseViewportHash === 'function')
-      ? parseViewportHash(location.hash) : null;
+    const initVp = legacy?.viewport || (typeof parseViewportHash === 'function'
+      ? parseViewportHash(location.hash) : null);
     if (initVp) {
       mapCenter = [initVp.lat, initVp.lon];
       mapZoom = initVp.zoom;
@@ -1417,6 +1430,7 @@
 
     map = L.map('liveMap', {
       zoomControl: false,
+      zoomSnap: legacy ? 0.01 : 1,
       attributionControl: false,
       zoomAnimation: true,
       markerZoomAnimation: true,
@@ -1672,6 +1686,10 @@
     AreaFilter.init(document.getElementById('liveAreaFilter'));
     AreaFilter.onChange(function () { loadNodes(); });
     await loadNodes();
+    if (legacy?.node) {
+      const key = Object.keys(nodeData).find(key => key.toLowerCase() === legacy.node.toLowerCase());
+      if (key) void showNodeDetail(key);
+    }
     // Build the heat layer only when the user wants it. It used to be built
     // unconditionally and torn down ~270 lines later, which was invisible
     // (no await in between, so no frame composited) but meant that any throw
@@ -1716,7 +1734,7 @@
       // (cmd/server/types.go ObserverListResponse) — NOT a top-level array.
       // Bug #1136: previously parsed as array → map empty → region filter
       // dropped every packet.
-      fetch('/api/observers').then(function(r) { return r.json(); }).then(function(data) {
+      CoreScopeDeployment.fetch('/api/observers').then(function(r) { return r.json(); }).then(function(data) {
         setObserverIataMap(buildObserverIataMap(data));
       }).catch(function() { /* leave map empty; filter will hide all when active */ });
       RegionFilter.init(rfEl, { dropdown: true });
@@ -1811,7 +1829,7 @@
         if (!nodeFilterDropdown) return;
         if (!q || q.length < 1) { hideDropdown(); return; }
         try {
-          const resp = await fetch('/api/nodes/search?q=' + encodeURIComponent(q));
+          const resp = await CoreScopeDeployment.fetch('/api/nodes/search?q=' + encodeURIComponent(q));
           if (!resp.ok) { hideDropdown(); return; }
           const data = await resp.json();
           const nodes = (data && data.nodes) || [];
@@ -2011,7 +2029,7 @@
     });
     const feedHideBtn = document.getElementById('feedHideBtn');
     const feedShowBtn = document.getElementById('feedShowBtn');
-    if (localStorage.getItem('live-feed-hidden') === 'true') {
+    if (legacy?.layers ? !legacy.layers.has('feed') : localStorage.getItem('live-feed-hidden') === 'true') {
       feedEl.classList.add('hidden');
       feedShowBtn.classList.remove('hidden');
     }
@@ -2308,8 +2326,8 @@
 
     // Save/restore map view. #1709: URL hash lat/lon/zoom overrides
     // localStorage. Validated via shared parseViewportHash helper.
-    const urlVp = (typeof parseViewportHash === 'function')
-      ? parseViewportHash(location.hash) : null;
+    const urlVp = legacy?.viewport || (typeof parseViewportHash === 'function'
+      ? parseViewportHash(location.hash) : null);
     if (urlVp) {
       map.setView([urlVp.lat, urlVp.lon], urlVp.zoom);
     } else {
@@ -2318,9 +2336,54 @@
         try { const v = JSON.parse(savedView); map.setView([v.lat, v.lng], v.zoom); } catch {}
       }
     }
+    if (CoreScopeDeployment.ukmeshApp) {
+      const tools = document.createElement('section');
+      tools.className = 'ukmesh-map-tools';
+      tools.setAttribute('aria-label', 'Map view');
+      const copy = document.createElement('button');
+      copy.type = 'button';
+      copy.className = 'btn-secondary';
+      copy.textContent = 'Copy view link';
+      const status = document.createElement('span');
+      status.setAttribute('role', 'status');
+      copy.addEventListener('click', async () => {
+        const center = map.getCenter();
+        const url = URLState.ukmeshViewLink(location.href, {
+          lat: center.lat, lon: center.lng, zoom: map.getZoom(),
+        });
+        try {
+          await navigator.clipboard.writeText(url.href);
+          status.textContent = 'Link copied';
+        } catch {
+          status.textContent = 'Could not copy the link';
+        }
+      });
+      tools.append(copy, status);
+      const pending = [...legacy?.layers || []].filter(layer => !['feed', 'heatmap', 'coverage'].includes(layer));
+      if (pending.length) {
+        const notice = document.createElement('p');
+        notice.textContent = 'Some layers in this link are unavailable on this map.';
+        tools.append(notice);
+      }
+      if (legacy?.note) {
+        const note = document.createElement('p');
+        note.textContent = legacy.note;
+        tools.append(note);
+      }
+      app.querySelector('.live-page')?.append(tools);
+      stopUKMeshRfCoverage = UKMeshRfCoverage.start(map, tools, legacy?.layers);
+      window.addEventListener('ukmesh:privacy-unavailable', stopUKMeshRfCoverage, { once: true });
+    }
+    let legacyViewportChanged = false;
+    if (legacy) map.on('dragstart zoomstart', () => { legacyViewportChanged = true; });
     map.on('moveend', () => {
       const c = map.getCenter();
-      localStorage.setItem('live-map-view', JSON.stringify({ lat: c.lat, lng: c.lng, zoom: map.getZoom() }));
+      const zoom = map.getZoom();
+      if (legacyViewportChanged) {
+        history.replaceState(null, '', URLState.ukmeshViewLink(location.href, { lat: c.lat, lon: c.lng, zoom }));
+        legacyViewportChanged = false;
+      }
+      localStorage.setItem('live-map-view', JSON.stringify({ lat: c.lat, lng: c.lng, zoom }));
     });
 
     // === VCR event listeners ===
@@ -2805,7 +2868,7 @@
 
   async function fetchAffinityData() {
     try {
-      const resp = await fetch('/api/analytics/neighbor-graph');
+      const resp = await CoreScopeDeployment.fetch('/api/analytics/neighbor-graph');
       const graph = await resp.json();
       if (window.HopResolver && HopResolver.setAffinity) {
         HopResolver.setAffinity(graph);
@@ -3269,7 +3332,7 @@
   async function replayRecent() {
     try {
       // Single bulk fetch with expand=observations — no N+1 calls
-      const resp = await fetch('/api/packets?limit=8&expand=observations');
+      const resp = await CoreScopeDeployment.fetch('/api/packets?limit=8&expand=observations');
       const data = await resp.json();
       const groups = (data.packets || []).reverse();
 
@@ -4638,6 +4701,11 @@
     if (regionFilterChangeHandler && window.RegionFilter && typeof RegionFilter.offChange === 'function') {
       RegionFilter.offChange(regionFilterChangeHandler);
       regionFilterChangeHandler = null;
+    }
+    if (stopUKMeshRfCoverage) {
+      window.removeEventListener('ukmesh:privacy-unavailable', stopUKMeshRfCoverage);
+      stopUKMeshRfCoverage();
+      stopUKMeshRfCoverage = undefined;
     }
     if (map) { map.remove(); map = null; }
     if (_onResize) {

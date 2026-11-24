@@ -95,6 +95,7 @@ function makeSandbox(opts) {
   ctx.window.document = ctx.document;
   ctx.globalThis = ctx;
   vm.createContext(ctx);
+  require('./load-deployment')(ctx);
   ctx.setTheme = (t) => { theme = t; };
   ctx.listeners = listeners;
   ctx.fire = (type, ev) => { (listeners[type] || []).forEach(fn => fn(ev)); };

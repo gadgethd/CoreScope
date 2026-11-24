@@ -15,7 +15,7 @@
     if (method !== 'GET' && state.user && state.user.csrfToken) {
       opts.headers['X-CS-CSRF'] = state.user.csrfToken;
     }
-    return fetch(path, opts).then(function (res) {
+    return CoreScopeDeployment.fetch(path, opts).then(function (res) {
       return res.json().catch(function () { return {}; }).then(function (data) {
         if (res.status === 401 && state.user && path !== '/api/auth/login' && path !== '/api/auth/activate') {
           setUser(null);

@@ -28,6 +28,7 @@ async function test(name, fn) {
 function loadPureModule() {
   const ctx = { window: {}, module: { exports: {} }, console, Date };
   vm.createContext(ctx);
+  require('./load-deployment')(ctx);
   const src = fs.readFileSync(path.join(REPO_ROOT, 'public', 'warmup-banner.js'), 'utf8');
   vm.runInContext(src, ctx);
   return ctx.window.__warmupBanner || ctx.module.exports;
@@ -89,6 +90,7 @@ function bootDomSandbox(initialHealthz, initialHeader) {
   };
   ctx.window.fetch = ctx.fetch;
   vm.createContext(ctx);
+  require('./load-deployment')(ctx);
   const src = fs.readFileSync(path.join(REPO_ROOT, 'public', 'warmup-banner.js'), 'utf8');
   vm.runInContext(src, ctx);
   const sapi = ctx.window.__warmupBanner;
@@ -269,6 +271,7 @@ function bootDomSandbox(initialHealthz, initialHeader) {
     };
     ctx.window.fetch = baseFetch;
     vm.createContext(ctx);
+    require('./load-deployment')(ctx);
     const src = fs.readFileSync(path.join(REPO_ROOT, 'public', 'warmup-banner.js'), 'utf8');
     vm.runInContext(src, ctx);
     const a = ctx.window.__warmupBanner;

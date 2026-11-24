@@ -74,6 +74,7 @@ function makeSandbox() {
     RegionFilter: { init(){}, getSelected: () => null, onChange: () => {}, offChange: () => {}, regionQueryString: () => '', getRegionParam: () => '' },
   };
   vm.createContext(ctx);
+  require('./load-deployment')(ctx);
   return ctx;
 }
 

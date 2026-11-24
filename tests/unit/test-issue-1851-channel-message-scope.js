@@ -51,6 +51,7 @@ function loadPathHashSize() {
     fetch: () => new Promise(() => {}),
   };
   vm.createContext(appCtx);
+  require('./load-deployment')(appCtx);
   vm.runInContext(fs.readFileSync('public/app.js', 'utf8'), appCtx);
   return appCtx.pathHashSize;
 }
@@ -125,6 +126,7 @@ function makeChannelsSandbox(apiImpl) {
   };
   ctx.window.matchMedia = ctx.matchMedia;
   vm.createContext(ctx);
+  require('./load-deployment')(ctx);
   for (const file of ['public/vendor/aes-ecb.js', 'public/channel-decrypt.js', 'public/channels.js']) {
     vm.runInContext(fs.readFileSync(file, 'utf8'), ctx);
     for (const k of Object.keys(ctx.window)) ctx[k] = ctx.window[k];

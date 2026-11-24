@@ -97,6 +97,7 @@ function makeSandbox(opts) {
   ctx.window.document = ctx.document;
   ctx.globalThis = ctx;
   vm.createContext(ctx);
+  require('./load-deployment')(ctx);
   // After context creation, make the sandbox global object also be `window`
   // so `window.X = ...` in roles.js makes X a bare global the same file
   // can reference. We do this by copying assignments back — simpler: install

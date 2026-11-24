@@ -60,6 +60,7 @@ function loadAnalyticsHelpers() {
   };
   sandbox.window = sandbox;
   vm.createContext(sandbox);
+  require('./load-deployment')(sandbox);
   vm.runInContext(fs.readFileSync(path.join(REPO_ROOT, 'public/analytics.js'), 'utf8'), sandbox);
   return sandbox;
 }
@@ -147,6 +148,7 @@ function loadApi(responses) {
   };
   sandbox.window = sandbox;
   vm.createContext(sandbox);
+  require('./load-deployment')(sandbox);
   vm.runInContext(fs.readFileSync(path.join(REPO_ROOT, 'public/app.js'), 'utf8'), sandbox);
   return { sandbox, calls };
 }

@@ -92,6 +92,7 @@ function makeSandbox() {
   ctx.makeColumnsResizable = () => {};
   ctx.debounce = (fn) => fn;
   vm.createContext(ctx);
+  require('./load-deployment')(ctx);
   return ctx;
 }
 function loadInCtx(ctx, file) {

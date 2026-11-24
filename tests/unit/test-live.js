@@ -94,6 +94,7 @@ function makeSandbox() {
     },
   };
   vm.createContext(ctx);
+  require('./load-deployment')(ctx);
   return ctx;
 }
 

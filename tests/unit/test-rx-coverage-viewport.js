@@ -48,7 +48,9 @@ function harness(options = {}) {
       tileLayer: () => ({ addTo() {} }), layerGroup: () => ({ addTo() { return this; }, clearLayers() {} })
     }
   };
-  vm.runInNewContext(parser + '\n' + source, context);
+  vm.createContext(context);
+  require('./load-deployment')(context);
+  vm.runInContext(parser + '\n' + source, context);
   return { page, maps, requests, timers, storage, location, init: async () => { page.init({ innerHTML: '' }); await flush(); } };
 }
 (async () => {

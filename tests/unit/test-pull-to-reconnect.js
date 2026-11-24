@@ -120,6 +120,7 @@ function makeSandbox(opts) {
   ctx.globalThis = ctx;
 
   vm.createContext(ctx);
+  require('./load-deployment')(ctx);
   return { ctx, elements, wsInstances, listeners };
 }
 

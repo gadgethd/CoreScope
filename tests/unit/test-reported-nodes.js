@@ -19,6 +19,7 @@ const sandbox = {
   Date,
 };
 vm.createContext(sandbox);
+require('./load-deployment')(sandbox);
 vm.runInContext(code, sandbox);
 const R = sandbox.window.ReportedNodes;
 

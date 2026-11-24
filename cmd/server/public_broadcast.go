@@ -64,6 +64,10 @@ func (h *Hub) BroadcastPublicBatch(messages []WSMessage, generation int64) {
 		}()
 	}
 	for _, client := range clients {
+		if client.publicGeneration != 0 && client.publicGeneration != current {
+			client.conn.Close()
+			continue
+		}
 		jobs <- client
 	}
 	close(jobs)

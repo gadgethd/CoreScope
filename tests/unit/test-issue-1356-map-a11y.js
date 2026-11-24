@@ -88,6 +88,7 @@ function loadMapInternals() {
   };
   ctx.window.L = ctx.L;
   vm.createContext(ctx);
+  require('./load-deployment')(ctx);
   for (const f of ['public/roles.js', 'public/map.js']) {
     vm.runInContext(fs.readFileSync(path.join(REPO_ROOT, f), 'utf8'), ctx, { filename: f });
     for (const k of Object.keys(ctx.window)) ctx[k] = ctx.window[k];

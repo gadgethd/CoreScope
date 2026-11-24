@@ -65,6 +65,7 @@ function makeSandbox() {
   ctx.window.location = ctx.location;
   ctx.window.localStorage = ctx.localStorage;
   vm.createContext(ctx);
+  require('./load-deployment')(ctx);
   return ctx;
 }
 function load(ctx, file) {

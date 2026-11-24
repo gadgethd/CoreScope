@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -612,6 +613,17 @@ func main() {
 	}
 }
 
+// Only the edge's explicit candidate shell route uses the UKMesh asset root.
+const ukmeshAppShellPath = "/corescope-app-shell"
+
+var relativeShellAsset = regexp.MustCompile(`(<(?:link|script) [^<>\n]*?(?:href|src)=")([a-zA-Z][^"<>:\s]*")`)
+
+func ukmeshShell(indexHTML string) []byte {
+	namespaced := relativeShellAsset.ReplaceAllString(indexHTML, "${1}/corescope/static/${2}")
+	return []byte(strings.Replace(namespaced, "<!-- UKMESH_APP_CONFIG -->",
+		`<script src="/corescope/config.js" data-ukmesh-app-config></script>`, 1))
+}
+
 // spaHandler serves static files, falling back to index.html for SPA routes.
 // It reads index.html once at creation time and replaces the __BUST__ placeholder
 // with a Unix timestamp so browsers fetch fresh JS/CSS after each server restart.
@@ -625,6 +637,7 @@ func spaHandler(root string, fs http.Handler) http.Handler {
 	}
 	bustValue := fmt.Sprintf("%d", time.Now().Unix())
 	indexHTML := []byte(strings.ReplaceAll(string(rawHTML), "__BUST__", bustValue))
+	appIndexHTML := ukmeshShell(string(indexHTML))
 	log.Printf("[static] cache-bust value: %s", bustValue)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -639,10 +652,14 @@ func spaHandler(root string, fs http.Handler) http.Handler {
 			return
 		}
 		// Serve pre-processed index.html for root and /index.html
-		if r.URL.Path == "/" || r.URL.Path == "/index.html" {
+		if r.URL.Path == "/" || r.URL.Path == "/index.html" || r.URL.Path == ukmeshAppShellPath {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
-			w.Write(indexHTML)
+			if r.URL.Path == ukmeshAppShellPath {
+				w.Write(appIndexHTML)
+			} else {
+				w.Write(indexHTML)
+			}
 			return
 		}
 

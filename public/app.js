@@ -130,7 +130,7 @@ const CLIENT_TTL = {
   nodeAnalytics: 60000, nodeSearch: 10000
 };
 // Fetch server cache config and use as client TTLs (server values are in seconds)
-fetch('/api/config/cache').then(r => r.json()).then(cfg => {
+CoreScopeDeployment.fetch('/api/config/cache').then(r => r.json()).then(cfg => {
   for (const [k, v] of Object.entries(cfg)) {
     if (k in CLIENT_TTL && typeof v === 'number') CLIENT_TTL[k] = v * 1000;
   }
@@ -169,7 +169,7 @@ async function api(path, { ttl = 0, bust = false } = {}) {
     let notified = false;
     try {
       while (true) {
-        const res = await fetch('/api' + path);
+        const res = await CoreScopeDeployment.fetch('/api' + path);
         if (res.status === 503 && attempt < maxAttempts) {
           const ra = parseInt(res.headers.get('Retry-After'), 10);
           const wait = isFinite(ra) && ra > 0 ? ra * 1000 : delay;
@@ -882,8 +882,9 @@ function connectWS() {
   clearTimeout(wsReconnectTimer);
   wsReconnectTimer = null;
   dropWS();
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const sock = new WebSocket(`${proto}//${location.host}`);
+  const endpoint = CoreScopeDeployment.socketUrl();
+  if (!endpoint) return;
+  const sock = new WebSocket(endpoint);
   ws = sock;
   // Measured from creation, so a handshake that never completes is caught too.
   wsLastMessageAt = Date.now();
@@ -1251,7 +1252,9 @@ function navigate() {
     return;
   }
 
-  const hash = location.hash.replace('#/', '') || 'packets';
+  const fragment = location.hash;
+  const legacyMap = CoreScopeDeployment.ukmeshApp && (!fragment.startsWith('#/') || fragment === '#/');
+  const hash = legacyMap ? 'live' : (fragment.replace('#/', '') || 'packets');
   const route = hash.split('?')[0];
 
   // Handle parameterized routes: nodes/<pubkey> → nodes page + select
@@ -1366,6 +1369,12 @@ function navigate() {
 }
 
 window.addEventListener('hashchange', navigate);
+window.addEventListener('ukmesh:privacy-unavailable', () => {
+  clearTimeout(wsReconnectTimer);
+  dropWS();
+  _apiCache.clear();
+  _inflight.clear();
+});
 let _themeRefreshTimer = null;
 window.addEventListener('theme-changed', () => {
   if (_themeRefreshTimer) clearTimeout(_themeRefreshTimer);
@@ -1378,7 +1387,16 @@ window.addEventListener('timestamp-mode-changed', () => {
   window.dispatchEvent(new CustomEvent('theme-refresh'));
 });
 window.addEventListener('DOMContentLoaded', () => {
-  connectWS();
+  if (CoreScopeDeployment.ukmeshApp) {
+    window.addEventListener('ukmesh:privacy-ready', () => {
+      connectWS();
+      navigate();
+    });
+    // The initial check can finish before the document and its scripts load.
+    if (CoreScopeDeployment.socketUrl()) connectWS();
+  } else {
+    connectWS();
+  }
   setupWSResumeCheck();
   setupPullToReconnect();
 
@@ -1855,9 +1873,9 @@ window.addEventListener('DOMContentLoaded', () => {
     searchTimeout = setTimeout(async () => {
       try {
         const [packets, nodes, channels, reported] = await Promise.all([
-          fetch('/api/packets?limit=5&hash=' + encodeURIComponent(q)).then(r => r.json()).catch(() => ({ packets: [] })),
-          fetch('/api/nodes?search=' + encodeURIComponent(q)).then(r => r.json()).catch(() => []),
-          fetch('/api/channels').then(r => r.json()).catch(() => []),
+          CoreScopeDeployment.fetch('/api/packets?limit=5&hash=' + encodeURIComponent(q)).then(r => r.json()).catch(() => ({ packets: [] })),
+          CoreScopeDeployment.fetch('/api/nodes?search=' + encodeURIComponent(q)).then(r => r.json()).catch(() => []),
+          CoreScopeDeployment.fetch('/api/channels').then(r => r.json()).catch(() => []),
           // Repeaters known only from their reported name are not in /api/nodes.
           window.ReportedNodes ? window.ReportedNodes.load() : Promise.resolve({ nodes: [] })
         ]);
@@ -1952,7 +1970,7 @@ window.addEventListener('DOMContentLoaded', () => {
 
   // --- Theme Customization ---
   // Fetch theme config and apply via customizer v2 pipeline
-  fetch('/api/config/theme', { cache: 'no-store' }).then(r => r.json()).then(cfg => {
+  CoreScopeDeployment.fetch('/api/config/theme', { cache: 'no-store' }).then(r => r.json()).then(cfg => {
     // Normalize timestamp defaults
     cfg = cfg || {};
     if (!cfg.timestamps) cfg.timestamps = {};
@@ -1977,7 +1995,9 @@ window.addEventListener('DOMContentLoaded', () => {
   });
 
   // Navigate immediately — don't gate data-fetching pages on cosmetic theme fetch
-  if (!location.hash || location.hash === '#/') location.hash = '#/home';
+  if (CoreScopeDeployment.ukmeshApp) {
+    if (CoreScopeDeployment.socketUrl() && !currentPage) navigate();
+  } else if (!location.hash || location.hash === '#/') location.hash = '#/home';
   else navigate();
 });
 

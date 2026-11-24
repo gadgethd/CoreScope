@@ -82,7 +82,7 @@
     }
 
     resultsDiv.innerHTML = '<p>Loading...</p>';
-    fetch('/api/paths/inspect', {
+    CoreScopeDeployment.fetch('/api/paths/inspect', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ prefixes: prefixes })

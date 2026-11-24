@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -61,6 +62,13 @@ func TestF01CopiedProjectionIsFencedAndCachesReplacedOnRevocation(t *testing.T) 
 		if response.Code != code {
 			t.Fatalf("%s: status=%d want=%d body=%s", path, response.Code, code, response.Body.String())
 		}
+		var expectedGeneration string
+		if code == http.StatusOK {
+			expectedGeneration = strconv.FormatInt(generation.Load(), 10)
+		}
+		if got := response.Header().Get("X-CoreScope-Privacy-Generation"); got != expectedGeneration {
+			t.Fatalf("%s: generation=%q want=%q", path, got, expectedGeneration)
+		}
 		return response.Body.String()
 	}
 	if !strings.Contains(request("/api/nodes", 200), "TestRepeater") {
@@ -115,6 +123,19 @@ func TestF01PublicBroadcastUsesOneCurrentEpochAndRejectsStaleCapturedRows(t *tes
 		t.Fatal(err)
 	}
 	defer client.Close()
+	fencedURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/ws?privacyGeneration="
+	bound, _, err := websocket.DefaultDialer.Dial(fencedURL+"1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bound.Close()
+	waitForRegistration := time.Now().Add(time.Second)
+	for hub.ClientCount() != 2 && time.Now().Before(waitForRegistration) {
+		time.Sleep(time.Millisecond)
+	}
+	if hub.ClientCount() != 2 {
+		t.Fatal("public sockets did not register")
+	}
 	message := func(hash string) WSMessage {
 		return WSMessage{Type: "packet", Data: struct {
 			Hash string `json:"hash"`
@@ -124,6 +145,10 @@ func TestF01PublicBroadcastUsesOneCurrentEpochAndRejectsStaleCapturedRows(t *tes
 	_, data, err := client.ReadMessage()
 	if err != nil || !strings.Contains(string(data), "ready") {
 		t.Fatalf("ready delivery: %s %v", data, err)
+	}
+	bound.SetReadDeadline(time.Now().Add(time.Second))
+	if _, data, err := bound.ReadMessage(); err != nil || !strings.Contains(string(data), "ready") {
+		t.Fatalf("generation-bound delivery: %s %v", data, err)
 	}
 	seen := make(chan []byte, 1)
 	go func() { _, data, _ := client.ReadMessage(); seen <- data }()
@@ -136,6 +161,14 @@ func TestF01PublicBroadcastUsesOneCurrentEpochAndRejectsStaleCapturedRows(t *tes
 	}
 	db.conn.Exec(`UPDATE public_projection_state SET generation=2,ready=1`)
 	hub.BroadcastPublicBatch([]WSMessage{message("current-copy")}, 2)
+	bound.SetReadDeadline(time.Now().Add(time.Second))
+	if _, data, err := bound.ReadMessage(); !websocket.IsCloseError(err, websocket.CloseAbnormalClosure) {
+		t.Fatalf("old generation socket remained open: %s, %v", data, err)
+	}
+	if _, response, err := websocket.DefaultDialer.Dial(fencedURL+"1", nil); err == nil ||
+		response == nil || response.StatusCode != 503 {
+		t.Fatal("stale client generation accepted an upgrade")
+	}
 	select {
 	case data := <-seen:
 		if !strings.Contains(string(data), "current-copy") {

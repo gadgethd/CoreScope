@@ -86,6 +86,7 @@ function makeSandbox() {
     requestAnimationFrame: (cb) => setTimeout(cb, 0),
   };
   vm.createContext(ctx);
+  require('./load-deployment')(ctx);
   return ctx;
 }
 
@@ -7579,6 +7580,7 @@ console.log('\n=== observers.js: healthStatus (configurable thresholds) ===');
     const ctx = { window: {}, Date };
     if (healthThresholds) ctx.window.HEALTH_THRESHOLDS = healthThresholds;
     vm.createContext(ctx);
+  require('./load-deployment')(ctx);
     vm.runInContext(healthStatusSrc + '\n; result = healthStatus(lastSeen);', Object.assign(ctx, { lastSeen, result: null }));
     return ctx.result;
   }

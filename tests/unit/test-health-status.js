@@ -32,6 +32,7 @@ function loadRoles(config) {
     fetch: () => Promise.resolve({ json: () => Promise.resolve(config || {}) }),
   };
   vm.createContext(ctx);
+  require('./load-deployment')(ctx);
   vm.runInContext(ROLES_JS, ctx);
   // roles.js reads HEALTH_THRESHOLDS as a bare global; window.X does not create one here.
   for (const k of Object.keys(ctx.window)) ctx[k] = ctx.window[k];
@@ -93,6 +94,7 @@ async function liveDetail(node, stats = {}, healthFailed = false) {
     activeNodeDetailKey: null,
   };
   vm.createContext(ctx);
+  require('./load-deployment')(ctx);
   vm.runInContext(src.slice(start, end), ctx);
   await ctx.showNodeDetail(node.public_key);
   assert.strictEqual(calls.length, 3, 'detail must not add network requests');

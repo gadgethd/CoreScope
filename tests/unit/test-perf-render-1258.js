@@ -55,7 +55,9 @@ function makeSandbox(opts = {}) {
 function loadPerf() {
   const sb = makeSandbox();
   const code = fs.readFileSync('public/perf.js', 'utf8');
-  vm.runInNewContext(code, sb.ctx);
+  vm.createContext(sb.ctx);
+  require('./load-deployment')(sb.ctx);
+  vm.runInContext(code, sb.ctx);
   return sb;
 }
 

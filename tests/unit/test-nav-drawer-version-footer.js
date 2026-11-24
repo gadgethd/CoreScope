@@ -48,6 +48,7 @@ function sliceVersionFns() {
 function load(fetchImpl) {
   const sandbox = { fetch: fetchImpl, console };
   vm.createContext(sandbox);
+  require('./load-deployment')(sandbox);
   vm.runInContext(sliceVersionFns() + '\nthis.fillVersion = fillVersion;', sandbox);
   return sandbox.fillVersion;
 }

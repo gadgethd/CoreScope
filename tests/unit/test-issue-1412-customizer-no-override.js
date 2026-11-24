@@ -116,6 +116,7 @@ console.log('\n=== #1412 A: server-config nodeColors does NOT clobber preset ROL
 {
   const env = makeSandbox();
   vm.createContext(env.sandbox);
+  require('./load-deployment')(env.sandbox);
   vm.runInContext(rolesSrc, env.sandbox);
   vm.runInContext(presetsSrc, env.sandbox);
 
@@ -152,6 +153,7 @@ console.log('\n=== #1412 B: early-overrides path also stays out of ROLE_COLORS o
 {
   const env = makeSandbox();
   vm.createContext(env.sandbox);
+  require('./load-deployment')(env.sandbox);
   vm.runInContext(rolesSrc, env.sandbox);
   vm.runInContext(presetsSrc, env.sandbox);
   env.sandbox.window.MeshCorePresets.applyPreset('deut');
@@ -176,6 +178,7 @@ console.log('\n=== #1412 C: explicit setRoleColorOverride() still wins (user cus
 {
   const env = makeSandbox();
   vm.createContext(env.sandbox);
+  require('./load-deployment')(env.sandbox);
   vm.runInContext(rolesSrc, env.sandbox);
   vm.runInContext(presetsSrc, env.sandbox);
   env.sandbox.window.MeshCorePresets.applyPreset('deut');

@@ -71,6 +71,7 @@ function loadPage() {
     registerPage: () => {},
   };
   vm.createContext(ctx);
+  require('./load-deployment')(ctx);
   const loadFile = f => {
     vm.runInContext(fs.readFileSync(REPO_ROOT + '/public/' + f, 'utf8'), ctx, { filename: f });
     for (const k of Object.keys(ctx.window)) ctx[k] = ctx.window[k];

@@ -110,12 +110,47 @@
     return buildHash(parsed.route, merged);
   }
 
+  function readUKMeshMapLink(search, fragment) {
+    const params = new URLSearchParams(search);
+    const hash = String(fragment || '');
+    if (hash.startsWith('#/') && hash !== '#/') return null;
+    const regions = new URLSearchParams(hash.replace(/^#\??/, '')).getAll('region');
+    const region = regions.length === 1 ? regions[0].replace(/^#/, '') : '';
+    const coordinates = params.get('map');
+    const parts = coordinates ? coordinates.split(',') : [];
+    const [lat, lon, zoom] = parts.map(value => value.trim() ? Number(value) : NaN);
+    const viewport = parts.length === 3 && Number.isFinite(lat) && Math.abs(lat) <= 90 &&
+      Number.isFinite(lon) && Math.abs(lon) <= 180 && Number.isFinite(zoom) &&
+      zoom >= 6 && zoom <= 19 ? { lat, lon, zoom } : null;
+    const layers = params.has('layers') ? new Set(params.get('layers').split(',')) : null;
+    const mode = params.get('mode');
+    const hops = Number(params.get('clashHops') || NaN);
+    return {
+      viewport,
+      layers,
+      mode: ['explore', 'traffic', 'diagnose', 'plan'].includes(mode) ? mode : null,
+      clashHops: Number.isInteger(hops) && hops >= 0 && hops <= 3 ? hops : null,
+      node: params.get('node'),
+      note: params.get('note') || '',
+      region: /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(region) ? region : null,
+    };
+  }
+
+  function ukmeshViewLink(href, view) {
+    const url = new URL(href);
+    const zoom = Math.max(6, Math.min(19, view.zoom));
+    url.searchParams.set('map', `${view.lat.toFixed(5)},${view.lon.toFixed(5)},${zoom.toFixed(2)}`);
+    return url;
+  }
+
   var api = {
     parseSort: parseSort,
     serializeSort: serializeSort,
     parseHash: parseHash,
     buildHash: buildHash,
     updateHashParams: updateHashParams,
+    readUKMeshMapLink: readUKMeshMapLink,
+    ukmeshViewLink: ukmeshViewLink,
   };
 
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

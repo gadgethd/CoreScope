@@ -120,6 +120,7 @@ let env;
 try {
   env = makeSandbox();
   vm.createContext(env.sandbox);
+  require('./load-deployment')(env.sandbox);
   vm.runInContext(rolesSrc, env.sandbox);
   vm.runInContext(presetsSrc, env.sandbox);
 } catch (e) {

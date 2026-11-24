@@ -134,6 +134,7 @@ function makeSandbox() {
   ctx.self = window;
   ctx.globalThis = ctx;
   vm.createContext(ctx);
+  require('./load-deployment')(ctx);
   vm.runInContext(fs.readFileSync('public/app.js', 'utf8'), ctx);
 
   return {

@@ -40,7 +40,7 @@
  * available is 400; the SVG's font-weight="700" synthesizes bold. */
 @font-face {
   font-family: 'Aldrich';
-  src: url('/fonts/aldrich-regular.woff2') format('woff2');
+  src: url('fonts/aldrich-regular.woff2') format('woff2');
   font-weight: 400;
   font-style: normal;
   font-display: swap;
@@ -5950,3 +5950,15 @@ body.embed #app.app-fixed {
 .reported-links { display: flex; flex-wrap: wrap; gap: 6px; }
 .reported-links .btn-primary { text-decoration: none; padding: 4px 10px; font-size: 12px; }
 .reported-table td { white-space: normal; }
+
+/* Keep previously rendered measurements and controls hidden until a public
+   projection generation is confirmed for this browser session. */
+html[data-ukmesh-data-unavailable] body > :not(#ukmesh-data-unavailable) {
+  display: none;
+}
+html[data-ukmesh-data-unavailable] #ukmesh-data-unavailable {
+  display: block;
+  margin: 2rem auto;
+  padding-inline: 1rem;
+  text-align: center;
+}

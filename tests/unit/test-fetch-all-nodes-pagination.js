@@ -63,6 +63,7 @@ function makeSandbox() {
   ctx.window.addEventListener = () => {};
   ctx.window.dispatchEvent = () => {};
   vm.createContext(ctx);
+  require('./load-deployment')(ctx);
   return ctx;
 }
 

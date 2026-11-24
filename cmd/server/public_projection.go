@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -232,6 +233,7 @@ func (p *publicProjectionReader) middleware(next http.Handler) http.Handler {
 		if response.status == 0 {
 			response.status = http.StatusOK
 		}
+		w.Header().Set("X-CoreScope-Privacy-Generation", strconv.FormatInt(generation, 10))
 		w.WriteHeader(response.status)
 		_, _ = w.Write(response.body.Bytes())
 	})

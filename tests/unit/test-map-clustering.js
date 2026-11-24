@@ -64,6 +64,7 @@ function makeSandbox() {
   };
   ctx.window.L = ctx.L;
   vm.createContext(ctx);
+  require('./load-deployment')(ctx);
   // Load roles for ROLE_COLORS palette
   vm.runInContext(fs.readFileSync('public/roles.js','utf8'), ctx);
   for (const k of Object.keys(ctx.window)) ctx[k] = ctx.window[k];

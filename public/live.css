@@ -1509,3 +1509,38 @@ input.live-node-filter-input:focus {
 .leaflet-zoom-anim .leaflet-liveAnimPane-pane {
   display: none !important;
 }
+
+.ukmesh-map-tools {
+  position: absolute;
+  inset: auto 1rem calc(var(--vcr-bar-height, 58px) + .75rem) auto;
+  z-index: 700;
+  max-width: min(24rem, calc(100% - 2rem));
+  padding: .5rem .75rem;
+  border-radius: var(--radius-md, .5rem);
+  background: var(--surface-1);
+  color: var(--text);
+}
+.ukmesh-map-tools button,
+.ukmesh-rf-controls label,
+.ukmesh-rf-controls select {
+  min-height: 44px;
+}
+.ukmesh-map-tools p {
+  margin: .35rem 0 0;
+  overflow-wrap: anywhere;
+}
+
+.ukmesh-rf-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .5rem;
+}
+.ukmesh-rf-controls > span {
+  flex-basis: 100%;
+}
+.ukmesh-rf-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+}

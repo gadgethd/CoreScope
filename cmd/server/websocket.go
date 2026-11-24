@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -89,6 +90,8 @@ type Client struct {
 	conn      *websocket.Conn
 	send      chan []byte
 	closeOnce sync.Once
+	// Optional fence used by the UKMesh app. Standalone clients use zero.
+	publicGeneration int64
 	// release returns this connection's slot to the per-IP concurrent cap
 	// (#1794). Always non-nil so Unregister needs no nil check; it is a no-op
 	// when limits are disabled.
@@ -198,11 +201,20 @@ func (h *Hub) Broadcast(msg interface{}) {
 
 // ServeWS handles the WebSocket upgrade and runs the client.
 func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
+	var publicGeneration int64
+	requested := r.URL.Query().Get("privacyGeneration")
 	if h.publicProjection != nil {
-		if _, err := h.publicProjection.epoch(r.Context()); err != nil {
+		current, err := h.publicProjection.epoch(r.Context())
+		if err != nil || (requested != "" && requested != strconv.FormatInt(current, 10)) {
 			http.Error(w, "public data temporarily unavailable", http.StatusServiceUnavailable)
 			return
 		}
+		if requested != "" {
+			publicGeneration = current
+		}
+	} else if requested != "" {
+		http.Error(w, "public data temporarily unavailable", http.StatusServiceUnavailable)
+		return
 	}
 	// #1794: decide BEFORE the upgrade. Rejecting afterwards would already
 	// have allocated the connection and completed the handshake, which is the
@@ -228,9 +240,10 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := &Client{
-		conn:    conn,
-		send:    make(chan []byte, 256),
-		release: release,
+		conn:             conn,
+		send:             make(chan []byte, 256),
+		release:          release,
+		publicGeneration: publicGeneration,
 	}
 	h.Register(client)
 

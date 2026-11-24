@@ -118,12 +118,12 @@ function renderVersionCard(health) {
       // #1258: /api/health was awaited AFTER Promise.all, adding a full RTT
       // (~50-200ms) on every 5s refresh. Issue it in parallel with the rest.
       const [server, client, ioStats, sqliteStats, writeSources, health] = await Promise.all([
-        fetch('/api/perf').then(r => r.json()),
+        CoreScopeDeployment.fetch('/api/perf').then(r => r.json()),
         Promise.resolve(window.apiPerf ? window.apiPerf() : null),
-        fetch('/api/perf/io').then(r => r.json()).catch(() => null),
-        fetch('/api/perf/sqlite').then(r => r.json()).catch(() => null),
-        fetch('/api/perf/write-sources').then(r => r.json()).catch(() => null),
-        fetch('/api/health').then(r => r.json()).catch(() => null)
+        CoreScopeDeployment.fetch('/api/perf/io').then(r => r.json()).catch(() => null),
+        CoreScopeDeployment.fetch('/api/perf/sqlite').then(r => r.json()).catch(() => null),
+        CoreScopeDeployment.fetch('/api/perf/write-sources').then(r => r.json()).catch(() => null),
+        CoreScopeDeployment.fetch('/api/health').then(r => r.json()).catch(() => null)
       ]);
 
       let html = '';

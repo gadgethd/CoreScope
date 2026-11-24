@@ -1,0 +1,122 @@
+/* global AbortSignal */
+const CoreScopeDeployment = (() => {
+  const supplied = globalThis.window?.CORE_SCOPE_DEPLOYMENT;
+  const marker = globalThis.document?.querySelector?.('script[data-ukmesh-app-config]');
+  const ukmeshApp = supplied?.ukmeshApp === true || marker?.hasAttribute?.('data-ukmesh-app-config') === true;
+  const request = (...args) => fetch(...args);
+  const localPath = (value, fallback) => (
+    typeof value === 'string' && /^\/(?!\/)[\w/-]*[\w-]$/.test(value) ? value : fallback
+  );
+  const apiBase = localPath(supplied?.apiBase, ukmeshApp ? '' : '/api');
+  const wsPath = localPath(supplied?.wsPath, ukmeshApp ? '' : '/');
+  const privacyUrl = localPath(supplied?.privacyUrl, '');
+  const configured = !ukmeshApp || Boolean(apiBase && wsPath && privacyUrl);
+  let generation = null;
+  let retired = false;
+  let checking;
+
+  function setUnavailable(value) {
+    document.documentElement.toggleAttribute('data-ukmesh-data-unavailable', value);
+  }
+
+  function retire() {
+    setUnavailable(true);
+    if (retired) return;
+    retired = true;
+    window.dispatchEvent(new Event('ukmesh:privacy-unavailable'));
+  }
+
+  function refresh() {
+    if (!ukmeshApp || !configured) return Promise.resolve(null);
+    if (checking) return checking;
+    checking = (async () => {
+      let next = null;
+      try {
+        const response = await request(privacyUrl, {
+          cache: 'no-store', credentials: 'omit', redirect: 'error',
+          signal: AbortSignal.timeout(2500),
+        });
+        if (response.ok) {
+          const value = (await response.json()).privacyGeneration;
+          if (Number.isSafeInteger(value) && value > 0) next = value;
+        }
+      } catch { /* keep public data hidden when the authority is unavailable */ }
+      if (retired) {
+        if (next !== null) window.location.reload();
+        return null;
+      }
+      if (generation !== null && next !== generation) {
+        retire();
+        if (next !== null) window.location.reload();
+        return null;
+      }
+      if (next !== null && generation === null) {
+        generation = next;
+        setUnavailable(false);
+        window.dispatchEvent(new Event('ukmesh:privacy-ready'));
+      }
+      return generation;
+    })().finally(() => { checking = undefined; });
+    return checking;
+  }
+
+  function apiPath(path) {
+    return apiBase + path.slice(4);
+  }
+
+  function fetchResource(path, options) {
+    if (typeof path !== 'string' || !/^\/api(?:\/|$)/.test(path)) {
+      return request(path, options);
+    }
+    const url = apiPath(path);
+    if (!ukmeshApp) return request(url, options);
+    return fetchPublicResource(path, url, options);
+  }
+
+  async function fetchPublicResource(path, url, options) {
+    if (generation === null) await refresh();
+    if (generation === null || retired) throw new Error('Public data temporarily unavailable');
+    const expected = generation;
+    const response = await request(url, { ...options, cache: 'no-store', credentials: 'omit', redirect: 'error' });
+    // Health is an operational startup signal, neither data nor authority.
+    if (!retired && path.split('?')[0] === '/api/healthz') return response;
+    if (retired || response.headers.get('X-CoreScope-Privacy-Generation') !== String(expected)) {
+      // Projection errors carry no generation. A normal edge denial is
+      // local to the requested route and never supplies measurements.
+      if (response.ok || response.status === 503) retire();
+      throw new Error('Public data temporarily unavailable');
+    }
+    return response;
+  }
+
+  function socketUrl() {
+    if (!ukmeshApp && wsPath === '/') {
+      const address = globalThis.location ?? window.location;
+      const proto = address.protocol === 'https:' ? 'wss:' : 'ws:';
+      return `${proto}//${address.host}`;
+    }
+    if (ukmeshApp && (generation === null || retired)) return null;
+    const endpoint = new URL(wsPath, window.location.origin);
+    endpoint.protocol = endpoint.protocol === 'https:' ? 'wss:' : 'ws:';
+    if (ukmeshApp) endpoint.searchParams.set('privacyGeneration', String(generation));
+    return endpoint.href;
+  }
+
+  if (ukmeshApp) {
+    setUnavailable(true);
+    if (configured) {
+      function poll() {
+        void refresh().finally(() => window.setTimeout(poll, 2000));
+      }
+      poll();
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) void refresh();
+      });
+      window.addEventListener('pageshow', (event) => {
+        if (event.persisted) retire();
+        void refresh();
+      });
+    }
+  }
+  return { ukmeshApp, apiPath, fetch: fetchResource, socketUrl, refresh };
+})();

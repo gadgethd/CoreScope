@@ -23,6 +23,7 @@ function load(file) {
     parseInt, parseFloat, isNaN,
   };
   vm.createContext(sandbox);
+  require('./load-deployment')(sandbox);
   vm.runInContext(fs.readFileSync(REPO_ROOT + '/public/' + file, 'utf8'), sandbox);
   return sandbox;
 }
@@ -101,6 +102,7 @@ function loadDisplay() {
     },
   };
   vm.createContext(sandbox);
+  require('./load-deployment')(sandbox);
   vm.runInContext(fs.readFileSync(REPO_ROOT + '/public/hop-display.js', 'utf8'), sandbox);
   return { HopDisplay: sandbox.window.HopDisplay, appended };
 }
@@ -157,6 +159,7 @@ function loadPackets() {
     registerPage: () => {},
   };
   vm.createContext(ctx);
+  require('./load-deployment')(ctx);
   const loadFile = f => {
     vm.runInContext(fs.readFileSync(REPO_ROOT + '/public/' + f, 'utf8'), ctx, { filename: f });
     for (const k of Object.keys(ctx.window)) ctx[k] = ctx.window[k];

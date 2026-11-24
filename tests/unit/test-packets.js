@@ -92,6 +92,7 @@ function makeSandbox() {
     registerPage: (name, handler) => { registeredPages[name] = handler; },
   };
   vm.createContext(ctx);
+  require('./load-deployment')(ctx);
   return ctx;
 }
 

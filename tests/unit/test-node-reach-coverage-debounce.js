@@ -54,6 +54,7 @@ const sandbox = {
   document: { documentElement: {} },
 };
 vm.createContext(sandbox);
+require('./load-deployment')(sandbox);
 // Define debounce IN the context so it uses the controllable timers above.
 vm.runInContext('function debounce(fn, ms){var t; return function(){var a=arguments, c=this; clearTimeout(t); t=setTimeout(function(){fn.apply(c,a);}, ms);};}', sandbox);
 vm.runInContext(code, sandbox);

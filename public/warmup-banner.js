@@ -156,7 +156,7 @@
   function pollOnce() {
     if (state.inflight || typeof fetch !== 'function') return;
     state.inflight = true;
-    fetch('/api/healthz', { credentials: 'same-origin', cache: 'no-store' })
+    CoreScopeDeployment.fetch('/api/healthz', { credentials: 'same-origin', cache: 'no-store' })
       .then(function (resp) {
         if (resp && resp.headers && resp.headers.get) {
           noteLoadStatus(resp.headers.get('X-Corescope-Load-Status'));

@@ -42,6 +42,7 @@ function buildCtx(hash, initialStorage) {
   };
   ctx.window = ctx;
   vm.createContext(ctx);
+  require('./load-deployment')(ctx);
   vm.runInContext(fs.readFileSync(REPO_ROOT + '/public/region-filter.js', 'utf8'), ctx);
   return { rf: ctx.window.RegionFilter, storage, location: ctx.location };
 }
