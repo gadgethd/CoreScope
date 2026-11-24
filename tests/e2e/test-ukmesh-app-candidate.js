@@ -22,6 +22,7 @@ async function main() {
     let generation = 1;
     let privateReady = true;
     let readyTiles = 1;
+    let authorityHold;
     const origin = 'https://candidate.example.test';
     const sampleRaster = path.join(publicDir, 'vendor/leaflet-1.9.4/images/layers.png');
     const rasterTier = tier => ({
@@ -60,6 +61,7 @@ async function main() {
         }` });
       }
       if (file === '/api/runtime-config') {
+        if (authorityHold) await authorityHold();
         return route.fulfill({ status: privateReady ? 200 : 503, json: { privacyGeneration: generation } });
       }
       if (file === '/rf-coverage/meta.json') {
@@ -123,6 +125,33 @@ async function main() {
       await page.screenshot({ path: process.env.UKMESH_BROWSER_SCREENSHOT });
     }
 
+    const visibility = hidden => page.evaluate(value => {
+      Object.defineProperty(document, 'hidden', { configurable: true, value });
+      document.dispatchEvent(new Event('visibilitychange'));
+    }, hidden);
+    await page.evaluate(() => { document.documentElement.dataset.fixtureDocument = 'original'; });
+    await visibility(true);
+    let releaseBeforeResume;
+    let releaseAfterResume;
+    const beforeResume = new Promise(resolve => { releaseBeforeResume = resolve; });
+    const afterResume = new Promise(resolve => { releaseAfterResume = resolve; });
+    let checks = 0;
+    authorityHold = () => ++checks === 1 ? beforeResume : afterResume;
+    await Promise.all([
+      page.waitForRequest('**/api/runtime-config'),
+      page.evaluate(() => { void CoreScopeDeployment.refresh(); }),
+    ]);
+    await visibility(false);
+    const refreshed = page.waitForRequest('**/api/runtime-config');
+    releaseBeforeResume();
+    await refreshed;
+    await page.getByText('Public data is temporarily unavailable.').waitFor({ state: 'visible' });
+    assert.equal(await page.locator('#liveMap').isVisible(), false);
+    authorityHold = undefined;
+    releaseAfterResume();
+    await page.locator('#liveMap.leaflet-container').waitFor({ state: 'visible' });
+    assert.equal(await page.locator('html').getAttribute('data-fixture-document'), 'original');
+
     privateReady = false;
     await page.getByText('Public data is temporarily unavailable.').waitFor({ state: 'visible' });
     assert.equal(await page.locator('#liveMap').isVisible(), false);
@@ -143,7 +172,7 @@ async function main() {
     assert.ok(networkPaths.some(value => value.startsWith('/api/')));
     assert.ok(socketPaths.includes('/'));
     assert.deepEqual(unexpected, []);
-    console.log('UKMesh shell, legacy map state, RF coverage progress and tiers, privacy recovery and standalone routes passed');
+    console.log('UKMesh shell, legacy map state, RF progress and tiers, hidden-tab privacy, generation recovery and standalone routes passed');
   } finally {
     await browser.close();
   }

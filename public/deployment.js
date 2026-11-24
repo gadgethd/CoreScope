@@ -14,6 +14,7 @@ const CoreScopeDeployment = (() => {
   let generation = null;
   let retired = false;
   let checking;
+  let visibilityRevision = 0;
 
   function setUnavailable(value) {
     document.documentElement.toggleAttribute('data-ukmesh-data-unavailable', value);
@@ -29,6 +30,7 @@ const CoreScopeDeployment = (() => {
   function refresh() {
     if (!ukmeshApp || !configured) return Promise.resolve(null);
     if (checking) return checking;
+    const visibility = visibilityRevision;
     checking = (async () => {
       let next = null;
       try {
@@ -50,10 +52,11 @@ const CoreScopeDeployment = (() => {
         if (next !== null) window.location.reload();
         return null;
       }
-      if (next !== null && generation === null) {
+      if (next !== null) {
+        const first = generation === null;
         generation = next;
-        setUnavailable(false);
-        window.dispatchEvent(new Event('ukmesh:privacy-ready'));
+        if (visibility === visibilityRevision && !document.hidden) setUnavailable(false);
+        if (first) window.dispatchEvent(new Event('ukmesh:privacy-ready'));
       }
       return generation;
     })().finally(() => { checking = undefined; });
@@ -110,7 +113,13 @@ const CoreScopeDeployment = (() => {
       }
       poll();
       document.addEventListener('visibilitychange', () => {
-        if (!document.hidden) void refresh();
+        visibilityRevision++;
+        setUnavailable(true);
+        if (!document.hidden) {
+          // A check started before the tab became visible cannot reveal it.
+          if (checking) void checking.then(refresh);
+          else void refresh();
+        }
       });
       window.addEventListener('pageshow', (event) => {
         if (event.persisted) retire();
