@@ -399,7 +399,8 @@ func TestAnalyticsRecomputers_FullDataRightAfterStartupLoad(t *testing.T) {
 		return w
 	}
 
-	for _, p := range []string{"/api/analytics/rf", "/api/analytics/topology", "/api/analytics/channels"} {
+	gated := []string{"/api/analytics/rf", "/api/analytics/topology", "/api/analytics/channels"}
+	for _, p := range gated {
 		if w := get(p); w.Code != http.StatusServiceUnavailable {
 			t.Fatalf("%s before full load: got %d, want 503", p, w.Code)
 		}
@@ -434,18 +435,20 @@ func TestAnalyticsRecomputers_FullDataRightAfterStartupLoad(t *testing.T) {
 		t.Fatalf("fixture precondition: %d packets in memory after load, want %d", inMemory, totalRows)
 	}
 
-	waitForTest(t, "rf gate opens after full load", func() bool { return get("/api/analytics/rf").Code == http.StatusOK })
+	waitForTest(t, "rf, topology, and channel gates open after full load", func() bool {
+		for _, p := range gated {
+			if get(p).Code != http.StatusOK {
+				return false
+			}
+		}
+		return true
+	})
 	var rf map[string]interface{}
 	if err := json.Unmarshal(get("/api/analytics/rf").Body.Bytes(), &rf); err != nil {
 		t.Fatalf("rf body: %v", err)
 	}
 	if got, _ := rf["totalTransmissions"].(float64); int(got) != totalRows {
 		t.Fatalf("rf totalTransmissions = %v right after full load, want %d (first-chunk snapshot still served)", rf["totalTransmissions"], totalRows)
-	}
-	for _, p := range []string{"/api/analytics/topology", "/api/analytics/channels"} {
-		if w := get(p); w.Code != http.StatusOK {
-			t.Fatalf("%s after full load: got %d, want 200", p, w.Code)
-		}
 	}
 	for name, rc := range all {
 		name, rc := name, rc
