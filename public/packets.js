@@ -637,6 +637,7 @@
 
 (function () {
   let packets = [];
+  let packetOrder = null;
   let hashIndex = new Map(); // hash → packet group for O(1) dedup
 
   // #1799 PR #1804 r1 item 9 (adv6): payload-labels.js is loaded
@@ -1484,29 +1485,8 @@
         .map(m => m.data.packet);
       if (!newPkts.length) return;
 
-      // Check if new packets pass current filters
-      const filtered = newPkts.filter(p => {
-        // When user pinned a hash, accept ONLY that exact packet — bypass all
-        // other filters (window/region/type/observer/node).
-        if (filters.hash) return p.hash === filters.hash;
-        // Respect time window filter — drop packets outside the selected window
-        const windowMin = savedTimeWindowMin;
-        if (windowMin > 0) {
-          const cutoff = new Date(Date.now() - windowMin * 60000).toISOString();
-          const pktTime = p.latest || p.timestamp || p.first_seen;
-          if (pktTime && pktTime < cutoff) return false;
-        }
-        if (filters.type) { const types = filters.type.split(',').map(Number); if (!types.includes(p.payload_type)) return false; }
-        if (filters.observer) { const obsSet = new Set(filters.observer.split(',')); if (!obsSet.has(p.observer_id) && !(p._children && p._children.some(c => obsSet.has(String(c.observer_id))))) return false; }
-        if (RegionFilter.getRegionParam()) {
-          const selectedRegions = RegionFilter.getRegionParam().split(',');
-          const obs = observerMap.get(p.observer_id);
-          if (!obs || !selectedRegions.includes(obs.iata)) return false;
-        }
-        if (filters.node && !(p.decoded_json || '').includes(filters.node)) return false;
-        if (filters.channel && !packetMatchesChannel(p, filters.channel)) return false;
-        return true;
-      });
+      const filtered = filterLivePacketBatch(newPkts, filters, savedTimeWindowMin,
+        filters.hash ? '' : RegionFilter.getRegionParam(), observerMap);
       if (!filtered.length) return;
 
       // Resolve any new hops, then update and re-render
@@ -1523,11 +1503,14 @@
       }
       (newHops.size ? resolveHopsForPackets(filtered) : Promise.resolve()).then(() => {
         if (groupByHash) {
+          const added = [];
+          const updated = new Set();
           // Update existing groups or create new ones
           for (const p of filtered) {
             const h = p.hash;
             const existing = hashIndex.get(h);
             if (existing) {
+              updated.add(existing);
               existing.count = (existing.count || 1) + 1;
               existing.observation_count = (existing.observation_count || 1) + 1;
               existing.latest = p.timestamp > existing.latest ? p.timestamp : existing.latest;
@@ -1562,16 +1545,11 @@
                 decoded_json: p.decoded_json,
                 radio: p.radio, // #1869: the filter's radio/sf fields read it
               };
-              packets.unshift(newGroup);
+              added.push(newGroup);
               if (h) hashIndex.set(h, newGroup);
             }
           }
-          // Re-sort by active sort column (or latest DESC as default), then evict oldest beyond the limit
-          if (_packetSortColumn) {
-            sortPacketsArray();
-          } else {
-            packets.sort((a, b) => (b.latest || '').localeCompare(a.latest || ''));
-          }
+          updatePacketOrder(added, updated);
           if (packets.length > PACKET_LIMIT) {
             const evicted = packets.splice(PACKET_LIMIT);
             for (const p of evicted) { if (p.hash) hashIndex.delete(p.hash); }
@@ -1579,12 +1557,33 @@
         } else {
           // Flat mode: prepend, then evict oldest beyond the limit
           packets = filtered.concat(packets);
+          packetOrder = null;
           if (packets.length > PACKET_LIMIT) packets.length = PACKET_LIMIT;
         }
         totalCount += filtered.length;
         // Coalesce WS-triggered renders via rAF (#396)
         scheduleWSRender();
       });
+    });
+  }
+
+  function filterLivePacketBatch(incoming, filters, windowMin, regionParam, observerMap, now = Date.now()) {
+    // A pinned hash is an exact identity regardless of the current filter choices.
+    if (filters.hash) return incoming.filter(p => p.hash === filters.hash);
+    const types = filters.type ? new Set(filters.type.split(',').map(Number)) : null;
+    const observers = filters.observer ? new Set(filters.observer.split(',')) : null;
+    const regions = regionParam ? new Set(regionParam.split(',')) : null;
+    const cutoff = windowMin > 0 ? new Date(now - windowMin * 60000).toISOString() : null;
+    return incoming.filter(p => {
+      if (cutoff) {
+        const pktTime = p.latest || p.timestamp || p.first_seen;
+        if (pktTime && pktTime < cutoff) return false;
+      }
+      if (types && !types.has(p.payload_type)) return false;
+      if (observers && !observers.has(p.observer_id) && !p._children?.some(c => observers.has(String(c.observer_id)))) return false;
+      if (regions && !regions.has(observerMap.get(p.observer_id)?.iata)) return false;
+      if (filters.node && !(p.decoded_json || '').includes(filters.node)) return false;
+      return !filters.channel || packetMatchesChannel(p, filters.channel);
     });
   }
 
@@ -1613,6 +1612,7 @@
     if (_areaChangeHandler) { AreaFilter.offChange(_areaChangeHandler); _areaChangeHandler = null; }
     removeAllByopOverlays();
     packets = [];
+    packetOrder = null;
     hashIndex = new Map();    selectedId = null;
     filtersBuilt = false;
     delete filters.node;
@@ -1697,6 +1697,7 @@
 
       const data = await api('/packets?' + params.toString());
       packets = data.packets || [];
+      packetOrder = null;
       hashIndex = new Map();
       for (const p of packets) { if (p.hash) hashIndex.set(p.hash, p); }
       totalCount = data.total || packets.length;
@@ -3143,11 +3144,8 @@
     _vsScrollHandler = null;
   }
 
-  /** Sort the packets array by the current sort column. Called before renderTableRows. */
-  function sortPacketsArray() {
-    if (!_packetSortColumn || !packets.length) return;
-    var col = _packetSortColumn;
-    var dir = _packetSortDirection === 'asc' ? 1 : -1;
+  function packetOrderComparator(col, direction) {
+    var dir = direction === 'asc' ? 1 : -1;
 
     var accessor;
     switch (col) {
@@ -3172,7 +3170,7 @@
     var isNumeric = (col === 'size' || col === 'hb' || col === 'rpt');
     var isDate = (col === 'time');
 
-    packets.sort(function(a, b) {
+    return function(a, b) {
       // Most packets carry no scope (FLOOD and DIRECT cannot), so an ascending
       // sort would bury every scoped row under a wall of dashes. Pin the empties
       // last in BOTH directions, as the nodes table does for default_scope.
@@ -3197,7 +3195,56 @@
         ) * -1; // desc (newest first)
       }
       return dir * result;
-    });
+    };
+  }
+
+  function sortPacketsArray() {
+    const compare = packetOrderComparator(_packetSortColumn, _packetSortDirection);
+    if (!compare) return;
+    packets.sort(compare);
+    packetOrder = `${_packetSortColumn}:${_packetSortDirection}`;
+  }
+
+  // Merge sorted changes into the unaffected rows. On comparator ties, keep
+  // the positions the previous stable sort would see after prepending arrivals.
+  function mergeChangedPacketOrder(rows, added, updated, compare) {
+    const changes = added.map((packet, index) => ({ packet, position: -index - 1 }));
+    for (let i = 0; i < rows.length; i++) {
+      if (updated.has(rows[i])) changes.push({ packet: rows[i], position: i });
+    }
+    if (!changes.length) return rows;
+    changes.sort((a, b) => compare(a.packet, b.packet) || a.position - b.position);
+    const result = [];
+    let changeIndex = 0;
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      if (updated.has(row)) continue;
+      while (changeIndex < changes.length) {
+        const change = changes[changeIndex];
+        const order = compare(change.packet, row) || change.position - i;
+        if (order > 0) break;
+        result.push(change.packet);
+        changeIndex++;
+      }
+      result.push(row);
+    }
+    while (changeIndex < changes.length) result.push(changes[changeIndex++].packet);
+    return result;
+  }
+
+  function updatePacketOrder(added, updated) {
+    const key = _packetSortColumn ? `${_packetSortColumn}:${_packetSortDirection}` : 'default';
+    const compare = _packetSortColumn
+      ? packetOrderComparator(_packetSortColumn, _packetSortDirection)
+      : (a, b) => (b.latest || '').localeCompare(a.latest || '');
+    // Observer, region and type labels can change without a packet update.
+    if (compare && packetOrder === key && !['observer', 'region', 'type'].includes(_packetSortColumn)) {
+      packets = mergeChangedPacketOrder(packets, added, updated, compare);
+    } else {
+      if (added.length) packets = added.reverse().concat(packets);
+      if (compare) packets.sort(compare);
+    }
+    packetOrder = compare ? key : null;
   }
 
   // applyObserverFilter decides which already-loaded packets remain visible
@@ -4433,6 +4480,9 @@
       group.observer_name = first.observer_name;
       group.snr = first.snr;
       group.rssi = first.rssi;
+      if (group.path_json !== first.path_json && (_packetSortColumn === 'path' || _packetSortColumn === 'rpt')) {
+        packetOrder = null;
+      }
       group.path_json = first.path_json;
       group.direction = first.direction;
     }
@@ -4530,8 +4580,10 @@
       _calcVisibleRange,
       buildPacketsParams,
       applyObserverFilter,
+      filterLivePacketBatch,
+      mergeChangedPacketOrder,
       renderTableRows,
-      _setPackets: function(p) { packets = p; },
+      _setPackets: function(p) { packets = p; packetOrder = null; },
       _setFilter: function(k, v) { filters[k] = v; },
       _setFullNames: function(v) { showFullNames = !!v; },
       resolveHopsForPackets,

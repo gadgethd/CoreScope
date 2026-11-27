@@ -1429,6 +1429,33 @@ console.log('\n=== packets.js: Full Names toggle (observer column) ===');
   });
 }
 
+{
+  const { mergeChangedPacketOrder } = loadPacketsSandbox()._packetsTestAPI;
+  const byTime = (a, b) => b.time - a.time;
+
+  test('grouped live updates retain stable-sort ties after prepending and changing rows', () => {
+    const rows = [8, 7, 7, 3, 0].map((time, id) => ({ time, id }));
+    const added = [{ time: 7, id: 5 }, { time: 12, id: 6 }, { time: 7, id: 7 }];
+    const updated = new Set([rows[0], rows[4]]);
+    rows[0].time = 7;
+    rows[4].time = 11;
+    const expected = [...added].reverse().concat(rows).sort(byTime);
+    assert.deepStrictEqual(Array.from(mergeChangedPacketOrder(rows, added, updated, byTime)), expected);
+  });
+
+  test('top-of-feed bursts compare only the changed rows at the 50,000 packet limit', () => {
+    const rows = Array.from({ length: 50000 }, (_, i) => ({ time: 50000 - i, id: i }));
+    const added = Array.from({ length: 16 }, (_, i) => ({ time: 50001 + i, id: 50000 + i }));
+    const updated = new Set([rows[0], rows[1]]);
+    rows[1].time = 50100;
+    const expected = [...added].reverse().concat(rows).sort(byTime);
+    let comparisons = 0;
+    const actual = mergeChangedPacketOrder(rows, added, updated, (a, b) => { comparisons++; return byTime(a, b); });
+    assert(comparisons < 100, `unexpected ${comparisons} comparator calls`);
+    assert.deepStrictEqual(Array.from(actual), expected);
+  });
+}
+
 // ===== SUMMARY =====
 console.log(`\n${'='.repeat(40)}`);
 console.log(`packets.js tests: ${passed} passed, ${failed} failed`);

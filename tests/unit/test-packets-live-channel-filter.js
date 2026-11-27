@@ -117,11 +117,14 @@ test('malformed decoded_json does not throw and does not match', () => {
 });
 
 test('WS live filter applies the channel filter', () => {
-  const start = src.indexOf('Check if new packets pass current filters');
-  assert.ok(start > 0, 'WS filter block not found');
-  const block = src.slice(start, src.indexOf('if (!filtered.length) return;', start));
-  assert.ok(/filters\.channel\s*&&\s*!packetMatchesChannel\(p,\s*filters\.channel\)/.test(block),
-    'WS filter must reject packets that do not match filters.channel');
+  const select = win._packetsTestAPI.filterLivePacketBatch;
+  const allowed = { ...grp({ channel: '#test' }), hash: 'test', observer_id: 'SJC' };
+  const otherChannel = { ...grp({ channel: '#news' }), hash: 'news', observer_id: 'SJC' };
+  const otherRegion = { ...allowed, hash: 'far', observer_id: 'SFO' };
+  const upcoming = [allowed, otherChannel, otherRegion];
+  const directory = new Map([['SJC', { iata: 'SJC' }], ['SFO', { iata: 'SFO' }]]);
+  assert.deepStrictEqual(Array.from(select(upcoming, { channel: '#test' }, 0, 'SJC', directory)), [allowed]);
+  assert.deepStrictEqual(Array.from(select(upcoming, { hash: 'news', channel: '#test' }, 0, 'SJC', directory)), [otherChannel]);
 });
 
 console.log(`\n${passed} passed`);
