@@ -1429,6 +1429,36 @@ console.log('\n=== packets.js: Full Names toggle (observer column) ===');
   });
 }
 
+async function newestPacketRequestWins() {
+  const ctx = loadPacketsSandbox();
+  const view = ctx._packetsTestAPI;
+  const pending = [];
+  ctx.api = () => new Promise((resolve, reject) => pending.push({ resolve, reject }));
+  ctx.RegionFilter = { getRegionParam: () => '' };
+  ctx.AreaFilter = { getAreaParam: () => '' };
+  let completions = 0;
+  const body = { innerHTML: '', setAttribute: () => { completions++; } };
+  ctx.document.getElementById = id => id === 'pktBody' ? body : null;
+  const first = view.loadPackets();
+  const second = view.loadPackets();
+  const latest = view.loadPackets();
+  pending[2].resolve({ packets: [{ hash: 'current' }], total: 1 });
+  await latest;
+  pending[0].resolve({ packets: [{ hash: 'stale' }], total: 1 });
+  pending[1].reject(new Error('superseded request'));
+  await Promise.all([first, second]);
+  assert.strictEqual(view._getPackets()[0].hash, 'current');
+  assert.strictEqual(completions, 1);
+  assert.strictEqual(body.innerHTML, '');
+}
+
+newestPacketRequestWins().then(() => {
+  console.log('  ✓ newer packet queries retain their rows and loading state');
+}).catch(error => {
+  console.error(error);
+  process.exitCode = 1;
+});
+
 // ===== SUMMARY =====
 console.log(`\n${'='.repeat(40)}`);
 console.log(`packets.js tests: ${passed} passed, ${failed} failed`);

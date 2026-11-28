@@ -1043,10 +1043,11 @@
   // alone, it returns the first candidate with no signal that it guessed, which
   // is how a repeater 126 km outside the observer's region ended up displayed
   // as a certainty.
-  async function resolveHops(hops, observerId, direct) {
+  async function resolveHops(hops, observerId, direct, request = packetRequestGeneration) {
     const unknown = hops.filter(h => !(hopCacheKey(h, observerId, direct) in hopNameCache));
     if (!unknown.length) return;
     await ensureHopResolver();
+    if (request !== packetRequestGeneration) return;
     const [obsLat, obsLon] = observerPosition(observerId);
     const resolved = HopResolver.resolve(unknown, null, null, obsLat, obsLon, observerId,
       { directHops: direct ? unknown : [] }) || {};
@@ -1062,7 +1063,7 @@
   // Resolve every hop of every packet, grouped by the observer that heard it.
   // #2098 — within a group, the last hop of each path (heard directly) and the
   // earlier hops are resolved apart, because only the first get the region.
-  async function resolveHopsForPackets(packets) {
+  async function resolveHopsForPackets(packets, request = packetRequestGeneration) {
     const groups = new Map();
     for (const p of packets || []) {
       const obs = (p && p.observer_id) ? String(p.observer_id) : '';
@@ -1076,8 +1077,9 @@
     // ensureHopResolver() is idempotent and awaited once inside resolveHops;
     // the resolve itself is local computation, so the loop costs no requests.
     for (const [obs, g] of groups) {
-      if (g.relayed.size) await resolveHops([...g.relayed], obs || undefined, false);
-      if (g.direct.size) await resolveHops([...g.direct], obs || undefined, true);
+      if (request !== packetRequestGeneration) return;
+      if (g.relayed.size) await resolveHops([...g.relayed], obs || undefined, false, request);
+      if (g.direct.size) await resolveHops([...g.direct], obs || undefined, true, request);
     }
   }
 
@@ -1086,7 +1088,7 @@
    * Packets with resolved_path skip client-side HopResolver entirely.
    * Must call ensureHopResolver() first so nodesList is available for name lookup.
    */
-  async function cacheResolvedPaths(packets) {
+  async function cacheResolvedPaths(packets, request = packetRequestGeneration) {
     if (!packets || !packets.length) return;
     let needsInit = false;
     for (const p of packets) {
@@ -1095,6 +1097,7 @@
     }
     if (!needsInit) return;
     await ensureHopResolver();
+    if (request !== packetRequestGeneration) return;
     for (const p of packets) {
       const rp = getResolvedPath(p);
       if (!rp) continue;
@@ -1160,6 +1163,7 @@
   let directPacketId = null;
   let directPacketHash = null;
   let initGeneration = 0;
+  let packetRequestGeneration = 0;
   let _docActionHandler = null;
   let _docMenuCloseHandler = null;
   let _docColMenuCloseHandler = null;
@@ -1387,6 +1391,7 @@
     // them together rather than in series halves worst-case time-to-first-row
     // on slow links / loaded CI runners without changing render contracts.
     await Promise.all([loadObservers(), loadPackets()]);
+    if (gen !== initGeneration) return;
 
     // Auto-select packet detail when arriving via hash URL
     if (directPacketHash) {
@@ -1589,6 +1594,8 @@
   }
 
   function destroy() {
+    ++packetRequestGeneration;
+    ++initGeneration;
     clearTimeout(_renderTimer);
     if (wsHandler) offWS(wsHandler);
     wsHandler = null;
@@ -1684,6 +1691,7 @@
   }
 
   async function loadPackets() {
+    const request = ++packetRequestGeneration;
     try {
       const windowMin = normalizeTimeWindow(document.getElementById('fTimeWindow')?.value, savedTimeWindowMin);
       const params = buildPacketsParams({
@@ -1696,6 +1704,7 @@
       });
 
       const data = await api('/packets?' + params.toString());
+      if (request !== packetRequestGeneration) return;
       packets = data.packets || [];
       hashIndex = new Map();
       for (const p of packets) { if (p.hash) hashIndex.set(p.hash, p); }
@@ -1727,12 +1736,14 @@
       // #1692 parallelisation. Hop *names* are a presentation enhancement
       // (paths render as hex prefixes until names arrive), so resolve them
       // in the background and re-render rows when done.
+      const loadedPackets = packets;
       const hopJob = (async () => {
         try {
-          await cacheResolvedPaths(packets);
-          await resolveHopsForPackets(packets);
+          await cacheResolvedPaths(loadedPackets, request);
+          if (request !== packetRequestGeneration) return;
+          await resolveHopsForPackets(loadedPackets, request);
           // Re-render rows so resolved hop names replace hex prefixes.
-          if (filtersBuilt) renderTableRows();
+          if (request === packetRequestGeneration && filtersBuilt) renderTableRows();
         } catch (e) {
           console.warn('[packets] background hop resolution failed:', e);
         }
@@ -1754,6 +1765,7 @@
             .then(data => ({ hash, group, data }))
             .catch(() => ({ hash, group, data: null }));
         }));
+        if (request !== packetRequestGeneration) return;
         for (const { hash, group, data } of results) {
           if (!group) {
             expandedHashes.delete(hash);
@@ -1775,13 +1787,15 @@
       sortPacketsArray();
       renderLeft();
     } catch (e) {
+      if (request !== packetRequestGeneration) return;
       console.error('Failed to load packets:', e);
       const tbody = document.getElementById('pktBody');
       if (tbody) tbody.innerHTML = '<tr><td colspan="' + _getColCount() + '" class="text-center" style="padding:24px;color:var(--error,#ef4444)"><div role="alert" aria-live="polite">Failed to load packets. Please try again.</div></td></tr>';
     } finally {
-      // Always signal data-loaded — even on error — so E2E tests can proceed.
-      var pktContainer = document.getElementById('pktLeft') || document.getElementById('pktBody');
-      if (pktContainer) pktContainer.setAttribute('data-loaded', 'true');
+      if (request === packetRequestGeneration) {
+        const container = document.getElementById('pktLeft') || document.getElementById('pktBody');
+        if (container) container.setAttribute('data-loaded', 'true');
+      }
     }
   }
 
@@ -4531,6 +4545,8 @@
       buildPacketsParams,
       applyObserverFilter,
       renderTableRows,
+      loadPackets,
+      _getPackets: function() { return packets; },
       _setPackets: function(p) { packets = p; },
       _setFilter: function(k, v) { filters[k] = v; },
       _setFullNames: function(v) { showFullNames = !!v; },
